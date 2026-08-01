@@ -1,0 +1,12 @@
+[package]
+name = "entropymap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+egui_extras = "0.28"
+memmap2 = "0.9"
+rfd = "0.14"
+rayon = "1.10"
