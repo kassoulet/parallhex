@@ -128,7 +128,7 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 |  ├─────────────────────────────┤  |                                   |
 |  │  Direct greyscale map       │  |                                   |
 |  ├─────────────────────────────┤  |                                   |
-|  │  Entropy map                │  |                                   |
+|  │  Entropy map + histogram    │  |                                   |
 |  └─────────────────────────────┘  |                                   |
 |  (one shared virtualized scroll)  |                                   |
 +-----------------------------------+-----------------------------------+
@@ -151,11 +151,14 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 
 4. **Entropy map (bottom pane):**
    * Same geometry; each pixel colored by the sliding-window entropy at that offset (§3.B), using the entropy gradient (§3.C.3).
+   * Below the entropy pixels, each row includes a **per-row byte histogram** (value-distribution band): 32 bins across the byte-value range `0x00..=0xFF`, bar height normalized to the row's maximum bin count, bars colored by the byte-class palette of each bin's value range.
 
 5. **Selection & hover (shared):**
    * Hover updates `hovered_offset`; the same offset is highlighted in all panes (hex cell outline, greyscale/entropy pixel marker) and reported in the bottom status bar.
    * Primary click + drag on the hex strip sets `selection_range`; all panes highlight the selected byte range.
    * Clicking selects a single byte (`selected_offset`).
+
+6. **Keyboard navigation:** arrow keys move the selection by one byte / one row; PageUp / PageDown move by a page (visible rows); Home / End jump to the file start / end. The view auto-scrolls to keep the selection centered.
 
 ### Top Panel Controls
 
@@ -169,7 +172,7 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 * File name, size (`human_size`).
 * Inspector: hovered and selected byte — offset (`0x%08X`), value (`0x%02X`), printable char, and local entropy `H`.
 * Selection section: range `0x…–0x…`, length, **Copy Hex**, **Copy ASCII**, **Clear**.
-* A **mini overview map** is optional (whole-file entropy/greyscale thumbnail for navigation).
+* **Mini overview map**: a whole-file thumbnail — greyscale row on top, entropy row below — with click/drag navigation (jumps the central view to the clicked offset, centered) and a translucent band showing the currently visible range.
 
 ### Bottom Status Bar
 

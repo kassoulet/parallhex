@@ -12,12 +12,17 @@ use crate::color;
 const ADDR_X: f32 = 8.0;
 const ROW_H: f32 = 18.0;
 const MAP_H: f32 = 8.0;
+const HIST_H: f32 = 12.0;
 const BLOCK_GAP: f32 = 3.0;
+
+/// Vertical size of one full row block (hex row + pixel rows + histogram).
+pub(crate) const BLOCK_H: f32 = ROW_H + 2.0 * MAP_H + HIST_H + BLOCK_GAP;
 
 /// Per-row horizontal geometry for one bytes-per-row layout.
 struct RowGeo {
     bpr: usize,
     hex_start: f32,
+    hex_w: f32,
     cell_w: f32,
     group_gap: f32,
     ascii_start: f32,
@@ -37,6 +42,7 @@ impl RowGeo {
         Self {
             bpr,
             hex_start,
+            hex_w,
             cell_w,
             group_gap,
             ascii_start,
@@ -80,6 +86,44 @@ impl RowGeo {
     }
 }
 
+/// Draw a per-row byte histogram (value distribution) band: 32 bins across
+/// the byte-value range, bar height normalized to the row's maximum bin
+/// count, bars colored by the byte-class palette of each bin's value range.
+fn draw_histogram(
+    painter: &egui::Painter,
+    geo: &RowGeo,
+    data: &[u8],
+    row_start: usize,
+    n: usize,
+    y: f32,
+) {
+    const N_BINS: usize = 32;
+    let hist_rect = egui::Rect::from_min_size(
+        egui::pos2(geo.hex_start, y),
+        egui::vec2(geo.hex_w, HIST_H),
+    );
+    painter.rect_filled(hist_rect, 0.0, egui::Color32::from_gray(14));
+
+    let mut counts = [0u32; N_BINS];
+    for &b in &data[row_start..row_start + n] {
+        counts[(b as usize * N_BINS) / 256] += 1;
+    }
+    let max_c = counts.iter().copied().max().unwrap_or(1).max(1);
+    let bin_w = geo.hex_w / N_BINS as f32;
+    for (i, &c) in counts.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let bar_h = (c as f32 / max_c as f32) * HIST_H;
+        let mid = (((2 * i + 1) as u32 * 256) / (2 * N_BINS as u32)) as u8;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(hist_rect.min.x + i as f32 * bin_w, y + HIST_H - bar_h),
+            egui::pos2(hist_rect.min.x + (i as f32 + 1.0) * bin_w, y + HIST_H),
+        );
+        painter.rect_filled(bar, 0.0, color::class_color(mid));
+    }
+}
+
 /// Map a screen-space pointer to a file offset, or `None` when outside the
 /// content or over a gap.
 fn offset_from(
@@ -109,7 +153,7 @@ fn offset_from(
 
 pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     let bpr = app.bytes_per_row.max(1);
-    let block_h = ROW_H + 2.0 * MAP_H + BLOCK_GAP;
+    let block_h = BLOCK_H;
 
     let mut scroll_area = egui::ScrollArea::both()
         .auto_shrink([false, false])
@@ -119,6 +163,16 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
             .vertical_scroll_offset(0.0)
             .horizontal_scroll_offset(0.0);
         app.scroll_reset = false;
+    }
+    if let Some(off) = app.scroll_to_offset {
+        // Center the target row in the viewport.
+        let row = (off / bpr) as f32;
+        let view_h = ui.available_height().max(0.0);
+        let content_h = app.file_size.div_ceil(bpr) as f32 * block_h;
+        let max_scroll = (content_h - view_h).max(0.0);
+        let scroll = (row * block_h - view_h * 0.5).clamp(0.0, max_scroll);
+        scroll_area = scroll_area.vertical_scroll_offset(scroll);
+        app.scroll_to_offset = None;
     }
 
     let Some(data) = app.data() else { return };
@@ -141,7 +195,7 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     let mut viewport = egui::Rect::NOTHING;
     let mut origin = egui::Pos2::ZERO;
 
-    scroll_area.show_viewport(ui, |ui, vp| {
+    let out = scroll_area.show_viewport(ui, |ui, vp| {
         viewport = vp;
         ui.allocate_space(egui::vec2(content_w, total_rows as f32 * block_h));
         origin = ui.min_rect().min;
@@ -277,6 +331,16 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
                 }
             }
 
+            // Per-row byte histogram (value distribution) band.
+            draw_histogram(
+                &painter,
+                &geo,
+                data,
+                row_start,
+                n,
+                y0 + ROW_H + 2.0 * MAP_H,
+            );
+
             // Hover outline across all three representations of the byte.
             if let Some(o) = app.hovered_offset {
                 if (row_start..row_start + n).contains(&o) {
@@ -303,6 +367,14 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
             );
         }
     });
+
+    // Report the visible range of the file to the overview map.
+    app.view_height = viewport.height();
+    let content_h = total_rows as f32 * block_h;
+    if content_h > 0.0 {
+        app.view_frac = (out.state.offset.y / content_h).clamp(0.0, 1.0);
+        app.view_frac_h = (viewport.height() / content_h).clamp(0.0, 1.0);
+    }
 
     // ---- apply interaction results to shared state ----
     if let Some(o) = drag_started {

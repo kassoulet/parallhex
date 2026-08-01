@@ -24,8 +24,22 @@ pub struct EntropyMapApp {
     // One-shot: jump the central scroll area back to the top.
     pub scroll_reset: bool,
 
+    // One-shot: scroll the central view to a specific file offset.
+    pub scroll_to_offset: Option<usize>,
+
     // Cached Shannon entropy per `entropy_window`-sized block (whole file).
     pub entropies: Vec<f32>,
+
+    // Whole-file overview thumbnail (greyscale + entropy) for the side panel.
+    pub overview_image: Option<egui::ColorImage>,
+    pub overview_tex: Option<egui::TextureHandle>,
+    pub overview_dirty: bool,
+
+    // Visible fraction of the file in the central view, for the overview's
+    // viewport indicator.
+    pub view_frac: f32,
+    pub view_frac_h: f32,
+    pub view_height: f32,
 
     // Selection & hover state (shared by all four panes).
     pub hovered_offset: Option<usize>,
@@ -45,7 +59,14 @@ impl EntropyMapApp {
             bytes_per_row: 32,
             entropy_window: 256,
             scroll_reset: false,
+            scroll_to_offset: None,
             entropies: Vec::new(),
+            overview_image: None,
+            overview_tex: None,
+            overview_dirty: false,
+            view_frac: 0.0,
+            view_frac_h: 1.0,
+            view_height: 600.0,
             hovered_offset: None,
             selected_offset: None,
             selection_range: None,
@@ -79,6 +100,107 @@ impl EntropyMapApp {
             Some(d) => entropy::block_entropies(d, self.entropy_window),
             None => Vec::new(),
         };
+    }
+
+    /// Build a 2-row whole-file thumbnail: greyscale (top) and entropy
+    /// (bottom). Each column covers `len / width` bytes.
+    fn generate_overview(&mut self) {
+        let Some(data) = self.data() else {
+            self.overview_image = None;
+            self.overview_dirty = true;
+            return;
+        };
+        let len = data.len();
+        if len == 0 {
+            self.overview_image = None;
+            self.overview_dirty = true;
+            return;
+        }
+        const W: usize = 256;
+        const SAMPLES: usize = 8;
+        let mut pixels = vec![egui::Color32::from_gray(8); W * 2];
+        for x in 0..W {
+            let start = x * len / W;
+            let end = ((x + 1) * len / W).max(start + 1);
+            let mut sum = 0u32;
+            for k in 0..SAMPLES {
+                let off = (start + (end - start) * k / SAMPLES).min(len - 1);
+                sum += data[off] as u32;
+            }
+            pixels[x] = egui::Color32::from_gray((sum / SAMPLES as u32) as u8);
+            let mid = (start + (end - start) / 2).min(len - 1);
+            pixels[W + x] = color::entropy_color(self.entropy_at(mid));
+        }
+        self.overview_image = Some(egui::ColorImage {
+            size: [W, 2],
+            pixels,
+        });
+        self.overview_dirty = true;
+    }
+
+    /// Move the selection with the keyboard (arrows / PageUp / PageDown /
+    /// Home / End) and scroll the hex viewer to keep it centered.
+    fn keyboard_navigate(&mut self, ctx: &egui::Context) {
+        // Don't steal keys from a focused widget (e.g. the entropy slider).
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let len = match self.data() {
+            Some(d) => d.len(),
+            None => return,
+        };
+        if len == 0 {
+            return;
+        }
+        let bpr = self.bytes_per_row.max(1);
+        let page_rows = (self.view_height / panes::BLOCK_H).max(1.0) as usize;
+        let page_bytes = page_rows * bpr;
+
+        // `key_down` repeats while held, so holding an arrow key keeps moving.
+        let input = ctx.input(|i| i.clone());
+        let left = input.key_down(egui::Key::ArrowLeft);
+        let right = input.key_down(egui::Key::ArrowRight);
+        let up = input.key_down(egui::Key::ArrowUp);
+        let down = input.key_down(egui::Key::ArrowDown);
+        let pg_up = input.key_down(egui::Key::PageUp);
+        let pg_down = input.key_down(egui::Key::PageDown);
+        let home = input.key_down(egui::Key::Home);
+        let end = input.key_down(egui::Key::End);
+        if !(left || right || up || down || pg_up || pg_down || home || end) {
+            return;
+        }
+
+        // First navigation press with no selection yet: honor Home/End,
+        // otherwise place the cursor at offset 0.
+        let Some(cur) = self.selected_offset else {
+            let start = if end { len - 1 } else { 0 };
+            self.selected_offset = Some(start);
+            self.hovered_offset = Some(start);
+            self.scroll_to_offset = Some(start);
+            return;
+        };
+        let cur = cur.min(len - 1);
+        let next = if left {
+            cur.saturating_sub(1)
+        } else if right {
+            (cur + 1).min(len - 1)
+        } else if up {
+            cur.saturating_sub(bpr)
+        } else if down {
+            (cur + bpr).min(len - 1)
+        } else if pg_up {
+            cur.saturating_sub(page_bytes)
+        } else if pg_down {
+            (cur + page_bytes).min(len - 1)
+        } else if home {
+            0
+        } else {
+            len - 1
+        };
+
+        self.selected_offset = Some(next);
+        self.hovered_offset = Some(next);
+        self.scroll_to_offset = Some(next);
     }
 
     fn open_dialog(&mut self) {
@@ -117,7 +239,9 @@ impl EntropyMapApp {
         self.file_size = len;
         self.mmap = Some(Arc::new(mmap));
         self.recompute_entropies();
+        self.generate_overview();
         self.scroll_reset = true;
+        self.scroll_to_offset = None;
         self.hovered_offset = None;
         self.selected_offset = None;
         self.selection_range = None;
@@ -154,6 +278,7 @@ impl EntropyMapApp {
                 .changed()
             {
                 self.recompute_entropies();
+                self.generate_overview();
             }
 
             ui.separator();
@@ -221,12 +346,58 @@ impl EntropyMapApp {
         ));
         ui.separator();
 
+        self.overview_section(ui);
+        ui.separator();
+
         ui.strong("Inspector");
         self.byte_info(ui, "Hover:", self.hovered_offset);
         self.byte_info(ui, "Selected:", self.selected_offset);
         ui.separator();
 
         self.selection_section(ui);
+    }
+
+    /// Whole-file thumbnail (greyscale / entropy). Click or drag to jump the
+    /// central view to that offset; a translucent band marks the visible range.
+    fn overview_section(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Overview");
+        ui.label("Greyscale · Entropy — click to navigate");
+        let Some(tex) = self.overview_tex.clone() else {
+            ui.label("(no data)");
+            return;
+        };
+        let h = 56.0;
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), h),
+            egui::Sense::click_and_drag(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(10));
+        painter.image(
+            tex.id(),
+            rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        // Viewport indicator.
+        let y0 = rect.min.y + self.view_frac.clamp(0.0, 1.0) * rect.height();
+        let y1 = rect.min.y
+            + (self.view_frac + self.view_frac_h).clamp(0.0, 1.0) * rect.height();
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, y0), egui::pos2(rect.max.x, y1)),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+        );
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)));
+
+        // Click / drag navigation.
+        if resp.clicked() || resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let t = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                let off = (t * self.file_size as f32) as usize;
+                self.scroll_to_offset = Some(off.min(self.file_size.saturating_sub(1)));
+            }
+        }
     }
 
     fn byte_info(&mut self, ui: &mut egui::Ui, label: &str, off: Option<usize>) {
@@ -320,6 +491,13 @@ impl eframe::App for EntropyMapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command) {
             self.open_dialog();
+        }
+        self.keyboard_navigate(ctx);
+        if self.overview_dirty {
+            self.overview_dirty = false;
+            self.overview_tex = self.overview_image.clone().map(|img| {
+                ctx.load_texture("overview", img, egui::TextureOptions::NEAREST)
+            });
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_panel(ui));
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_panel(ui));
