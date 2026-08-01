@@ -131,8 +131,8 @@ impl EntropyMapApp {
             view_frac: 0.0,
             view_frac_h: 1.0,
             view_height: 600.0,
-            hex_zoom: 1.0,
-            pixel_zoom: 4.0,
+            hex_zoom: panes::HEX_ZOOM_DEFAULT,
+            pixel_zoom: panes::PIXEL_ZOOM_DEFAULT,
             scroll_rows: 0.0,
             hex_rect: egui::Rect::NOTHING,
             pixels_rect: egui::Rect::NOTHING,
@@ -460,10 +460,7 @@ impl EntropyMapApp {
                 self.open_jump_dialog();
             }
             ui.separator();
-            ui.label(format!(
-                "Zoom: hex ×{:.2} · px {} · drag pan, Ctrl+wheel zoom",
-                self.hex_zoom, self.pixel_zoom
-            ));
+            ui.label("Ctrl+wheel zoom · drag pan/select (hex: middle or Ctrl/Alt+drag) · right-click copy");
         });
     }
 
@@ -471,8 +468,10 @@ impl EntropyMapApp {
     /// viewport band; click or drag to navigate, hover previews the offset
     /// in the top bar.
     fn overview_column(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Overview");
-        ui.label("Whole file · greyscale / entropy");
+        // Whole file: the entire byte range is always visible here.
+        let range = (self.file_size > 0).then(|| panes::range_label(0, self.file_size));
+        panes::column_header(ui, "Overview", range, |_| {});
+        ui.label("Greyscale / entropy");
         let Some(tex) = self.overview_tex.clone() else {
             ui.label("(no data)");
             return;

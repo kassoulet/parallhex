@@ -130,16 +130,18 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 +------------------------+------------------------+---------------------+
 ```
 
+Each column has a header showing its **visible byte range** (e.g. `0x00000000 – 0x000000FF`; the overview column always shows the whole-file range) and — for the zoomable pixels/hex columns — a live zoom readout (`×1.00`, `4 px`) with a **Reset zoom** button that restores that column's default zoom.
+
 ### Three Synchronized Columns
 
-All three columns share one scroll position (`scroll_rows`, in rows). The **hex column is the master** (it owns the scrollbar); the pixels and overview columns follow it, and dragging the pixels column pans it back. A `Ctrl+wheel` / pinch over a column adjusts that column's zoom (hex row height ×0.5–4, pixel size 1–24 px).
+All three columns share one scroll position (`scroll_rows`, in rows). The **hex column is the master** (it owns the scrollbar); the pixels and overview columns follow it, and dragging any column pans it: primary drag pans the pixels and overview columns, while the hex column pans with a **middle-mouse drag** or a **Ctrl/Alt + primary drag** (its plain primary drag selects bytes instead). A `Ctrl+wheel` / pinch over a column adjusts that column's zoom (hex row height ×0.5–4, pixel size 1–24 px).
 
 1. **Hex column (right, central panel):**
    * Rows of `bytes_per_row` cells. Each cell shows `"%02X"` in a monospace font, **background filled with the Class palette color** (§3.C.1), high-contrast foreground text.
    * An ASCII column follows the hex cells on each row, showing `printable(b)` per byte (`'.'` for non-printable), same class-colored backgrounds.
    * Row headers show the starting offset `r*B` in `%08X`.
    * Selection range is highlighted (semi-transparent overlay across the selected cells); hovered cell gets a bright outline.
-   * Primary click + drag sets `selection_range`; right-click offers **Copy Hex / Copy ASCII / Clear selection**.
+   * Primary click + drag sets `selection_range`; right-click offers **Copy Hex / Copy ASCII / Clear selection**. Middle-mouse or Ctrl/Alt + primary drag pans the column (the same shared-scroll pan gesture as the pixels column).
 
 2. **Pixels column (middle):**
    * One `Color32::from_gray(byte)` pixel per byte on the top half of each row, one entropy-colored pixel (sliding-window entropy §3.B, gradient §3.C.3) on the bottom half.
@@ -167,7 +169,7 @@ All three columns share one scroll position (`scroll_rows`, in rows). The **hex 
 * **Entropy window** slider: `16..=4096`, logarithmic (default 256).
 * **Reset view** — jump scroll back to row 0.
 * **Jump to offset… (Ctrl+G)** — open the jump-to-offset dialog (live preview while typing).
-* **Zoom readout** — `hex ×… · px …` (Ctrl+wheel over the hex/pixels columns to zoom).
+* **Zoom readout** — `hex ×… · px …` (Ctrl+wheel over the hex/pixels columns to zoom); each zoomable column also has its own **Reset zoom** button in its header.
 * Error messages (yellow) are shown here too.
 
 There is **no side panel and no bottom status bar**: file info, hovered/selected byte readout, zoom state and error messages all live in the top bar. Selection copy actions are available from the hex column's right-click context menu (Copy Hex / Copy ASCII / Clear selection).

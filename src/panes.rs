@@ -15,9 +15,49 @@ const ADDR_X: f32 = 8.0;
 const ROW_H: f32 = 18.0;
 const ROW_GAP: f32 = 3.0;
 
+/// Zoom limits and defaults, shared between the wheel-zoom handlers, the
+/// column headers' readouts and their reset buttons.
+pub(crate) const HEX_ZOOM_DEFAULT: f32 = 1.0;
+pub(crate) const HEX_ZOOM_MIN: f32 = 0.5;
+pub(crate) const HEX_ZOOM_MAX: f32 = 4.0;
+pub(crate) const PIXEL_ZOOM_DEFAULT: f32 = 4.0;
+pub(crate) const PIXEL_ZOOM_MIN: f32 = 1.0;
+pub(crate) const PIXEL_ZOOM_MAX: f32 = 24.0;
+
 /// Height of one hex row at zoom `zoom` (1.0 = default).
 pub(crate) fn hex_row_h(zoom: f32) -> f32 {
     ROW_H * zoom
+}
+
+/// Format a half-open byte range as a hex header label, e.g.
+/// `0x00000000 – 0x000000FF`.
+pub(crate) fn range_label(start: usize, end_exclusive: usize) -> String {
+    if end_exclusive > start {
+        format!("0x{start:08X} – 0x{:08X}", end_exclusive - 1)
+    } else {
+        format!("0x{start:08X}")
+    }
+}
+
+/// Draw a column header: bold title, an optional muted byte-range label,
+/// and a right-aligned row of trailing widgets (e.g. a zoom readout and
+/// reset button). A separator line follows the header.
+pub(crate) fn column_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    range: Option<String>,
+    trailing: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.strong(title);
+        if let Some(r) = range {
+            ui.monospace(egui::RichText::new(r).color(egui::Color32::from_gray(150)));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            trailing(ui);
+        });
+    });
+    ui.separator();
 }
 
 /// Per-row horizontal geometry for one bytes-per-row layout.
@@ -115,17 +155,43 @@ fn offset_from(
 
 /// Hex column (right): class-colored hex + ASCII cells, one row per file
 /// row. This column owns the master vertical scrollbar; its position is
-/// written back to `app.scroll_rows` so the other columns follow. Drag
-/// selects a range; right-click copies / clears the selection; Ctrl+wheel
-/// zooms the row height.
+/// written back to `app.scroll_rows` so the other columns follow. Primary
+/// drag selects a range; **middle-mouse drag or Ctrl/Alt + primary drag
+/// pans** (the same gesture the other columns use); right-click copies /
+/// clears the selection; Ctrl+wheel zooms the row height.
 pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     let bpr = app.bytes_per_row.max(1);
+    let len = app.file_size;
+
+    // ---- column header: title, visible byte range, zoom + reset ----
+    let range = if len > 0 {
+        let block_h = hex_row_h(app.hex_zoom) + ROW_GAP;
+        let first = app.scroll_rows.floor().max(0.0) as usize;
+        let total_rows = len.div_ceil(bpr);
+        let vis_rows = ((ui.available_height() / block_h).ceil() as usize + 1)
+            .min(total_rows.saturating_sub(first));
+        Some(range_label(first * bpr, ((first + vis_rows) * bpr).min(len)))
+    } else {
+        None
+    };
+    column_header(ui, "Hex", range, |ui| {
+        ui.monospace(
+            egui::RichText::new(format!("×{:.2}", app.hex_zoom)).color(egui::Color32::from_gray(150)),
+        );
+        if ui
+            .add(egui::Button::new("Reset zoom").small())
+            .on_hover_text("Reset hex zoom to ×1.0")
+            .clicked()
+        {
+            app.hex_zoom = HEX_ZOOM_DEFAULT;
+        }
+    });
 
     // Ctrl+wheel / pinch zooms the hex cells.
     if ui.rect_contains_pointer(ui.max_rect()) {
         let z = ui.input(|i| i.zoom_delta());
         if z != 1.0 {
-            app.hex_zoom = (app.hex_zoom * z).clamp(0.5, 4.0);
+            app.hex_zoom = (app.hex_zoom * z).clamp(HEX_ZOOM_MIN, HEX_ZOOM_MAX);
         }
     }
     let row_h = hex_row_h(app.hex_zoom);
@@ -143,6 +209,27 @@ pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
         let row = (off / bpr) as f32;
         scroll_offset = (row * block_h - ui.available_height().max(0.0) * 0.5).max(0.0);
         app.scroll_to_offset = None;
+    }
+
+    // ---- drag-to-pan: middle mouse, or Ctrl/Alt + primary drag ----
+    // Plain primary drag still selects; this gesture matches the pixels
+    // column so all three views drag to pan. `app.hex_rect` (from last
+    // frame) gates the gesture to this column's content area.
+    let hex_rect = app.hex_rect; // Rect is Copy
+    let pan_active = ui.input(|i| {
+        let p = &i.pointer;
+        let middle = p.button_down(egui::PointerButton::Middle);
+        // `command` covers Ctrl on non-macOS and Cmd on macOS; the explicit
+        // `ctrl` covers the literal Ctrl key on macOS (Cmd is `command` there).
+        let modded = p.primary_down() && (i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt);
+        let over = p.interact_pos().is_some_and(|pos| hex_rect.contains(pos));
+        (middle || modded) && over
+    });
+    if pan_active {
+        // Content follows the cursor: dragging down (dy > 0) shows earlier
+        // rows, so the scroll offset decreases (mirrors show_pixels).
+        let dy = ui.input(|i| i.pointer.delta().y);
+        scroll_offset = (scroll_offset - dy).max(0.0);
     }
 
     let Some(data) = app.data() else { return };
@@ -190,26 +277,31 @@ pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
                 egui::Sense::click_and_drag(),
             );
 
-            if resp.drag_started() {
-                drag_started = resp
-                    .interact_pointer_pos()
-                    .and_then(|p| offset_from(p, origin, &geo, total_rows, len, block_h));
-            }
-            if resp.dragged() {
-                drag_pos = resp
-                    .interact_pointer_pos()
-                    .and_then(|p| offset_from(p, origin, &geo, total_rows, len, block_h));
-            }
-            if resp.drag_stopped() {
-                drag_stopped = true;
+            // While panning, the pointer belongs to the pan gesture: don't
+            // start or extend a selection. Hover is still reported so the
+            // readout stays live.
+            if !pan_active {
+                if resp.drag_started() {
+                    drag_started = resp
+                        .interact_pointer_pos()
+                        .and_then(|p| offset_from(p, origin, &geo, total_rows, len, block_h));
+                }
+                if resp.dragged() {
+                    drag_pos = resp
+                        .interact_pointer_pos()
+                        .and_then(|p| offset_from(p, origin, &geo, total_rows, len, block_h));
+                }
+                if resp.drag_stopped() {
+                    drag_stopped = true;
+                }
+                if resp.clicked() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        clicked = offset_from(p, origin, &geo, total_rows, len, block_h);
+                    }
+                }
             }
             if let Some(p) = resp.hover_pos() {
                 hovered = offset_from(p, origin, &geo, total_rows, len, block_h);
-            }
-            if resp.clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    clicked = offset_from(p, origin, &geo, total_rows, len, block_h);
-                }
             }
             resp.context_menu(|ui| {
                 if ui.button("Copy Hex").clicked() {
@@ -381,11 +473,36 @@ pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
 /// column), wheel to scroll, Ctrl+wheel to zoom, click to select a byte.
 pub fn show_pixels(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     let len = app.file_size;
+    let bpr = app.bytes_per_row.max(1);
+    let total_rows = len.div_ceil(bpr);
+
+    // ---- column header: title, visible byte range, zoom + reset ----
+    let range = if len > 0 {
+        let px = app.pixel_zoom.clamp(PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX);
+        let row_h = 2.0 * px + 1.0;
+        let first = app.scroll_rows.floor().max(0.0) as usize;
+        let vis_rows = ((ui.available_height() / row_h).ceil() as usize + 1)
+            .min(total_rows.saturating_sub(first));
+        Some(range_label(first * bpr, ((first + vis_rows) * bpr).min(len)))
+    } else {
+        None
+    };
+    column_header(ui, "Pixels", range, |ui| {
+        ui.monospace(
+            egui::RichText::new(format!("{} px", app.pixel_zoom.round() as u32))
+                .color(egui::Color32::from_gray(150)),
+        );
+        if ui
+            .add(egui::Button::new("Reset zoom").small())
+            .on_hover_text("Reset pixel zoom to 4 px")
+            .clicked()
+        {
+            app.pixel_zoom = PIXEL_ZOOM_DEFAULT;
+        }
+    });
     if len == 0 {
         return;
     }
-    let bpr = app.bytes_per_row.max(1);
-    let total_rows = len.div_ceil(bpr);
 
     let (rect, resp) = ui.allocate_exact_size(
         ui.available_size(),
@@ -396,9 +513,9 @@ pub fn show_pixels(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     // Ctrl+wheel / pinch zooms the pixel size.
     let z = ui.input(|i| i.zoom_delta());
     if resp.hovered() && z != 1.0 {
-        app.pixel_zoom = (app.pixel_zoom * z).clamp(1.0, 24.0);
+        app.pixel_zoom = (app.pixel_zoom * z).clamp(PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX);
     }
-    let px = app.pixel_zoom.clamp(1.0, 24.0);
+    let px = app.pixel_zoom.clamp(PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX);
     let band_h = px; // greyscale band height; entropy band sits below it
     let row_h = 2.0 * band_h + 1.0;
 
