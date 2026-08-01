@@ -165,6 +165,7 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 ### Command Line
 
 * **`entropymap <file>`** — opens the file on startup (optional positional argument; errors are shown in the status bar).
+* **`entropymap --help`** (or `-h`) — prints usage and exits. Unknown `-`-prefixed options print an error and exit instead of being treated as files. `--` ends option parsing, so a file whose name starts with `-` can be opened (e.g. `entropymap -- -foo.bin`).
 
 ### Top Panel Controls
 
