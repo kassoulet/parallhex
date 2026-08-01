@@ -130,13 +130,16 @@ pub struct EntropyMapApp {
     pub jump_focus_requested: bool,
 
     // Persisted layout prefs: the resizable side-panel widths plus the
-    // zooms / bytes-per-row, written to a config file. `saved_cfg` and
-    // `last_save` debounce the write so an unchanged layout never rewrites
-    // the file.
+    // zooms / bytes-per-row / entropy window, written to a config file.
+    // `saved_cfg` and `last_save` debounce the write so an unchanged layout
+    // never rewrites the file.
     pub overview_width: f32,
     pub pixels_width: f32,
     pub saved_cfg: config::Config,
     pub last_save: Instant,
+    // One-shot: show the side panels at the default widths next frame
+    // (used by "Reset all settings").
+    pub reset_panel_widths: bool,
 
     pub message: Option<String>,
 }
@@ -152,7 +155,7 @@ impl EntropyMapApp {
                 16 | 32 | 64 => prefs.bytes_per_row,
                 _ => 32,
             },
-            entropy_window: 256,
+            entropy_window: prefs.entropy_window.clamp(16, 4096),
             scroll_reset: false,
             scroll_to_offset: None,
             entropies: Vec::new(),
@@ -193,6 +196,7 @@ impl EntropyMapApp {
             pixels_width: prefs.pixels_width.clamp(200.0, 3000.0),
             saved_cfg: prefs,
             last_save: Instant::now(),
+            reset_panel_widths: false,
             message: None,
         };
         if let Some(path) = initial_file {
@@ -609,7 +613,15 @@ impl EntropyMapApp {
                 self.open_jump_dialog();
             }
             ui.separator();
-            ui.label("Ctrl+wheel or +/- zoom (pointer over column) · drag pan/select (hex: middle or Ctrl/Alt+drag) · right-click copy");
+            if ui
+                .button("Reset all settings")
+                .on_hover_text("Restore defaults: bytes/row, entropy window, zooms and panel widths")
+                .clicked()
+            {
+                self.reset_all_settings();
+            }
+            ui.separator();
+            ui.label("Zoom: Ctrl+wheel / +/- / header slider · drag pan/select (hex: middle or Ctrl/Alt+drag) · right-click copy");
         });
 
         // Right side of the top panel: the horizontal whole-file preview.
@@ -895,11 +907,36 @@ impl EntropyMapApp {
     fn current_config(&self) -> config::Config {
         config::Config {
             bytes_per_row: self.bytes_per_row,
+            entropy_window: self.entropy_window,
             hex_zoom: self.hex_zoom,
             pixel_zoom: self.pixel_zoom,
             overview_width: self.overview_width.round(),
             pixels_width: self.pixels_width.round(),
         }
+    }
+
+    /// Restore every persisted setting to its default: reset the live
+    /// values, write the config file immediately, and ask the side panels
+    /// to snap back to the default widths next frame.
+    fn reset_all_settings(&mut self) {
+        let defaults = config::Config::default();
+        self.bytes_per_row = defaults.bytes_per_row;
+        self.entropy_window = defaults.entropy_window;
+        self.hex_zoom = defaults.hex_zoom;
+        self.pixel_zoom = defaults.pixel_zoom;
+        self.overview_width = defaults.overview_width;
+        self.pixels_width = defaults.pixels_width;
+        self.reset_panel_widths = true;
+        self.scroll_reset = true;
+        self.recompute_entropies();
+        // The 2D overview regenerates with the new entropy window; the
+        // strip regenerates now.
+        self.overview_gen_size = None;
+        self.generate_strip();
+        config::save(&defaults);
+        self.saved_cfg = defaults;
+        self.last_save = Instant::now();
+        self.message = Some("Settings reset to defaults.".to_owned());
     }
 }
 
@@ -935,17 +972,35 @@ impl eframe::App for EntropyMapApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_panel(ui));
         // Capture the resizable panel widths each frame so they can be
         // persisted. `default_width` restores the saved width on launch.
-        let overview_resp = egui::SidePanel::left("overview")
+        // After "Reset all settings" the side panels snap back to the
+        // default widths for one frame (`exact_width` overrides egui's
+        // stored panel width; the freshly stored state keeps the default).
+        let reset_panels = std::mem::take(&mut self.reset_panel_widths);
+        let overview_panel = egui::SidePanel::left("overview")
             .resizable(true)
-            .default_width(self.overview_width)
-            .min_width(140.0)
-            .show(ctx, |ui| self.overview_column(ui));
+            .min_width(140.0);
+        let overview_resp = if reset_panels {
+            overview_panel
+                .exact_width(self.overview_width)
+                .show(ctx, |ui| self.overview_column(ui))
+        } else {
+            overview_panel
+                .default_width(self.overview_width)
+                .show(ctx, |ui| self.overview_column(ui))
+        };
         self.overview_width = overview_resp.response.rect.width();
-        let pixels_resp = egui::SidePanel::left("pixels")
+        let pixels_panel = egui::SidePanel::left("pixels")
             .resizable(true)
-            .default_width(self.pixels_width)
-            .min_width(200.0)
-            .show(ctx, |ui| panes::show_pixels(ui, self));
+            .min_width(200.0);
+        let pixels_resp = if reset_panels {
+            pixels_panel
+                .exact_width(self.pixels_width)
+                .show(ctx, |ui| panes::show_pixels(ui, self))
+        } else {
+            pixels_panel
+                .default_width(self.pixels_width)
+                .show(ctx, |ui| panes::show_pixels(ui, self))
+        };
         self.pixels_width = pixels_resp.response.rect.width();
         egui::CentralPanel::default().show(ctx, |ui| self.central_panel(ui));
 

@@ -57,15 +57,19 @@ pub(crate) fn column_header(
     range: Option<String>,
     trailing: impl FnOnce(&mut egui::Ui),
 ) {
+    // Title row: the trailing widgets (zoom controls) sit on the right and
+    // get the full row width to themselves.
     ui.horizontal(|ui| {
         ui.strong(title);
-        if let Some(r) = range {
-            ui.monospace(egui::RichText::new(r).color(egui::Color32::from_gray(150)));
-        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             trailing(ui);
         });
     });
+    // Second row: the visible byte range, on its own line so it never
+    // crowds the zoom controls.
+    if let Some(r) = range {
+        ui.monospace(egui::RichText::new(r).color(egui::Color32::from_gray(150)));
+    }
     ui.separator();
 }
 
@@ -80,9 +84,10 @@ struct RowGeo {
 }
 
 impl RowGeo {
-    fn new(ui: &egui::Ui, bpr: usize) -> Self {
-        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-        let char_w = ui.fonts(|f| f.glyph_width(&font_id, '0'));
+    /// Build the per-row geometry for the given (possibly zoom-scaled)
+    /// monospace font: every metric is derived from its glyph width.
+    fn new(ui: &egui::Ui, bpr: usize, font_id: &egui::FontId) -> Self {
+        let char_w = ui.fonts(|f| f.glyph_width(font_id, '0'));
         let addr_w = 8.0 * char_w;
         let hex_start = ADDR_X + addr_w + 12.0;
         let cell_w = 3.0 * char_w;
@@ -167,7 +172,8 @@ fn offset_from(
 /// written back to `app.scroll_rows` so the other columns follow. Primary
 /// drag selects a range; **middle-mouse drag or Ctrl/Alt + primary drag
 /// pans** (the same gesture the other columns use); right-click copies /
-/// clears the selection; Ctrl+wheel zooms the row height.
+/// clears the selection; Ctrl+wheel / `+`/`-` / the header slider zoom the
+/// text and row size.
 pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     let bpr = app.bytes_per_row.max(1);
     let len = app.file_size;
@@ -184,9 +190,6 @@ pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
         None
     };
     column_header(ui, "Hex", range, |ui| {
-        ui.monospace(
-            egui::RichText::new(format!("×{:.2}", app.hex_zoom)).color(egui::Color32::from_gray(150)),
-        );
         if ui
             .add(egui::Button::new("Reset zoom").small())
             .on_hover_text("Reset hex zoom to ×1.0")
@@ -194,6 +197,15 @@ pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
         {
             app.hex_zoom = HEX_ZOOM_DEFAULT;
         }
+        ui.spacing_mut().slider_width = 90.0;
+        ui.add(
+            egui::Slider::new(&mut app.hex_zoom, HEX_ZOOM_MIN..=HEX_ZOOM_MAX)
+                .logarithmic(true)
+                .show_value(false),
+        );
+        ui.monospace(
+            egui::RichText::new(format!("×{:.2}", app.hex_zoom)).color(egui::Color32::from_gray(150)),
+        );
     });
 
     // Ctrl+wheel / pinch zooms the hex cells.
@@ -247,8 +259,11 @@ pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
         return;
     }
     let total_rows = len.div_ceil(bpr);
-    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-    let geo = RowGeo::new(ui, bpr);
+    // The hex zoom scales the text size: cells, spacing, the address gutter
+    // and the row height all follow the scaled monospace font below.
+    let base_font = egui::TextStyle::Monospace.resolve(ui.style());
+    let font_id = egui::FontId::new(base_font.size * app.hex_zoom, base_font.family);
+    let geo = RowGeo::new(ui, bpr, &font_id);
     let content_w = geo.content_w();
     let content_h = total_rows as f32 * block_h;
     let sel = app.selection_range.clone();
@@ -497,10 +512,6 @@ pub fn show_pixels(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
         None
     };
     column_header(ui, "Pixels", range, |ui| {
-        ui.monospace(
-            egui::RichText::new(format!("{} px", app.pixel_zoom.round() as u32))
-                .color(egui::Color32::from_gray(150)),
-        );
         if ui
             .add(egui::Button::new("Reset zoom").small())
             .on_hover_text("Reset pixel zoom to 4 px")
@@ -508,6 +519,16 @@ pub fn show_pixels(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
         {
             app.pixel_zoom = PIXEL_ZOOM_DEFAULT;
         }
+        ui.spacing_mut().slider_width = 90.0;
+        ui.add(
+            egui::Slider::new(&mut app.pixel_zoom, PIXEL_ZOOM_MIN..=PIXEL_ZOOM_MAX)
+                .logarithmic(true)
+                .show_value(false),
+        );
+        ui.monospace(
+            egui::RichText::new(format!("{} px", app.pixel_zoom.round() as u32))
+                .color(egui::Color32::from_gray(150)),
+        );
     });
     if len == 0 {
         return;

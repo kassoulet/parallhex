@@ -1,4 +1,5 @@
-//! Persisted UI preferences: layout, zooms and bytes-per-row.
+//! Persisted UI preferences: layout, zooms, bytes-per-row and the entropy
+//! window.
 //!
 //! Stored as a tiny `key = value` text file in the platform config
 //! directory, so no serialization dependency is needed. Loading is
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Config {
     pub bytes_per_row: usize,
+    pub entropy_window: usize,
     pub hex_zoom: f32,
     pub pixel_zoom: f32,
     pub overview_width: f32,
@@ -22,6 +24,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bytes_per_row: 32,
+            entropy_window: 256,
             hex_zoom: 1.0,
             pixel_zoom: 4.0,
             overview_width: 200.0,
@@ -83,6 +86,11 @@ pub fn parse(text: &str) -> Config {
                     cfg.bytes_per_row = n;
                 }
             }
+            "entropy_window" => {
+                if let Ok(n) = value.parse() {
+                    cfg.entropy_window = n;
+                }
+            }
             "hex_zoom" => {
                 if let Ok(f) = value.parse::<f32>() {
                     if f.is_finite() {
@@ -123,11 +131,13 @@ pub fn serialize(cfg: &Config) -> String {
     format!(
         "# EntropyMap preferences\n\
          bytes_per_row = {}\n\
+         entropy_window = {}\n\
          hex_zoom = {}\n\
          pixel_zoom = {}\n\
          overview_width = {}\n\
          pixels_width = {}\n",
         cfg.bytes_per_row,
+        cfg.entropy_window,
         cfg.hex_zoom,
         cfg.pixel_zoom,
         cfg.overview_width.round(),
@@ -163,6 +173,7 @@ mod tests {
     fn parse_round_trip() {
         let cfg = Config {
             bytes_per_row: 64,
+            entropy_window: 512,
             hex_zoom: 2.0,
             pixel_zoom: 8.0,
             overview_width: 250.0,
@@ -172,15 +183,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_entropy_window() {
+        assert_eq!(parse("entropy_window = 1024").entropy_window, 1024);
+        assert_eq!(parse("entropy_window = abc").entropy_window, 256);
+    }
+
+    #[test]
     fn parse_ignores_unknown_and_malformed_lines() {
         let cfg = parse(
             "# comment\n\
              bytes_per_row = 64\n\
+             entropy_window = 1024\n\
              unknown_key = 1\n\
              hex_zoom = 2.5\n\
              garbage line without equals\n",
         );
         assert_eq!(cfg.bytes_per_row, 64);
+        assert_eq!(cfg.entropy_window, 1024);
         assert_eq!(cfg.hex_zoom, 2.5);
         // Everything else keeps its default.
         assert_eq!(cfg.pixel_zoom, 4.0);

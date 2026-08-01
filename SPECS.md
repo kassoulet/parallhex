@@ -132,11 +132,11 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 +------------------------+------------------------+---------------------+
 ```
 
-Each column has a header showing its **visible byte range** (e.g. `0x00000000 – 0x000000FF`; the overview column always shows the whole-file range) and — for the zoomable pixels/hex columns — a live zoom readout (`×1.00`, `4 px`) with a **Reset zoom** button that restores that column's default zoom.
+Each column has a header showing its **visible byte range** (e.g. `0x00000000 – 0x000000FF`; the overview column always shows the whole-file range) and — for the zoomable pixels/hex columns — a live zoom readout (`×1.00`, `4 px`), a **zoom slider** and a **Reset zoom** button that restores that column's default zoom.
 
 ### Three Synchronized Columns
 
-All three columns share one scroll position (`scroll_rows`, in rows). The **hex column is the master** (it owns the scrollbar); the pixels and overview columns follow it, and dragging any column pans it: primary drag pans the pixels and overview columns, while the hex column pans with a **middle-mouse drag** or a **Ctrl/Alt + primary drag** (its plain primary drag selects bytes instead). A `Ctrl+wheel` / pinch over a column adjusts that column's zoom (hex row height ×0.5–4, pixel size 1–24 px).
+All three columns share one scroll position (`scroll_rows`, in rows). The **hex column is the master** (it owns the scrollbar); the pixels and overview columns follow it, and dragging any column pans it: primary drag pans the pixels and overview columns, while the hex column pans with a **middle-mouse drag** or a **Ctrl/Alt + primary drag** (its plain primary drag selects bytes instead). A `Ctrl+wheel` / pinch over a column adjusts that column's zoom (hex text/row size ×0.5–4, pixel size 1–24 px); each header also has a zoom slider.
 
 1. **Hex column (right, central panel):**
    * Rows of `bytes_per_row` cells. Each cell shows `"%02X"` in a monospace font, **background filled with the Class palette color** (§3.C.1), high-contrast foreground text.
@@ -144,6 +144,7 @@ All three columns share one scroll position (`scroll_rows`, in rows). The **hex 
    * Row headers show the starting offset `r*B` in `%08X`.
    * Selection range is highlighted (semi-transparent overlay across the selected cells); hovered cell gets a bright outline.
    * Primary click + drag sets `selection_range`; right-click offers **Copy Hex / Copy ASCII / Clear selection**. Middle-mouse or Ctrl/Alt + primary drag pans the column (the same shared-scroll pan gesture as the pixels column).
+   * Zoom scales the **text size** (and thus the cell widths and row height): Ctrl+wheel / `+`/`-` / the header slider all adjust it from ×0.5 to ×4.
 
 2. **Pixels column (middle):**
    * One `Color32::from_gray(byte)` pixel per byte on the top half of each row, one entropy-colored pixel (sliding-window entropy §3.B, gradient §3.C.3) on the bottom half.
@@ -170,8 +171,9 @@ All three columns share one scroll position (`scroll_rows`, in rows). The **hex 
 * **Bytes/Row** combo: `16 / 32 / 64` (default 32; wider rows fill the wide window).
 * **Entropy window** slider: `16..=4096`, logarithmic (default 256).
 * **Reset view** — jump scroll back to row 0.
+* **Reset all settings** — restore defaults for bytes-per-row, the entropy window, both zooms and the panel widths (the config file is written immediately).
 * **Jump to offset… (Ctrl+G)** — open the jump-to-offset dialog (live preview while typing).
-* **Zoom readout** — `hex ×… · px …` (Ctrl+wheel over the hex/pixels columns, or `+`/`=`/`-` with the pointer over a zoomable column, to zoom); each zoomable column also has its own **Reset zoom** button in its header.
+* **Zoom readout** — `hex ×… · px …` (Ctrl+wheel over the hex/pixels columns, or `+`/`=`/`-` with the pointer over a zoomable column, to zoom); each zoomable column header also has a **zoom slider** and a **Reset zoom** button.
 * **Horizontal preview strip** — a whole-file greyscale/entropy strip at the right of the top bar with a viewport band; hover previews the offset, click / drag navigates.
 * Error messages (yellow) are shown here too.
 
@@ -182,6 +184,7 @@ There is **no side panel and no bottom status bar**: file info, hovered/selected
 The following UI settings are saved to a small `key = value` text file in the platform config directory (`$XDG_CONFIG_HOME` on Linux, `$APPDATA` on Windows, `~/Library/Application Support` on macOS — otherwise `~/.config/entropymap/config.txt`) and restored on the next launch:
 
 * `bytes_per_row` — bytes-per-row (16 / 32 / 64).
+* `entropy_window` — the entropy window size (16–4096).
 * `hex_zoom`, `pixel_zoom` — the two per-column zooms.
 * `overview_width`, `pixels_width` — the resizable side-panel widths.
 
