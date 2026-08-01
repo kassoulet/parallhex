@@ -172,11 +172,13 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 * File name, size (`human_size`).
 * Inspector: hovered and selected byte — offset (`0x%08X`), value (`0x%02X`), printable char, and local entropy `H`.
 * Selection section: range `0x…–0x…`, length, **Copy Hex**, **Copy ASCII**, **Clear**.
-* **Mini overview map**: a whole-file thumbnail — greyscale row on top, entropy row below — with click/drag navigation (jumps the central view to the clicked offset, centered) and a translucent band showing the currently visible range.
+* **Mini overview map**: a whole-file thumbnail — greyscale row on top, entropy row below — with click/drag navigation (jumps the central view to the clicked offset, centered, and selects/hovers the byte so the status bar and inspector update immediately), a translucent band showing the currently visible range, and hover preview: moving the pointer over the map shows the file offset (with byte value + entropy) under the cursor in the bottom status bar.
 
 ### Bottom Status Bar
 
 `Offset: 0x… Byte: 0x… 'c' H=…` under cursor · file size · `Rows: R · Bytes/row: B`.
+
+* Hovering the overview map shows `Preview: 0x… Byte: 0x… 'c' H=…` for the offset under the cursor (highest priority); otherwise the hovered content byte, falling back to the selected byte when not hovering the content.
 
 ---
 

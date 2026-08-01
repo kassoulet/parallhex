@@ -47,6 +47,10 @@ pub struct EntropyMapApp {
     pub selection_range: Option<Range<usize>>,
     pub drag_start: Option<usize>,
 
+    // Offset under the pointer while hovering the overview map (previewed
+    // in the status bar; does not touch the panes' hover/selection).
+    pub overview_hover_offset: Option<usize>,
+
     pub message: Option<String>,
 }
 
@@ -71,6 +75,7 @@ impl EntropyMapApp {
             selected_offset: None,
             selection_range: None,
             drag_start: None,
+            overview_hover_offset: None,
             message: None,
         }
     }
@@ -246,6 +251,7 @@ impl EntropyMapApp {
         self.selected_offset = None;
         self.selection_range = None;
         self.drag_start = None;
+        self.overview_hover_offset = None;
         self.message = None;
     }
 
@@ -290,21 +296,43 @@ impl EntropyMapApp {
 
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if let Some(off) = self.hovered_offset {
+            // Preview the offset under the cursor in the overview map first.
+            if let Some(off) = self.overview_hover_offset {
                 if let Some(d) = self.data() {
                     if off < d.len() {
                         let b = d[off];
                         let h = self.entropy_at(off);
-                        ui.label(format!(
-                            "Offset: 0x{off:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
-                            color::printable(b)
-                        ));
+                        ui.colored_label(
+                            egui::Color32::from_gray(180),
+                            format!(
+                                "Preview: 0x{off:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
+                                color::printable(b)
+                            ),
+                        );
                     } else {
                         ui.label("Offset: —");
                     }
                 }
             } else {
-                ui.label("Offset: —");
+                // Show the hovered byte, or the selected byte when not
+                // hovering the content.
+                let off = self.hovered_offset.or(self.selected_offset);
+                if let Some(off) = off {
+                    if let Some(d) = self.data() {
+                        if off < d.len() {
+                            let b = d[off];
+                            let h = self.entropy_at(off);
+                            ui.label(format!(
+                                "Offset: 0x{off:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
+                                color::printable(b)
+                            ));
+                        } else {
+                            ui.label("Offset: —");
+                        }
+                    }
+                } else {
+                    ui.label("Offset: —");
+                }
             }
             ui.separator();
             ui.label(format!(
@@ -390,12 +418,26 @@ impl EntropyMapApp {
         );
         painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)));
 
-        // Click / drag navigation.
+        // Hover: preview the file offset under the cursor in the status bar.
+        self.overview_hover_offset = match resp.hover_pos() {
+            Some(p) => {
+                let t = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                let off = (t * self.file_size as f32) as usize;
+                Some(off.min(self.file_size.saturating_sub(1)))
+            }
+            None => None,
+        };
+
+        // Click / drag navigation: jump to the offset and select it so the
+        // status bar and inspector update immediately.
         if resp.clicked() || resp.dragged() {
             if let Some(p) = resp.interact_pointer_pos() {
                 let t = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
                 let off = (t * self.file_size as f32) as usize;
-                self.scroll_to_offset = Some(off.min(self.file_size.saturating_sub(1)));
+                let off = off.min(self.file_size.saturating_sub(1));
+                self.scroll_to_offset = Some(off);
+                self.selected_offset = Some(off);
+                self.hovered_offset = Some(off);
             }
         }
     }
@@ -500,12 +542,14 @@ impl eframe::App for EntropyMapApp {
             });
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_panel(ui));
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_panel(ui));
+        // Side panel before bottom panel: the status bar reads the overview
+        // hover offset computed this frame, so the preview has no lag.
         egui::SidePanel::right("side")
             .resizable(true)
             .default_width(360.0)
             .min_width(280.0)
             .show(ctx, |ui| self.side_panel(ui));
+        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_panel(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.central_panel(ui));
     }
 }
