@@ -85,6 +85,15 @@ pub struct EntropyMapApp {
     pub view_frac_h: f32,
     pub view_height: f32,
 
+    // Three-column layout: per-column zoom, the shared scroll position (in
+    // rows; the hex column is the master) and each column's content rect.
+    pub hex_zoom: f32,
+    pub pixel_zoom: f32,
+    pub scroll_rows: f32,
+    pub hex_rect: egui::Rect,
+    pub pixels_rect: egui::Rect,
+    pub overview_rect: egui::Rect,
+
     // Selection & hover state (shared by all four panes).
     pub hovered_offset: Option<usize>,
     pub selected_offset: Option<usize>,
@@ -122,6 +131,12 @@ impl EntropyMapApp {
             view_frac: 0.0,
             view_frac_h: 1.0,
             view_height: 600.0,
+            hex_zoom: 1.0,
+            pixel_zoom: 4.0,
+            scroll_rows: 0.0,
+            hex_rect: egui::Rect::NOTHING,
+            pixels_rect: egui::Rect::NOTHING,
+            overview_rect: egui::Rect::NOTHING,
             hovered_offset: None,
             selected_offset: None,
             selection_range: None,
@@ -216,7 +231,8 @@ impl EntropyMapApp {
             return;
         }
         let bpr = self.bytes_per_row.max(1);
-        let page_rows = (self.view_height / panes::BLOCK_H).max(1.0) as usize;
+        // Page size: (view height / zoomed hex row height) rows, times bpr.
+        let page_rows = (self.view_height / panes::hex_row_h(self.hex_zoom)).max(1.0) as usize;
         let page_bytes = page_rows * bpr;
 
         // `key_down` repeats while held, so holding an arrow key keeps moving.
@@ -314,6 +330,7 @@ impl EntropyMapApp {
         self.recompute_entropies();
         self.generate_overview();
         self.scroll_reset = true;
+        self.scroll_rows = 0.0;
         self.scroll_to_offset = None;
         self.hovered_offset = None;
         self.selected_offset = None;
@@ -327,6 +344,79 @@ impl EntropyMapApp {
     }
 
     fn top_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("EntropyMap");
+            ui.separator();
+
+            // File info (moved from the old side panel).
+            let fname = self
+                .file_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<no file>".to_owned());
+            ui.label(format!(
+                "{fname} · {} bytes ({})",
+                self.file_size,
+                color::human_size(self.file_size)
+            ));
+            ui.separator();
+
+            // Hovered / selected byte info (moved from the old side panel).
+            let off = self
+                .overview_hover_offset
+                .or(self.hovered_offset)
+                .or(self.selected_offset);
+            if let Some(off) = off {
+                if let Some(d) = self.data() {
+                    if off < d.len() {
+                        let b = d[off];
+                        let h = self.entropy_at(off);
+                        ui.label(format!(
+                            "0x{off:08X} · 0x{b:02X} '{}' · H={h:.3}",
+                            color::printable(b)
+                        ));
+                    }
+                }
+            }
+
+            // Jump-dialog live preview while typing.
+            if self.show_jump_dialog {
+                ui.separator();
+                match Self::parse_offset(&self.jump_input) {
+                    Some(o) if o < self.file_size => {
+                        if let Some(d) = self.data() {
+                            let b = d[o];
+                            let h = self.entropy_at(o);
+                            ui.colored_label(
+                                egui::Color32::from_gray(180),
+                                format!(
+                                    "Jump: 0x{o:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
+                                    color::printable(b)
+                                ),
+                            );
+                        }
+                    }
+                    Some(o) => {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            format!(
+                                "Out of range: 0x{o:X} (file is 0x{:X} bytes).",
+                                self.file_size
+                            ),
+                        );
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::YELLOW, "Jump: invalid offset");
+                    }
+                }
+            }
+            ui.separator();
+            if let Some(msg) = self.message.clone() {
+                ui.colored_label(egui::Color32::YELLOW, msg);
+            }
+        });
+
         ui.horizontal_wrapped(|ui| {
             if ui.button("Open File…").clicked() {
                 self.open_dialog();
@@ -369,152 +459,29 @@ impl EntropyMapApp {
             {
                 self.open_jump_dialog();
             }
-        });
-    }
-
-    fn bottom_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // While the jump dialog is open, live-preview the offset being
-            // typed; it takes precedence over the hover/selection previews.
-            if self.show_jump_dialog {
-                match Self::parse_offset(&self.jump_input) {
-                    Some(o) if o < self.file_size => {
-                        if let Some(d) = self.data() {
-                            let b = d[o];
-                            let h = self.entropy_at(o);
-                            ui.colored_label(
-                                egui::Color32::from_gray(180),
-                                format!(
-                                    "Jump: 0x{o:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
-                                    color::printable(b)
-                                ),
-                            );
-                        } else {
-                            ui.label("Jump: —");
-                        }
-                    }
-                    Some(o) => {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            format!(
-                                "Out of range: 0x{o:X} (file is 0x{:X} bytes).",
-                                self.file_size
-                            ),
-                        );
-                    }
-                    None => {
-                        ui.colored_label(egui::Color32::YELLOW, "Jump: invalid offset");
-                    }
-                }
-                ui.separator();
-            }
-
-            // Preview the offset under the cursor in the overview map first.
-            if let Some(off) = self.overview_hover_offset {
-                if let Some(d) = self.data() {
-                    if off < d.len() {
-                        let b = d[off];
-                        let h = self.entropy_at(off);
-                        ui.colored_label(
-                            egui::Color32::from_gray(180),
-                            format!(
-                                "Preview: 0x{off:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
-                                color::printable(b)
-                            ),
-                        );
-                    } else {
-                        ui.label("Offset: —");
-                    }
-                }
-            } else {
-                // Show the hovered byte, or the selected byte when not
-                // hovering the content.
-                let off = self.hovered_offset.or(self.selected_offset);
-                if let Some(off) = off {
-                    if let Some(d) = self.data() {
-                        if off < d.len() {
-                            let b = d[off];
-                            let h = self.entropy_at(off);
-                            ui.label(format!(
-                                "Offset: 0x{off:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
-                                color::printable(b)
-                            ));
-                        } else {
-                            ui.label("Offset: —");
-                        }
-                    }
-                } else {
-                    ui.label("Offset: —");
-                }
-            }
             ui.separator();
             ui.label(format!(
-                "Size: {} ({})",
-                self.file_size,
-                color::human_size(self.file_size)
+                "Zoom: hex ×{:.2} · px {} · drag pan, Ctrl+wheel zoom",
+                self.hex_zoom, self.pixel_zoom
             ));
-            ui.separator();
-            let rows = self.file_size.div_ceil(self.bytes_per_row.max(1));
-            ui.label(format!("Rows: {rows}  Bytes/Row: {}", self.bytes_per_row));
-            if let Some(msg) = &self.message {
-                ui.separator();
-                ui.colored_label(egui::Color32::YELLOW, msg);
-            }
         });
     }
 
-    fn side_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("EntropyMap");
-        ui.label("Wide hex-viewer binary explorer");
-        ui.separator();
-
-        if self.mmap.is_none() {
-            ui.label("No file loaded.\n\nClick “Open File…” or press Ctrl/Cmd+O to open a binary file.");
-            return;
-        }
-
-        let fname = self
-            .file_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "<unknown>".to_owned());
-        ui.label(format!("File: {fname}"));
-        ui.label(format!(
-            "Size: {} bytes ({})",
-            self.file_size,
-            color::human_size(self.file_size)
-        ));
-        ui.separator();
-
-        self.overview_section(ui);
-        ui.separator();
-
-        ui.strong("Inspector");
-        self.byte_info(ui, "Hover:", self.hovered_offset);
-        self.byte_info(ui, "Selected:", self.selected_offset);
-        ui.separator();
-
-        self.row_histogram_section(ui);
-        ui.separator();
-
-        self.selection_section(ui);
-    }
-
-    /// Whole-file thumbnail (greyscale / entropy). Click or drag to jump the
-    /// central view to that offset; a translucent band marks the visible range.
-    fn overview_section(&mut self, ui: &mut egui::Ui) {
+    /// Left column: whole-file thumbnail (greyscale / entropy) with a
+    /// viewport band; click or drag to navigate, hover previews the offset
+    /// in the top bar.
+    fn overview_column(&mut self, ui: &mut egui::Ui) {
         ui.strong("Overview");
-        ui.label("Greyscale · Entropy — click to navigate");
+        ui.label("Whole file · greyscale / entropy");
         let Some(tex) = self.overview_tex.clone() else {
             ui.label("(no data)");
             return;
         };
-        let h = 56.0;
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), h),
+            egui::vec2(ui.available_width(), 56.0),
             egui::Sense::click_and_drag(),
         );
+        self.overview_rect = rect;
         let painter = ui.painter();
         painter.rect_filled(rect, 2.0, egui::Color32::from_gray(10));
         painter.image(
@@ -523,21 +490,21 @@ impl EntropyMapApp {
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
-        // Viewport indicator.
-        let y0 = rect.min.y + self.view_frac.clamp(0.0, 1.0) * rect.height();
-        let y1 = rect.min.y
-            + (self.view_frac + self.view_frac_h).clamp(0.0, 1.0) * rect.height();
+        // Viewport indicator (x maps to file offset).
+        let x0 = rect.min.x + self.view_frac.clamp(0.0, 1.0) * rect.width();
+        let x1 = rect.min.x
+            + (self.view_frac + self.view_frac_h).clamp(0.0, 1.0) * rect.width();
         painter.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(rect.min.x, y0), egui::pos2(rect.max.x, y1)),
+            egui::Rect::from_min_max(egui::pos2(x0, rect.min.y), egui::pos2(x1, rect.max.y)),
             0.0,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
         );
         painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)));
 
-        // Hover: preview the file offset under the cursor in the status bar.
+        // Hover: preview the file offset under the cursor in the top bar.
         self.overview_hover_offset = match resp.hover_pos() {
             Some(p) => {
-                let t = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                let t = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
                 let off = (t * self.file_size as f32) as usize;
                 Some(off.min(self.file_size.saturating_sub(1)))
             }
@@ -545,10 +512,10 @@ impl EntropyMapApp {
         };
 
         // Click / drag navigation: jump to the offset and select it so the
-        // status bar and inspector update immediately.
+        // top bar and hex view update immediately.
         if resp.clicked() || resp.dragged() {
             if let Some(p) = resp.interact_pointer_pos() {
-                let t = ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                let t = ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
                 let off = (t * self.file_size as f32) as usize;
                 let off = off.min(self.file_size.saturating_sub(1));
                 self.scroll_to_offset = Some(off);
@@ -556,6 +523,7 @@ impl EntropyMapApp {
                 self.hovered_offset = Some(off);
             }
         }
+        ui.label("Click / drag to navigate");
     }
 
     /// Parse a user-supplied offset as hex: `0x` prefix optional, underscores
@@ -649,165 +617,6 @@ impl EntropyMapApp {
         }
     }
 
-    /// Value distribution of the hovered (or selected) row: a compact 32-bin
-    /// histogram strip plus the distinct byte values with their counts.
-    fn row_histogram_section(&mut self, ui: &mut egui::Ui) {
-        // Prefer the hovered row; fall back to the selected row so the
-        // inspector stays live after the pointer leaves the content.
-        let off = self.hovered_offset.or(self.selected_offset);
-        let Some(off) = off else { return };
-        let Some(data) = self.data() else { return };
-        let bpr = self.bytes_per_row.max(1);
-        let row = off / bpr;
-        let start = row * bpr;
-        let end = (start + bpr).min(data.len());
-        if start >= end {
-            return;
-        }
-        let bytes = &data[start..end];
-
-        ui.strong("Row histogram");
-        ui.label(format!("Row 0x{start:08X} – 0x{:08X} ({n} bytes)", end - 1, n = bytes.len()));
-
-        // ---- compact 32-bin strip (same bins/colors as the entropy pane) ----
-        let counts = panes::row_bin_counts(bytes);
-        let max_c = counts.iter().copied().max().unwrap_or(1).max(1);
-        let strip_h = 24.0;
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), strip_h),
-            egui::Sense::hover(),
-        );
-        let painter = ui.painter();
-        let n = panes::N_BINS;
-        let gap = 1.5;
-        let bar_w = ((rect.width() - gap * (n - 1) as f32) / n as f32).max(1.0);
-        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(14));
-        for (i, &c) in counts.iter().enumerate() {
-            let x0 = rect.min.x + i as f32 * (bar_w + gap);
-            let bar_h = if c == 0 {
-                2.0
-            } else {
-                (c as f32 / max_c as f32) * (strip_h - 2.0)
-            };
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(x0, rect.max.y - bar_h),
-                    egui::pos2(x0 + bar_w, rect.max.y),
-                ),
-                0.0,
-                color::class_color(panes::bin_mid(i)),
-            );
-        }
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)));
-
-        // ---- distinct byte values with counts ----
-        let mut counts_by_value: Vec<(u8, u32)> = Vec::new();
-        for &b in bytes {
-            match counts_by_value.iter_mut().find(|(v, _)| *v == b) {
-                Some((_, c)) => *c += 1,
-                None => counts_by_value.push((b, 1)),
-            }
-        }
-        counts_by_value.sort_unstable();
-        ui.horizontal_wrapped(|ui| {
-            // The hovered byte (when it's in this row) is highlighted.
-            let hovered_byte = self
-                .hovered_offset
-                .filter(|h| (start..end).contains(h))
-                .map(|h| data[h]);
-            for (i, (b, c)) in counts_by_value.iter().enumerate().take(12) {
-                let text = format!("{b:02X}×{c}");
-                if Some(*b) == hovered_byte {
-                    ui.colored_label(egui::Color32::YELLOW, text);
-                } else {
-                    ui.monospace(text);
-                }
-                if i < counts_by_value.len().saturating_sub(1).min(11) {
-                    ui.separator();
-                }
-            }
-        });
-        if counts_by_value.len() > 12 {
-            ui.label(format!("+ {} more values…", counts_by_value.len() - 12));
-        }
-    }
-
-    fn byte_info(&mut self, ui: &mut egui::Ui, label: &str, off: Option<usize>) {
-        ui.horizontal(|ui| {
-            ui.label(label);
-            if let Some(o) = off {
-                if let Some(d) = self.data() {
-                    if o < d.len() {
-                        let b = d[o];
-                        let h = self.entropy_at(o);
-                        ui.label(format!(
-                            "0x{o:08X} · 0x{b:02X} '{}' · H={h:.3}",
-                            color::printable(b)
-                        ));
-                        return;
-                    }
-                }
-            }
-            ui.label("—");
-        });
-    }
-
-    fn selection_section(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Selection");
-        if let Some(r) = self.selection_range.clone() {
-            let start = r.start;
-            let end = r.end.min(self.file_size);
-            let len = end.saturating_sub(start);
-            ui.label(format!(
-                "Range: 0x{start:08X} – 0x{:08X}",
-                end.saturating_sub(1)
-            ));
-            ui.label(format!("Length: {len} bytes ({})", color::human_size(len)));
-            if start < end && start < self.file_size {
-                let mut action: Option<&'static str> = None;
-                ui.horizontal(|ui| {
-                    if ui.button("Copy Hex").clicked() {
-                        action = Some("hex");
-                    }
-                    if ui.button("Copy ASCII").clicked() {
-                        action = Some("ascii");
-                    }
-                    if ui.button("Clear").clicked() {
-                        action = Some("clear");
-                    }
-                });
-                match action {
-                    Some("clear") => self.selection_range = None,
-                    Some(kind) => {
-                        if let Some(d) = self.data() {
-                            let end = end.min(d.len());
-                            if start < end {
-                                if kind == "hex" {
-                                    let s: String = d[start..end]
-                                        .iter()
-                                        .map(|b| format!("{b:02X}"))
-                                        .collect::<Vec<_>>()
-                                        .join(" ");
-                                    ui.ctx().copy_text(s);
-                                } else {
-                                    let s: String = d[start..end]
-                                        .iter()
-                                        .map(|&b| color::printable(b))
-                                        .collect();
-                                    ui.ctx().copy_text(s);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            ui.label("Drag on the map to select a range.");
-            ui.label("Click to pick a single byte.");
-        }
-    }
-
     fn central_panel(&mut self, ui: &mut egui::Ui) {
         if self.mmap.is_none() {
             ui.centered_and_justified(|ui| {
@@ -815,7 +624,7 @@ impl EntropyMapApp {
             });
             return;
         }
-        panes::show_central(ui, self);
+        panes::show_hex(ui, self);
     }
 }
 
@@ -842,15 +651,28 @@ impl eframe::App for EntropyMapApp {
             });
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_panel(ui));
-        // Side panel before bottom panel: the status bar reads the overview
-        // hover offset computed this frame, so the preview has no lag.
-        egui::SidePanel::right("side")
+        egui::SidePanel::left("overview")
             .resizable(true)
-            .default_width(360.0)
-            .min_width(280.0)
-            .show(ctx, |ui| self.side_panel(ui));
-        egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_panel(ui));
+            .default_width(200.0)
+            .min_width(140.0)
+            .show(ctx, |ui| self.overview_column(ui));
+        egui::SidePanel::left("pixels")
+            .resizable(true)
+            .default_width(320.0)
+            .min_width(200.0)
+            .show(ctx, |ui| panes::show_pixels(ui, self));
         egui::CentralPanel::default().show(ctx, |ui| self.central_panel(ui));
+
+        // Clear the shared hover once the pointer leaves every column.
+        let hover_pos = ctx.pointer_hover_pos();
+        let in_columns = hover_pos.is_some_and(|p| {
+            self.overview_rect.contains(p)
+                || self.pixels_rect.contains(p)
+                || self.hex_rect.contains(p)
+        });
+        if !in_columns {
+            self.hovered_offset = None;
+        }
     }
 }
 
@@ -891,10 +713,10 @@ mod tests {
 
     #[test]
     fn page_size_matches_view_geometry() {
-        // The page size used by keyboard_navigate: (view_height / BLOCK_H)
+        // The page size used by keyboard_navigate: (view_height / hex_row_h)
         // rows, rounded up, times bytes_per_row.
         let bpr = 32usize;
-        let page_bytes = ((600.0 / crate::panes::BLOCK_H).max(1.0) as usize) * bpr;
+        let page_bytes = ((600.0 / crate::panes::hex_row_h(1.0)).max(1.0) as usize) * bpr;
         // Sanity: PageDown from 0 lands exactly one page in.
         assert_eq!(next(NavKey::PageDown, 0, bpr, page_bytes, 1 << 20), page_bytes);
         // And PageUp from there lands back on 0.

@@ -1,8 +1,10 @@
-//! Central panel: four synchronized hex-viewer panes.
+//! Central panes: three synchronized, zoomable views of the same file.
 //!
-//! All panes (hex+ASCII, direct greyscale, entropy) are drawn from the same
-//! byte rows inside a single virtualized scroll area, so they are always
-//! aligned and scrolled together. Rows are only painted when visible.
+//! Layout (left to right): the **overview** column (whole-file thumbnail,
+//! drawn in `app.rs`), the **pixels** column (per-byte greyscale + entropy
+//! bands) and the **hex** column (class-colored hex + ASCII cells). All
+//! three share the same scroll position (`app.scroll_rows`, in rows), so
+//! they stay in sync: scrolling or dragging any column pans the others.
 
 use eframe::egui;
 
@@ -11,18 +13,17 @@ use crate::color;
 
 const ADDR_X: f32 = 8.0;
 const ROW_H: f32 = 18.0;
-const MAP_H: f32 = 8.0;
-const HIST_H: f32 = 12.0;
-const BLOCK_GAP: f32 = 3.0;
+const ROW_GAP: f32 = 3.0;
 
-/// Vertical size of one full row block (hex row + pixel rows + histogram).
-pub(crate) const BLOCK_H: f32 = ROW_H + 2.0 * MAP_H + HIST_H + BLOCK_GAP;
+/// Height of one hex row at zoom `zoom` (1.0 = default).
+pub(crate) fn hex_row_h(zoom: f32) -> f32 {
+    ROW_H * zoom
+}
 
 /// Per-row horizontal geometry for one bytes-per-row layout.
 struct RowGeo {
     bpr: usize,
     hex_start: f32,
-    hex_w: f32,
     cell_w: f32,
     group_gap: f32,
     ascii_start: f32,
@@ -42,7 +43,6 @@ impl RowGeo {
         Self {
             bpr,
             hex_start,
-            hex_w,
             cell_w,
             group_gap,
             ascii_start,
@@ -86,58 +86,6 @@ impl RowGeo {
     }
 }
 
-/// Number of histogram bins across the byte-value range (shared by the
-/// entropy pane's per-row histogram band and the side-panel inspector).
-pub(crate) const N_BINS: usize = 32;
-
-/// Midpoint byte value of histogram bin `i` (used to color the bin by class).
-pub(crate) fn bin_mid(i: usize) -> u8 {
-    (((2 * i + 1) as u32 * 256) / (2 * N_BINS as u32)) as u8
-}
-
-/// Count `bytes` into `N_BINS` value bins (bin `i` covers the byte range
-/// `[i*256/N_BINS, (i+1)*256/N_BINS)`). Shared by the pane band and inspector.
-pub(crate) fn row_bin_counts(bytes: &[u8]) -> [u32; N_BINS] {
-    let mut counts = [0u32; N_BINS];
-    for &b in bytes {
-        counts[(b as usize * N_BINS) / 256] += 1;
-    }
-    counts
-}
-
-/// Draw a per-row byte histogram (value distribution) band: 32 bins across
-/// the byte-value range, bar height normalized to the row's maximum bin
-/// count, bars colored by the byte-class palette of each bin's value range.
-fn draw_histogram(
-    painter: &egui::Painter,
-    geo: &RowGeo,
-    data: &[u8],
-    row_start: usize,
-    n: usize,
-    y: f32,
-) {
-    let hist_rect = egui::Rect::from_min_size(
-        egui::pos2(geo.hex_start, y),
-        egui::vec2(geo.hex_w, HIST_H),
-    );
-    painter.rect_filled(hist_rect, 0.0, egui::Color32::from_gray(14));
-
-    let counts = row_bin_counts(&data[row_start..row_start + n]);
-    let max_c = counts.iter().copied().max().unwrap_or(1).max(1);
-    let bin_w = geo.hex_w / N_BINS as f32;
-    for (i, &c) in counts.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
-        let bar_h = (c as f32 / max_c as f32) * HIST_H;
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(hist_rect.min.x + i as f32 * bin_w, y + HIST_H - bar_h),
-            egui::pos2(hist_rect.min.x + (i as f32 + 1.0) * bin_w, y + HIST_H),
-        );
-        painter.rect_filled(bar, 0.0, color::class_color(bin_mid(i)));
-    }
-}
-
 /// Map a screen-space pointer to a file offset, or `None` when outside the
 /// content or over a gap.
 fn offset_from(
@@ -165,27 +113,35 @@ fn offset_from(
     (off < len).then_some(off)
 }
 
-pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
+/// Hex column (right): class-colored hex + ASCII cells, one row per file
+/// row. This column owns the master vertical scrollbar; its position is
+/// written back to `app.scroll_rows` so the other columns follow. Drag
+/// selects a range; right-click copies / clears the selection; Ctrl+wheel
+/// zooms the row height.
+pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     let bpr = app.bytes_per_row.max(1);
-    let block_h = BLOCK_H;
 
-    let mut scroll_area = egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .drag_to_scroll(false);
+    // Ctrl+wheel / pinch zooms the hex cells.
+    if ui.rect_contains_pointer(ui.max_rect()) {
+        let z = ui.input(|i| i.zoom_delta());
+        if z != 1.0 {
+            app.hex_zoom = (app.hex_zoom * z).clamp(0.5, 4.0);
+        }
+    }
+    let row_h = hex_row_h(app.hex_zoom);
+    let block_h = row_h + ROW_GAP;
+
+    // One-shot scroll requests are applied before borrowing the data.
+    let mut scroll_offset = app.scroll_rows * block_h;
     if app.scroll_reset {
-        scroll_area = scroll_area
-            .vertical_scroll_offset(0.0)
-            .horizontal_scroll_offset(0.0);
+        scroll_offset = 0.0;
         app.scroll_reset = false;
     }
     if let Some(off) = app.scroll_to_offset {
-        // Center the target row in the viewport.
+        // Center the target row in the viewport (content height unknown yet,
+        // so clamp after the area is shown).
         let row = (off / bpr) as f32;
-        let view_h = ui.available_height().max(0.0);
-        let content_h = app.file_size.div_ceil(bpr) as f32 * block_h;
-        let max_scroll = (content_h - view_h).max(0.0);
-        let scroll = (row * block_h - view_h * 0.5).clamp(0.0, max_scroll);
-        scroll_area = scroll_area.vertical_scroll_offset(scroll);
+        scroll_offset = (row * block_h - ui.available_height().max(0.0) * 0.5).max(0.0);
         app.scroll_to_offset = None;
     }
 
@@ -195,34 +151,38 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
         return;
     }
     let total_rows = len.div_ceil(bpr);
-
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let geo = RowGeo::new(ui, bpr);
     let content_w = geo.content_w();
+    let content_h = total_rows as f32 * block_h;
     let sel = app.selection_range.clone();
+
+    let scroll_area = egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .drag_to_scroll(false)
+        .vertical_scroll_offset(scroll_offset);
 
     let mut hovered: Option<usize> = None;
     let mut clicked: Option<usize> = None;
     let mut drag_started: Option<usize> = None;
     let mut drag_pos: Option<usize> = None;
     let mut drag_stopped = false;
-    let mut viewport = egui::Rect::NOTHING;
+    let mut menu_action: Option<&'static str> = None;
     let mut origin = egui::Pos2::ZERO;
 
     let out = scroll_area.show_viewport(ui, |ui, vp| {
-        viewport = vp;
-        ui.allocate_space(egui::vec2(content_w, total_rows as f32 * block_h));
+        ui.allocate_space(egui::vec2(content_w, content_h));
         origin = ui.min_rect().min;
         let painter = ui.painter().clone();
 
-        let first = (viewport.min.y / block_h).floor().max(0.0) as usize;
-        let last = ((viewport.max.y / block_h).ceil() as usize + 1).min(total_rows);
+        let first = (vp.min.y / block_h).floor().max(0.0) as usize;
+        let last = ((vp.max.y / block_h).ceil() as usize + 1).min(total_rows);
 
         for row in first..last {
             let y0 = row as f32 * block_h;
             let block_rect = egui::Rect::from_min_size(
                 egui::pos2(ADDR_X, y0),
-                egui::vec2(viewport.width(), block_h),
+                egui::vec2(vp.width(), block_h),
             );
             let resp = ui.interact(
                 block_rect,
@@ -251,13 +211,25 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
                     clicked = offset_from(p, origin, &geo, total_rows, len, block_h);
                 }
             }
+            resp.context_menu(|ui| {
+                if ui.button("Copy Hex").clicked() {
+                    menu_action = Some("hex");
+                }
+                if ui.button("Copy ASCII").clicked() {
+                    menu_action = Some("ascii");
+                }
+                ui.separator();
+                if ui.button("Clear selection").clicked() {
+                    menu_action = Some("clear");
+                }
+            });
 
             // ---- rendering ----
             let row_start = row * bpr;
             let n = (len - row_start).min(bpr);
 
             painter.text(
-                egui::pos2(ADDR_X, y0 + ROW_H * 0.5),
+                egui::pos2(ADDR_X, y0 + row_h * 0.5),
                 egui::Align2::LEFT_CENTER,
                 format!("{row_start:08X}"),
                 font_id.clone(),
@@ -272,10 +244,9 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
                 let in_sel = sel.as_ref().is_some_and(|r| r.contains(&off));
 
                 let cx = geo.cell_x(i);
-                // Hex cell: class color as background.
                 let hex_cell = egui::Rect::from_min_size(
                     egui::pos2(cx, y0),
-                    egui::vec2(geo.cell_w, ROW_H),
+                    egui::vec2(geo.cell_w, row_h),
                 );
                 painter.rect_filled(hex_cell, 0.0, class);
                 if in_sel {
@@ -286,18 +257,17 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
                     );
                 }
                 painter.text(
-                    egui::pos2(cx, y0 + ROW_H * 0.5),
+                    egui::pos2(cx, y0 + row_h * 0.5),
                     egui::Align2::LEFT_CENTER,
                     format!("{b:02X}"),
                     font_id.clone(),
                     fg,
                 );
 
-                // ASCII cell: same class background.
                 let ax = geo.ascii_x(i);
                 let ascii_cell = egui::Rect::from_min_size(
                     egui::pos2(ax, y0),
-                    egui::vec2(geo.char_w, ROW_H),
+                    egui::vec2(geo.char_w, row_h),
                 );
                 painter.rect_filled(ascii_cell, 0.0, class);
                 if in_sel {
@@ -308,54 +278,15 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
                     );
                 }
                 painter.text(
-                    egui::pos2(ax, y0 + ROW_H * 0.5),
+                    egui::pos2(ax, y0 + row_h * 0.5),
                     egui::Align2::LEFT_CENTER,
                     color::printable(b).to_string(),
                     font_id.clone(),
                     fg,
                 );
-
-                // Direct greyscale pixel.
-                let grey_rect = egui::Rect::from_min_size(
-                    egui::pos2(cx, y0 + ROW_H),
-                    egui::vec2(geo.cell_w, MAP_H),
-                );
-                painter.rect_filled(grey_rect, 0.0, egui::Color32::from_gray(b));
-                if in_sel {
-                    painter.rect_filled(
-                        grey_rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
-                    );
-                }
-
-                // Entropy pixel.
-                let h = app.entropy_at(off);
-                let entr_rect = egui::Rect::from_min_size(
-                    egui::pos2(cx, y0 + ROW_H + MAP_H),
-                    egui::vec2(geo.cell_w, MAP_H),
-                );
-                painter.rect_filled(entr_rect, 0.0, color::entropy_color(h));
-                if in_sel {
-                    painter.rect_filled(
-                        entr_rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60),
-                    );
-                }
             }
 
-            // Per-row byte histogram (value distribution) band.
-            draw_histogram(
-                &painter,
-                &geo,
-                data,
-                row_start,
-                n,
-                y0 + ROW_H + 2.0 * MAP_H,
-            );
-
-            // Hover outline across all three representations of the byte.
+            // Hover outline across hex + ascii cells.
             if let Some(o) = app.hovered_offset {
                 if (row_start..row_start + n).contains(&o) {
                     let i = o - row_start;
@@ -363,7 +294,7 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
                     painter.rect_stroke(
                         egui::Rect::from_min_size(
                             egui::pos2(cx, y0),
-                            egui::vec2(geo.cell_w, block_h - BLOCK_GAP),
+                            egui::vec2(geo.cell_w, block_h - ROW_GAP),
                         ),
                         0.0,
                         egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
@@ -374,20 +305,21 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
             // Row separator.
             painter.line_segment(
                 [
-                    egui::pos2(ADDR_X, y0 + block_h - BLOCK_GAP * 0.5),
-                    egui::pos2(viewport.width(), y0 + block_h - BLOCK_GAP * 0.5),
+                    egui::pos2(ADDR_X, y0 + block_h - ROW_GAP * 0.5),
+                    egui::pos2(vp.width(), y0 + block_h - ROW_GAP * 0.5),
                 ],
                 egui::Stroke::new(1.0_f32, egui::Color32::from_gray(25)),
             );
         }
     });
 
-    // Report the visible range of the file to the overview map.
-    app.view_height = viewport.height();
-    let content_h = total_rows as f32 * block_h;
+    // Report the visible range to the overview marker.
+    app.hex_rect = out.inner_rect;
+    app.view_height = out.inner_rect.height();
+    app.scroll_rows = (out.state.offset.y / block_h).clamp(0.0, total_rows as f32);
     if content_h > 0.0 {
         app.view_frac = (out.state.offset.y / content_h).clamp(0.0, 1.0);
-        app.view_frac_h = (viewport.height() / content_h).clamp(0.0, 1.0);
+        app.view_frac_h = (out.inner_rect.height() / content_h).clamp(0.0, 1.0);
     }
 
     // ---- apply interaction results to shared state ----
@@ -411,12 +343,158 @@ pub fn show_central(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     }
     if let Some(o) = hovered {
         app.hovered_offset = Some(o);
-    } else if !(viewport.is_positive()
-        && ui.ctx().pointer_hover_pos().is_some_and(|p| {
-            viewport.contains(egui::pos2(p.x - origin.x, p.y - origin.y))
-        }))
-    {
-        // Pointer left the content: clear the stale hover.
-        app.hovered_offset = None;
+    }
+
+    // ---- context-menu actions ----
+    match menu_action {
+        Some("clear") => app.selection_range = None,
+        Some(kind) => {
+            if let Some(d) = app.data() {
+                if let Some(r) = app.selection_range.clone() {
+                    let start = r.start;
+                    let end = r.end.min(d.len());
+                    if start < end {
+                        if kind == "hex" {
+                            let s: String = d[start..end]
+                                .iter()
+                                .map(|b| format!("{b:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            ui.ctx().copy_text(s);
+                        } else {
+                            let s: String = d[start..end]
+                                .iter()
+                                .map(|&b| color::printable(b))
+                                .collect();
+                            ui.ctx().copy_text(s);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pixels column (middle): per-byte greyscale + entropy bands at an
+/// adjustable zoom. Drag to pan (syncs `app.scroll_rows` with the hex
+/// column), wheel to scroll, Ctrl+wheel to zoom, click to select a byte.
+pub fn show_pixels(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
+    let len = app.file_size;
+    if len == 0 {
+        return;
+    }
+    let bpr = app.bytes_per_row.max(1);
+    let total_rows = len.div_ceil(bpr);
+
+    let (rect, resp) = ui.allocate_exact_size(
+        ui.available_size(),
+        egui::Sense::click_and_drag(),
+    );
+    app.pixels_rect = rect;
+
+    // Ctrl+wheel / pinch zooms the pixel size.
+    let z = ui.input(|i| i.zoom_delta());
+    if resp.hovered() && z != 1.0 {
+        app.pixel_zoom = (app.pixel_zoom * z).clamp(1.0, 24.0);
+    }
+    let px = app.pixel_zoom.clamp(1.0, 24.0);
+    let band_h = px; // greyscale band height; entropy band sits below it
+    let row_h = 2.0 * band_h + 1.0;
+
+    // Drag to pan; wheel scrolls. Both sync `app.scroll_rows`, which the hex
+    // column consumes as its master scroll position.
+    if resp.dragged() {
+        let dy = ui.input(|i| i.pointer.delta().y);
+        app.scroll_rows -= dy / row_h;
+    }
+    if resp.hovered() {
+        // egui: positive `smooth_scroll_delta.y` = scrolling down (content
+        // moves up, offset increases) — so wheel down advances the file.
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        if wheel != 0.0 {
+            app.scroll_rows += wheel / row_h;
+        }
+    }
+    // Clamp only to the file bounds: the hex column owns the real viewport
+    // clamp, so restricting to the pixels viewport would fight the master
+    // scroll and make EOF unreachable in the hex view.
+    app.scroll_rows = app.scroll_rows.clamp(0.0, total_rows as f32);
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(10));
+
+    // Hover → preview offset; click → select a byte.
+    if let Some(p) = resp.hover_pos() {
+        let row = app.scroll_rows + (p.y - rect.min.y) / row_h;
+        let col = ((p.x - rect.min.x) / px).floor();
+        if row >= 0.0 && col >= 0.0 {
+            let off = (row as usize * bpr + col as usize).min(len.saturating_sub(1));
+            app.hovered_offset = Some(off);
+        }
+    }
+    if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let row = app.scroll_rows + (p.y - rect.min.y) / row_h;
+            let col = ((p.x - rect.min.x) / px).floor();
+            if row >= 0.0 && col >= 0.0 {
+                let off = (row as usize * bpr + col as usize).min(len.saturating_sub(1));
+                app.selected_offset = Some(off);
+                app.hovered_offset = Some(off);
+            }
+        }
+    }
+
+    let Some(data) = app.data() else { return };
+    let sel = app.selection_range.clone();
+    let hovered = app.hovered_offset;
+
+    // Draw only the visible rows.
+    let first = app.scroll_rows.floor().max(0.0) as usize;
+    let visible_rows = (rect.height() / row_h).ceil() as usize + 1;
+    let last = (first + visible_rows).min(total_rows);
+    for row in first..last {
+        let y = rect.min.y + (row as f32 - app.scroll_rows) * row_h;
+        let row_start = row * bpr;
+        let n = (len - row_start).min(bpr);
+        for i in 0..n {
+            let off = row_start + i;
+            let b = data[off];
+            let x = rect.min.x + i as f32 * px;
+            let grey = egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(px, band_h),
+            );
+            painter.rect_filled(grey, 0.0, egui::Color32::from_gray(b));
+            let entr = egui::Rect::from_min_size(
+                egui::pos2(x, y + band_h),
+                egui::vec2(px, band_h),
+            );
+            painter.rect_filled(entr, 0.0, color::entropy_color(app.entropy_at(off)));
+
+            let in_sel = sel.as_ref().is_some_and(|r| r.contains(&off));
+            if in_sel {
+                painter.rect_filled(
+                    grey,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                );
+                painter.rect_filled(
+                    entr,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                );
+            }
+            if hovered == Some(off) {
+                painter.rect_stroke(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, y),
+                        egui::pos2(x + px, y + row_h),
+                    ),
+                    0.0,
+                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                );
+            }
+        }
     }
 }

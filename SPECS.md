@@ -114,81 +114,63 @@ Standardized output range: `[0.0, 8.0]` bits per byte.
 
 ## 4. UI Layout Specs (`egui`)
 
-Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) and a 3-panel layout:
+Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) and a three-column layout, with all info in the top bar:
 
 ```
 +-----------------------------------------------------------------------+
-|  Top Panel: Menu Bar & Controls (Open File, Bytes/Row, Entropy Win)   |
-+-----------------------------------+-----------------------------------+
-|                                   |  Side Panel (Right):              |
-|  Central Panel (wide):            |  - File information               |
-|  ┌─────────────────────────────┐  |  - Hover / Inspector stats       |
-|  │  Hex + ASCII strip (top)    │  |  - Selection range actions       |
-|  │  (class-colored backgrounds)│  |  - Copy Hex / Copy ASCII         |
-|  ├─────────────────────────────┤  |                                   |
-|  │  Direct greyscale map       │  |                                   |
-|  ├─────────────────────────────┤  |                                   |
-|  │  Entropy map + histogram    │  |                                   |
-|  └─────────────────────────────┘  |                                   |
-|  (one shared virtualized scroll)  |                                   |
-+-----------------------------------+-----------------------------------+
-|  Bottom Panel: Status Bar (Offset, Byte, Entropy under cursor)       |
-+-----------------------------------------------------------------------+
+|  Top Bar: Title · File name/size · Hovered/Selected byte · Controls   |
+|  (Open File, Bytes/Row, Entropy Win, Reset, Jump, zoom readout)       |
++------------------------+------------------------+---------------------+
+|  Overview column       |  Pixels column         |  Hex column         |
+|  (left, resizable)     |  (middle, resizable)   |  (right, central)   |
+|  whole-file thumbnail  |  per-byte greyscale +  |  class-colored hex  |
+|  (greyscale / entropy) |  entropy bands         |  + ASCII cells      |
+|  + viewport band       |  drag to pan,          |  drag to select,    |
+|  click/drag navigates  |  Ctrl+wheel zoom       |  Ctrl+wheel zoom    |
++------------------------+------------------------+---------------------+
 ```
 
-### Central Panel — Four Synchronized Panes
+### Three Synchronized Columns
 
-1. **One shared `ScrollArea`** contains all three stacked panes (hex+ASCII strip, greyscale map, entropy map). They share a single vertical scrollbar and the same horizontal scale (`bytes_per_row` cells per row), so a given offset appears in the same column in every pane. This is the "synchronized scroll" mechanism — no manual offset syncing is required because all panes render from the same row index.
+All three columns share one scroll position (`scroll_rows`, in rows). The **hex column is the master** (it owns the scrollbar); the pixels and overview columns follow it, and dragging the pixels column pans it back. A `Ctrl+wheel` / pinch over a column adjusts that column's zoom (hex row height ×0.5–4, pixel size 1–24 px).
 
-2. **Hex + ASCII strip (top pane):**
+1. **Hex column (right, central panel):**
    * Rows of `bytes_per_row` cells. Each cell shows `"%02X"` in a monospace font, **background filled with the Class palette color** (§3.C.1), high-contrast foreground text.
    * An ASCII column follows the hex cells on each row, showing `printable(b)` per byte (`'.'` for non-printable), same class-colored backgrounds.
    * Row headers show the starting offset `r*B` in `%08X`.
    * Selection range is highlighted (semi-transparent overlay across the selected cells); hovered cell gets a bright outline.
+   * Primary click + drag sets `selection_range`; right-click offers **Copy Hex / Copy ASCII / Clear selection**.
 
-3. **Direct greyscale map (middle pane):**
-   * Renders the same row range as a pixel strip: one `Color32::from_gray(byte)` pixel per byte, with each row's pixels scaled to the same column width as the hex cells so columns line up.
+2. **Pixels column (middle):**
+   * One `Color32::from_gray(byte)` pixel per byte on the top half of each row, one entropy-colored pixel (sliding-window entropy §3.B, gradient §3.C.3) on the bottom half.
+   * Renders only the visible rows for `scroll_rows`; drag pans the shared scroll (all columns follow), click selects a byte, hover outlines the byte.
 
-4. **Entropy map (bottom pane):**
-   * Same geometry; each pixel colored by the sliding-window entropy at that offset (§3.B), using the entropy gradient (§3.C.3).
-   * Below the entropy pixels, each row includes a **per-row byte histogram** (value-distribution band): 32 bins across the byte-value range `0x00..=0xFF`, bar height normalized to the row's maximum bin count, bars colored by the byte-class palette of each bin's value range.
+3. **Overview column (left):**
+   * Whole-file 2-row thumbnail (greyscale on top, entropy below) with a translucent band marking the currently visible range.
+   * Hover previews the offset under the cursor in the top bar; click / drag jumps the view (centered, selects/hovers the byte).
 
-5. **Selection & hover (shared):**
-   * Hover updates `hovered_offset`; the same offset is highlighted in all panes (hex cell outline, greyscale/entropy pixel marker) and reported in the bottom status bar.
-   * Primary click + drag on the hex strip sets `selection_range`; all panes highlight the selected byte range.
-   * Clicking selects a single byte (`selected_offset`).
+4. **Keyboard navigation:** arrow keys move the selection by one byte / one row; PageUp / PageDown move by a page (visible rows); Home / End jump to the file start / end. The view auto-scrolls to keep the selection centered. Page size scales with the hex zoom.
 
-6. **Keyboard navigation:** arrow keys move the selection by one byte / one row; PageUp / PageDown move by a page (visible rows); Home / End jump to the file start / end. The view auto-scrolls to keep the selection centered.
-
-7. **Jump to offset (Ctrl/Cmd+G):** a centered dialog accepts a hex offset (`0x…` prefix optional, underscores allowed), prefilled with the current selection; Enter or **Jump** navigates to that byte (scrolls, selects, and hovers it). Out-of-range or invalid input shows an error and keeps the dialog open. Also reachable via the **Jump to offset… (Ctrl+G)** button in the top panel.
+5. **Jump to offset (Ctrl/Cmd+G):** a centered dialog accepts a hex offset (`0x…` prefix optional, underscores allowed), prefilled with the current selection; Enter or **Jump** navigates to that byte (scrolls, selects, and hovers it), with a live preview of the parsed offset in the top bar. Out-of-range or invalid input shows an error and keeps the dialog open. Also reachable via the **Jump to offset… (Ctrl+G)** button in the top panel.
 
 ### Command Line
 
 * **`entropymap <file>`** — opens the file on startup (optional positional argument; errors are shown in the status bar).
 * **`entropymap --help`** (or `-h`) — prints usage and exits. Unknown `-`-prefixed options print an error and exit instead of being treated as files. `--` ends option parsing, so a file whose name starts with `-` can be opened (e.g. `entropymap -- -foo.bin`).
 
-### Top Panel Controls
+### Top Bar (Title + Info + Controls)
 
+* **Title** `EntropyMap`, **file name** and size (`human_size`).
+* **Hovered / selected byte** readout: `0x… · 0x… 'c' · H=…` (live; the overview hover preview takes precedence while hovering it).
 * **Open File…** (and Ctrl/Cmd+O) — `rfd` native dialog.
 * **Bytes/Row** combo: `16 / 32 / 64` (default 32; wider rows fill the wide window).
 * **Entropy window** slider: `16..=4096`, logarithmic (default 256).
 * **Reset view** — jump scroll back to row 0.
-* **Jump to offset… (Ctrl+G)** — open the jump-to-offset dialog.
+* **Jump to offset… (Ctrl+G)** — open the jump-to-offset dialog (live preview while typing).
+* **Zoom readout** — `hex ×… · px …` (Ctrl+wheel over the hex/pixels columns to zoom).
+* Error messages (yellow) are shown here too.
 
-### Side Panel (Right)
-
-* File name, size (`human_size`).
-* Inspector: hovered and selected byte — offset (`0x%08X`), value (`0x%02X`), printable char, and local entropy `H`.
-* Row histogram: for the hovered row (falling back to the selected row), a compact 32-bin value-distribution strip (same bins/colors as the entropy pane band) plus the distinct byte values in the row with their counts — the hovered byte is highlighted.
-* Selection section: range `0x…–0x…`, length, **Copy Hex**, **Copy ASCII**, **Clear**.
-* **Mini overview map**: a whole-file thumbnail — greyscale row on top, entropy row below — with click/drag navigation (jumps the central view to the clicked offset, centered, and selects/hovers the byte so the status bar and inspector update immediately), a translucent band showing the currently visible range, and hover preview: moving the pointer over the map shows the file offset (with byte value + entropy) under the cursor in the bottom status bar.
-
-### Bottom Status Bar
-
-`Offset: 0x… Byte: 0x… 'c' H=…` under cursor · file size · `Rows: R · Bytes/row: B`.
-
-* Hovering the overview map shows `Preview: 0x… Byte: 0x… 'c' H=…` for the offset under the cursor (highest priority); otherwise the hovered content byte, falling back to the selected byte when not hovering the content.
-* While the jump-to-offset dialog is open, the parsed input is live-previewed (`Jump: 0x… Byte: 0x… 'c' H=…`); invalid or out-of-range input shows a yellow error instead (takes precedence over the other previews).
+There is **no side panel and no bottom status bar**: file info, hovered/selected byte readout, zoom state and error messages all live in the top bar. Selection copy actions are available from the hex column's right-click context menu (Copy Hex / Copy ASCII / Clear selection).
 
 ---
 
@@ -212,12 +194,11 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
    * Write `printable(b)` for the ASCII view.
 4. **Build UI Framework**:
    * Set up `eframe::App` shell with a wide default viewport (`1600×900`).
-   * Add the top control panel (Open File, Bytes/Row, Entropy window, Reset view).
-   * Add the right inspector panel and bottom status bar.
-5. **Implement the Central Panel**:
-   * One virtualized `ScrollArea` computing `first_row..last_row` from `scroll_row`.
-   * Render the hex+ASCII strip with class-colored cell backgrounds and selection/hover overlays.
-   * Render the greyscale and entropy panes beneath it at the same column scale.
-   * Wire hover/click/drag so all four panes update the shared hover/selection state.
+   * Add the top bar with title, file info, hovered/selected byte readout, and controls (Open File, Bytes/Row, Entropy window, Reset view, Jump).
+5. **Implement the Three Columns**:
+   * Hex column: one virtualized `ScrollArea` computing `first_row..last_row` from the shared `scroll_rows`; class-colored hex+ASCII cells with selection/hover overlays; master scrollbar; drag to select; right-click context menu (Copy Hex / Copy ASCII / Clear); Ctrl+wheel zoom.
+   * Pixels column: per-byte greyscale + entropy bands for the visible rows; drag to pan (writes `scroll_rows`), wheel scroll, Ctrl+wheel zoom, click selects.
+   * Overview column (left): whole-file greyscale/entropy thumbnail with a viewport band; click/drag navigates.
+   * Wire hover/click/drag so all three columns update the shared hover/selection/scroll state.
 6. **Wire Data Loading**: memory-map the file on Open; reset scroll/selection; compute entropy blocks in parallel (recompute only when the file or entropy window changes).
-7. **Polish**: contrast-aware hex text, hover outlines, selection copy actions, status bar readout.
+7. **Polish**: contrast-aware hex text, hover outlines, selection copy via context menu, top-bar readout.
