@@ -13,6 +13,16 @@ pub fn class_color(b: u8) -> Color32 {
     }
 }
 
+/// Foreground text color with sufficient contrast against a class background.
+pub fn fg_for_class(bg: Color32) -> Color32 {
+    let luma = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    if luma > 140.0 {
+        Color32::from_gray(15)
+    } else {
+        Color32::WHITE
+    }
+}
+
 /// Printable representation of a byte for ASCII dump columns.
 pub fn printable(b: u8) -> char {
     if (0x20..=0x7E).contains(&b) {

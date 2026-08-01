@@ -1,5 +1,7 @@
 //! Shannon entropy (in bits per byte) computed over byte windows.
 
+use rayon::prelude::*;
+
 /// Shannon entropy of a byte slice, normalized to `[0.0, 8.0]` bits per byte.
 pub fn block_entropy(data: &[u8]) -> f32 {
     if data.is_empty() {
@@ -20,15 +22,20 @@ pub fn block_entropy(data: &[u8]) -> f32 {
     h
 }
 
-/// Entropy of the `window`-sized block containing `offset`.
-pub fn window_entropy_at(data: &[u8], offset: usize, window: usize) -> f32 {
-    if data.is_empty() {
-        return 0.0;
-    }
+/// Entropy of every contiguous `window`-sized block of `data`, in parallel.
+/// One value per block; pixel entropy is then looked up (and optionally
+/// interpolated) per byte from this cache.
+pub fn block_entropies(data: &[u8], window: usize) -> Vec<f32> {
     let w = window.max(1);
-    let start = (offset / w) * w;
-    let end = (start + w).min(data.len());
-    block_entropy(&data[start..end])
+    let nblocks = data.len().div_ceil(w);
+    (0..nblocks)
+        .into_par_iter()
+        .map(|b| {
+            let start = b * w;
+            let end = (start + w).min(data.len());
+            block_entropy(&data[start..end])
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -52,5 +59,13 @@ mod tests {
         let data: Vec<u8> = (0..256).map(|i| (i % 2) as u8 * 0x41).collect();
         let h = block_entropy(&data);
         assert!((h - 1.0).abs() < 0.01, "h={h}");
+    }
+
+    #[test]
+    fn blocks_cover_file() {
+        let data: Vec<u8> = (0..1000u16).map(|i| (i % 256) as u8).collect();
+        let h = block_entropies(&data, 256);
+        assert_eq!(h.len(), 4); // 1000 bytes -> ceil(1000/256) = 4 blocks
+        assert_eq!(block_entropy(&data[..256]), h[0]);
     }
 }
