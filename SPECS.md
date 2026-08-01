@@ -162,6 +162,10 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 
 7. **Jump to offset (Ctrl/Cmd+G):** a centered dialog accepts a hex offset (`0x…` prefix optional, underscores allowed), prefilled with the current selection; Enter or **Jump** navigates to that byte (scrolls, selects, and hovers it). Out-of-range or invalid input shows an error and keeps the dialog open. Also reachable via the **Jump to offset… (Ctrl+G)** button in the top panel.
 
+### Command Line
+
+* **`entropymap <file>`** — opens the file on startup (optional positional argument; errors are shown in the status bar).
+
 ### Top Panel Controls
 
 * **Open File…** (and Ctrl/Cmd+O) — `rfd` native dialog.
@@ -183,6 +187,7 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 `Offset: 0x… Byte: 0x… 'c' H=…` under cursor · file size · `Rows: R · Bytes/row: B`.
 
 * Hovering the overview map shows `Preview: 0x… Byte: 0x… 'c' H=…` for the offset under the cursor (highest priority); otherwise the hovered content byte, falling back to the selected byte when not hovering the content.
+* While the jump-to-offset dialog is open, the parsed input is live-previewed (`Jump: 0x… Byte: 0x… 'c' H=…`); invalid or out-of-range input shows a yellow error instead (takes precedence over the other previews).
 
 ---
 

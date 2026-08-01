@@ -5,6 +5,8 @@ mod color;
 mod entropy;
 mod panes;
 
+use std::path::PathBuf;
+
 use eframe::egui;
 
 fn main() -> eframe::Result {
@@ -15,9 +17,11 @@ fn main() -> eframe::Result {
             .with_min_inner_size([1000.0, 600.0]),
         ..Default::default()
     };
+    // Optional positional argument: open the file on startup.
+    let initial_file = std::env::args().nth(1).map(PathBuf::from);
     eframe::run_native(
         "EntropyMap",
         options,
-        Box::new(|cc| Ok(Box::new(app::EntropyMapApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(app::EntropyMapApp::new(cc, initial_file)))),
     )
 }

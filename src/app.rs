@@ -34,7 +34,6 @@ impl NavigationAction {
         page_up: bool,
         page_down: bool,
         home: bool,
-        end: bool,
     ) -> Self {
         if left {
             Self::Left
@@ -45,14 +44,15 @@ impl NavigationAction {
         } else if down {
             Self::Down
         } else if page_up {
-            Self::PageUp            } else if page_down {
-                Self::PageDown
-            } else if home {
-                Self::Home
-            } else {
-                let _ = end; // unreachable in practice; called only when a key is down
-                Self::End
-            }
+            Self::PageUp
+        } else if page_down {
+            Self::PageDown
+        } else if home {
+            Self::Home
+        } else {
+            // Only reachable when a navigation key is held: End.
+            Self::End
+        }
     }
 }
 
@@ -98,13 +98,16 @@ pub struct EntropyMapApp {
     // Jump-to-offset dialog (Ctrl+G).
     pub show_jump_dialog: bool,
     pub jump_input: String,
+    // One-shot: request keyboard focus on the dialog's text field the first
+    // frame it opens, so typing works immediately (Ctrl+G or toolbar button).
+    pub jump_focus_requested: bool,
 
     pub message: Option<String>,
 }
 
 impl EntropyMapApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
+        let mut app = Self {
             file_path: None,
             mmap: None,
             file_size: 0,
@@ -126,8 +129,13 @@ impl EntropyMapApp {
             overview_hover_offset: None,
             show_jump_dialog: false,
             jump_input: String::new(),
+            jump_focus_requested: false,
             message: None,
+        };
+        if let Some(path) = initial_file {
+            app.load_file(path);
         }
+        app
     }
 
     pub(crate) fn data(&self) -> Option<&[u8]> {
@@ -236,7 +244,7 @@ impl EntropyMapApp {
         };
 
         let next = Self::nav_next(
-            NavigationAction::new(left, right, up, down, pg_up, pg_down, home, end),
+            NavigationAction::new(left, right, up, down, pg_up, pg_down, home),
             cur.min(len - 1),
             bpr,
             page_bytes,
@@ -314,6 +322,7 @@ impl EntropyMapApp {
         self.overview_hover_offset = None;
         self.show_jump_dialog = false;
         self.jump_input.clear();
+        self.jump_focus_requested = false;
         self.message = None;
     }
 
@@ -365,6 +374,41 @@ impl EntropyMapApp {
 
     fn bottom_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            // While the jump dialog is open, live-preview the offset being
+            // typed; it takes precedence over the hover/selection previews.
+            if self.show_jump_dialog {
+                match Self::parse_offset(&self.jump_input) {
+                    Some(o) if o < self.file_size => {
+                        if let Some(d) = self.data() {
+                            let b = d[o];
+                            let h = self.entropy_at(o);
+                            ui.colored_label(
+                                egui::Color32::from_gray(180),
+                                format!(
+                                    "Jump: 0x{o:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
+                                    color::printable(b)
+                                ),
+                            );
+                        } else {
+                            ui.label("Jump: —");
+                        }
+                    }
+                    Some(o) => {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            format!(
+                                "Out of range: 0x{o:X} (file is 0x{:X} bytes).",
+                                self.file_size
+                            ),
+                        );
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::YELLOW, "Jump: invalid offset");
+                    }
+                }
+                ui.separator();
+            }
+
             // Preview the offset under the cursor in the overview map first.
             if let Some(off) = self.overview_hover_offset {
                 if let Some(d) = self.data() {
@@ -533,15 +577,15 @@ impl EntropyMapApp {
         let cur = self.selected_offset.unwrap_or(0);
         self.jump_input = format!("0x{cur:X}");
         self.show_jump_dialog = true;
+        self.jump_focus_requested = true;
     }
 
-    /// Ctrl+G jump dialog: type a hex (or decimal) offset and press Enter.
+    /// Ctrl+G jump dialog: type a hex offset and press Enter.
     fn jump_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_jump_dialog {
             return;
         }
         let file_size = self.file_size;
-        let mut want_close = false;
         let mut jumped: Option<usize> = None;
         let mut err: Option<String> = None;
 
@@ -562,10 +606,14 @@ impl EntropyMapApp {
                             .desired_width(180.0)
                             .font(egui::TextStyle::Monospace),
                     );
+                    // Focus the field the first frame the dialog is open.
+                    if self.jump_focus_requested {
+                        resp.request_focus();
+                        self.jump_focus_requested = false;
+                    }
                     let submit = resp.lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Jump").clicked() || submit {
-                        want_close = true;
                         err = Self::parse_offset(&self.jump_input).map_or_else(
                             || Some("Invalid offset.".to_owned()),
                             |o| {
@@ -597,8 +645,6 @@ impl EntropyMapApp {
             self.scroll_to_offset = Some(o);
             self.selected_offset = Some(o);
             self.hovered_offset = Some(o);
-            self.show_jump_dialog = false;
-        } else if want_close && err.is_none() {
             self.show_jump_dialog = false;
         }
     }
@@ -778,11 +824,17 @@ impl eframe::App for EntropyMapApp {
         if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command) {
             self.open_dialog();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::G) && i.modifiers.command) {
+        if self.mmap.is_some()
+            && ctx.input(|i| i.key_pressed(egui::Key::G) && i.modifiers.command)
+        {
             self.open_jump_dialog();
         }
         self.jump_dialog(ctx);
-        self.keyboard_navigate(ctx);
+        // While the jump dialog is open, navigation keys belong to it; don't
+        // move the file selection behind it (e.g. when the field isn't focused).
+        if !self.show_jump_dialog {
+            self.keyboard_navigate(ctx);
+        }
         if self.overview_dirty {
             self.overview_dirty = false;
             self.overview_tex = self.overview_image.clone().map(|img| {
@@ -828,7 +880,6 @@ mod tests {
             key == NavKey::PageUp,
             key == NavKey::PageDown,
             key == NavKey::Home,
-            key == NavKey::End,
         )
     }
 
