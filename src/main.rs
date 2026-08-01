@@ -2,6 +2,7 @@
 
 mod app;
 mod color;
+mod config;
 mod entropy;
 mod panes;
 

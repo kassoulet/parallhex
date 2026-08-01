@@ -24,6 +24,15 @@ pub(crate) const PIXEL_ZOOM_DEFAULT: f32 = 4.0;
 pub(crate) const PIXEL_ZOOM_MIN: f32 = 1.0;
 pub(crate) const PIXEL_ZOOM_MAX: f32 = 24.0;
 
+/// Keyboard zoom step factor (`+` / `-`), applied multiplicatively per press.
+pub(crate) const ZOOM_STEP: f32 = 1.25;
+
+/// Apply a multiplicative zoom step, clamped to `[min, max]`. Shared by the
+/// Ctrl+wheel handlers and the `+`/`-` keyboard shortcuts.
+pub(crate) fn zoom_step(zoom: f32, factor: f32, min: f32, max: f32) -> f32 {
+    (zoom * factor).clamp(min, max)
+}
+
 /// Height of one hex row at zoom `zoom` (1.0 = default).
 pub(crate) fn hex_row_h(zoom: f32) -> f32 {
     ROW_H * zoom
@@ -191,7 +200,7 @@ pub fn show_hex(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     if ui.rect_contains_pointer(ui.max_rect()) {
         let z = ui.input(|i| i.zoom_delta());
         if z != 1.0 {
-            app.hex_zoom = (app.hex_zoom * z).clamp(HEX_ZOOM_MIN, HEX_ZOOM_MAX);
+            app.hex_zoom = zoom_step(app.hex_zoom, z, HEX_ZOOM_MIN, HEX_ZOOM_MAX);
         }
     }
     let row_h = hex_row_h(app.hex_zoom);
@@ -513,7 +522,7 @@ pub fn show_pixels(ui: &mut egui::Ui, app: &mut EntropyMapApp) {
     // Ctrl+wheel / pinch zooms the pixel size.
     let z = ui.input(|i| i.zoom_delta());
     if resp.hovered() && z != 1.0 {
-        app.pixel_zoom = (app.pixel_zoom * z).clamp(PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX);
+        app.pixel_zoom = zoom_step(app.pixel_zoom, z, PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX);
     }
     let px = app.pixel_zoom.clamp(PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX);
     let band_h = px; // greyscale band height; entropy band sits below it
