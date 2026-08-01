@@ -12,6 +12,50 @@ use crate::color;
 use crate::entropy;
 use crate::panes;
 
+/// The navigation key pressed this frame (one-hot).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NavigationAction {
+    Left,
+    Right,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+impl NavigationAction {
+    fn new(
+        left: bool,
+        right: bool,
+        up: bool,
+        down: bool,
+        page_up: bool,
+        page_down: bool,
+        home: bool,
+        end: bool,
+    ) -> Self {
+        if left {
+            Self::Left
+        } else if right {
+            Self::Right
+        } else if up {
+            Self::Up
+        } else if down {
+            Self::Down
+        } else if page_up {
+            Self::PageUp            } else if page_down {
+                Self::PageDown
+            } else if home {
+                Self::Home
+            } else {
+                let _ = end; // unreachable in practice; called only when a key is down
+                Self::End
+            }
+    }
+}
+
 pub struct EntropyMapApp {
     pub file_path: Option<PathBuf>,
     pub mmap: Option<Arc<Mmap>>,
@@ -51,6 +95,10 @@ pub struct EntropyMapApp {
     // in the status bar; does not touch the panes' hover/selection).
     pub overview_hover_offset: Option<usize>,
 
+    // Jump-to-offset dialog (Ctrl+G).
+    pub show_jump_dialog: bool,
+    pub jump_input: String,
+
     pub message: Option<String>,
 }
 
@@ -76,6 +124,8 @@ impl EntropyMapApp {
             selection_range: None,
             drag_start: None,
             overview_hover_offset: None,
+            show_jump_dialog: false,
+            jump_input: String::new(),
             message: None,
         }
     }
@@ -184,25 +234,14 @@ impl EntropyMapApp {
             self.scroll_to_offset = Some(start);
             return;
         };
-        let cur = cur.min(len - 1);
-        let next = if left {
-            cur.saturating_sub(1)
-        } else if right {
-            (cur + 1).min(len - 1)
-        } else if up {
-            cur.saturating_sub(bpr)
-        } else if down {
-            (cur + bpr).min(len - 1)
-        } else if pg_up {
-            cur.saturating_sub(page_bytes)
-        } else if pg_down {
-            (cur + page_bytes).min(len - 1)
-        } else if home {
-            0
-        } else {
-            len - 1
-        };
 
+        let next = Self::nav_next(
+            NavigationAction::new(left, right, up, down, pg_up, pg_down, home, end),
+            cur.min(len - 1),
+            bpr,
+            page_bytes,
+            len,
+        );
         self.selected_offset = Some(next);
         self.hovered_offset = Some(next);
         self.scroll_to_offset = Some(next);
@@ -211,6 +250,27 @@ impl EntropyMapApp {
     fn open_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_file() {
             self.load_file(path);
+        }
+    }
+
+    /// Pure navigation math used by the keyboard handler: compute the offset
+    /// reached by `action` from `cur`, clamped to `[0, len)`.
+    fn nav_next(
+        action: NavigationAction,
+        cur: usize,
+        bpr: usize,
+        page_bytes: usize,
+        len: usize,
+    ) -> usize {
+        match action {
+            NavigationAction::Left => cur.saturating_sub(1),
+            NavigationAction::Right => (cur + 1).min(len - 1),
+            NavigationAction::Up => cur.saturating_sub(bpr),
+            NavigationAction::Down => (cur + bpr).min(len - 1),
+            NavigationAction::PageUp => cur.saturating_sub(page_bytes),
+            NavigationAction::PageDown => (cur + page_bytes).min(len - 1),
+            NavigationAction::Home => 0,
+            NavigationAction::End => len - 1,
         }
     }
 
@@ -252,6 +312,8 @@ impl EntropyMapApp {
         self.selection_range = None;
         self.drag_start = None;
         self.overview_hover_offset = None;
+        self.show_jump_dialog = false;
+        self.jump_input.clear();
         self.message = None;
     }
 
@@ -290,6 +352,13 @@ impl EntropyMapApp {
             ui.separator();
             if ui.button("Reset view").clicked() {
                 self.scroll_reset = true;
+            }
+            ui.separator();
+            if ui
+                .add_enabled(self.mmap.is_some(), egui::Button::new("Jump to offset… (Ctrl+G)"))
+                .clicked()
+            {
+                self.open_jump_dialog();
             }
         });
     }
@@ -382,6 +451,9 @@ impl EntropyMapApp {
         self.byte_info(ui, "Selected:", self.selected_offset);
         ui.separator();
 
+        self.row_histogram_section(ui);
+        ui.separator();
+
         self.selection_section(ui);
     }
 
@@ -439,6 +511,178 @@ impl EntropyMapApp {
                 self.selected_offset = Some(off);
                 self.hovered_offset = Some(off);
             }
+        }
+    }
+
+    /// Parse a user-supplied offset as hex: `0x` prefix optional, underscores
+    /// and whitespace allowed (e.g. `"0x1_000"`, `"1F"`).
+    fn parse_offset(input: &str) -> Option<usize> {
+        let s = input.trim().replace('_', "");
+        if s.is_empty() {
+            return None;
+        }
+        let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(&s);
+        usize::from_str_radix(hex, 16).ok()
+    }
+
+    /// Open the jump-to-offset dialog, prefilled with the current selection.
+    fn open_jump_dialog(&mut self) {
+        if self.show_jump_dialog {
+            return; // already open: don't wipe the user's typing
+        }
+        let cur = self.selected_offset.unwrap_or(0);
+        self.jump_input = format!("0x{cur:X}");
+        self.show_jump_dialog = true;
+    }
+
+    /// Ctrl+G jump dialog: type a hex (or decimal) offset and press Enter.
+    fn jump_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_jump_dialog {
+            return;
+        }
+        let file_size = self.file_size;
+        let mut want_close = false;
+        let mut jumped: Option<usize> = None;
+        let mut err: Option<String> = None;
+
+        let resp = egui::Window::new("Jump to Offset")
+            .id(egui::Id::new("jump_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Offset (hex, 0x… up to 0x{:X}):",
+                    file_size.saturating_sub(1)
+                ));
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.jump_input)
+                            .hint_text("0x1000")
+                            .desired_width(180.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    let submit = resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Jump").clicked() || submit {
+                        want_close = true;
+                        err = Self::parse_offset(&self.jump_input).map_or_else(
+                            || Some("Invalid offset.".to_owned()),
+                            |o| {
+                                if o >= file_size {
+                                    Some(format!(
+                                        "Offset 0x{o:X} is out of range (file is 0x{:X} bytes).",
+                                        file_size
+                                    ))
+                                } else {
+                                    jumped = Some(o);
+                                    None
+                                }
+                            },
+                        );
+                    }
+                });
+                if let Some(e) = &err {
+                    ui.colored_label(egui::Color32::YELLOW, e);
+                }
+            });
+
+        // User closed the window (X button / Escape): dismiss the dialog.
+        if resp.is_none() {
+            self.show_jump_dialog = false;
+            return;
+        }
+        // Apply the jump outside the closure (avoids borrow issues).
+        if let Some(o) = jumped {
+            self.scroll_to_offset = Some(o);
+            self.selected_offset = Some(o);
+            self.hovered_offset = Some(o);
+            self.show_jump_dialog = false;
+        } else if want_close && err.is_none() {
+            self.show_jump_dialog = false;
+        }
+    }
+
+    /// Value distribution of the hovered (or selected) row: a compact 32-bin
+    /// histogram strip plus the distinct byte values with their counts.
+    fn row_histogram_section(&mut self, ui: &mut egui::Ui) {
+        // Prefer the hovered row; fall back to the selected row so the
+        // inspector stays live after the pointer leaves the content.
+        let off = self.hovered_offset.or(self.selected_offset);
+        let Some(off) = off else { return };
+        let Some(data) = self.data() else { return };
+        let bpr = self.bytes_per_row.max(1);
+        let row = off / bpr;
+        let start = row * bpr;
+        let end = (start + bpr).min(data.len());
+        if start >= end {
+            return;
+        }
+        let bytes = &data[start..end];
+
+        ui.strong("Row histogram");
+        ui.label(format!("Row 0x{start:08X} – 0x{:08X} ({n} bytes)", end - 1, n = bytes.len()));
+
+        // ---- compact 32-bin strip (same bins/colors as the entropy pane) ----
+        let counts = panes::row_bin_counts(bytes);
+        let max_c = counts.iter().copied().max().unwrap_or(1).max(1);
+        let strip_h = 24.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), strip_h),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        let n = panes::N_BINS;
+        let gap = 1.5;
+        let bar_w = ((rect.width() - gap * (n - 1) as f32) / n as f32).max(1.0);
+        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(14));
+        for (i, &c) in counts.iter().enumerate() {
+            let x0 = rect.min.x + i as f32 * (bar_w + gap);
+            let bar_h = if c == 0 {
+                2.0
+            } else {
+                (c as f32 / max_c as f32) * (strip_h - 2.0)
+            };
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0, rect.max.y - bar_h),
+                    egui::pos2(x0 + bar_w, rect.max.y),
+                ),
+                0.0,
+                color::class_color(panes::bin_mid(i)),
+            );
+        }
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)));
+
+        // ---- distinct byte values with counts ----
+        let mut counts_by_value: Vec<(u8, u32)> = Vec::new();
+        for &b in bytes {
+            match counts_by_value.iter_mut().find(|(v, _)| *v == b) {
+                Some((_, c)) => *c += 1,
+                None => counts_by_value.push((b, 1)),
+            }
+        }
+        counts_by_value.sort_unstable();
+        ui.horizontal_wrapped(|ui| {
+            // The hovered byte (when it's in this row) is highlighted.
+            let hovered_byte = self
+                .hovered_offset
+                .filter(|h| (start..end).contains(h))
+                .map(|h| data[h]);
+            for (i, (b, c)) in counts_by_value.iter().enumerate().take(12) {
+                let text = format!("{b:02X}×{c}");
+                if Some(*b) == hovered_byte {
+                    ui.colored_label(egui::Color32::YELLOW, text);
+                } else {
+                    ui.monospace(text);
+                }
+                if i < counts_by_value.len().saturating_sub(1).min(11) {
+                    ui.separator();
+                }
+            }
+        });
+        if counts_by_value.len() > 12 {
+            ui.label(format!("+ {} more values…", counts_by_value.len() - 12));
         }
     }
 
@@ -534,6 +778,10 @@ impl eframe::App for EntropyMapApp {
         if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command) {
             self.open_dialog();
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::G) && i.modifiers.command) {
+            self.open_jump_dialog();
+        }
+        self.jump_dialog(ctx);
         self.keyboard_navigate(ctx);
         if self.overview_dirty {
             self.overview_dirty = false;
@@ -551,5 +799,133 @@ impl eframe::App for EntropyMapApp {
             .show(ctx, |ui| self.side_panel(ui));
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| self.bottom_panel(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.central_panel(ui));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EntropyMapApp, NavigationAction};
+
+    /// The navigation key pressed this frame (one-hot).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum NavKey {
+        Left,
+        Right,
+        Up,
+        Down,
+        PageUp,
+        PageDown,
+        Home,
+        End,
+    }
+
+    fn action(key: NavKey) -> NavigationAction {
+        NavigationAction::new(
+            key == NavKey::Left,
+            key == NavKey::Right,
+            key == NavKey::Up,
+            key == NavKey::Down,
+            key == NavKey::PageUp,
+            key == NavKey::PageDown,
+            key == NavKey::Home,
+            key == NavKey::End,
+        )
+    }
+
+    /// Mirror keyboard_navigate's call path: the current offset is clamped to
+    /// the file before the move is applied.
+    fn next(key: NavKey, cur: usize, bpr: usize, page_bytes: usize, len: usize) -> usize {
+        EntropyMapApp::nav_next(action(key), cur.min(len - 1), bpr, page_bytes, len)
+    }
+
+    #[test]
+    fn page_size_matches_view_geometry() {
+        // The page size used by keyboard_navigate: (view_height / BLOCK_H)
+        // rows, rounded up, times bytes_per_row.
+        let bpr = 32usize;
+        let page_bytes = ((600.0 / crate::panes::BLOCK_H).max(1.0) as usize) * bpr;
+        // Sanity: PageDown from 0 lands exactly one page in.
+        assert_eq!(next(NavKey::PageDown, 0, bpr, page_bytes, 1 << 20), page_bytes);
+        // And PageUp from there lands back on 0.
+        assert_eq!(next(NavKey::PageUp, page_bytes, bpr, page_bytes, 1 << 20), 0);
+    }
+
+    #[test]
+    fn arrows_clamp_at_boundaries() {
+        let len = 1000usize;
+        let bpr = 32usize;
+        // At the start: Left and Up clamp to 0.
+        assert_eq!(next(NavKey::Left, 0, bpr, 0, len), 0);
+        assert_eq!(next(NavKey::Up, 0, bpr, 0, len), 0);
+        // At the end: Right and Down clamp to len - 1.
+        assert_eq!(next(NavKey::Right, len - 1, bpr, 0, len), len - 1);
+        assert_eq!(next(NavKey::Down, len - 1, bpr, 0, len), len - 1);
+        // Right clamps when the next byte would overshoot the end.
+        assert_eq!(next(NavKey::Right, len - 2, bpr, 0, len), len - 1);
+        // Down from the last row clamps to the last byte (960 + 32 = 992,
+        // which is still in range, so use the true last row 968 + 32 = 1000).
+        assert_eq!(next(NavKey::Down, len - 32, bpr, 0, len), len - 1);
+        // Down from one row above the last row lands inside the file.
+        assert_eq!(next(NavKey::Down, len - 64, bpr, 0, len), len - 64 + bpr);
+    }
+
+    #[test]
+    fn page_keys_clamp_at_boundaries() {
+        let len = 1000usize;
+        let bpr = 32usize;
+        let page_bytes = 448usize; // 14 visible rows of 32 bytes
+        // PageUp at the top clamps to 0.
+        assert_eq!(next(NavKey::PageUp, 10, bpr, page_bytes, len), 0);
+        // PageDown at the bottom clamps to len - 1.
+        assert_eq!(next(NavKey::PageDown, len - 5, bpr, page_bytes, len), len - 1);
+        // PageDown from mid-file moves exactly one page.
+        assert_eq!(next(NavKey::PageDown, 100, bpr, page_bytes, len), 100 + page_bytes);
+        // PageUp from mid-file moves exactly one page back.
+        assert_eq!(next(NavKey::PageUp, 500, bpr, page_bytes, len), 500 - page_bytes);
+    }
+
+    #[test]
+    fn home_end_jump_to_boundaries() {
+        let len = 1000usize;
+        assert_eq!(next(NavKey::Home, 500, 32, 448, len), 0);
+        assert_eq!(next(NavKey::End, 500, 32, 448, len), len - 1);
+        assert_eq!(next(NavKey::End, 0, 32, 448, len), len - 1);
+    }
+
+    #[test]
+    fn stale_selection_is_clamped_before_moving() {
+        // keyboard_navigate clamps `cur` to len - 1 before applying the move.
+        let len = 1000usize;
+        // A stale cursor beyond EOF: Right can't go anywhere, stays at end.
+        assert_eq!(next(NavKey::Right, 5000, 32, 448, len), len - 1);
+        // PageDown from a stale position also clamps to the end.
+        assert_eq!(next(NavKey::PageDown, 5000, 32, 448, len), len - 1);
+        // Up from a stale position moves back exactly one row from the end.
+        assert_eq!(next(NavKey::Up, 5000, 32, 448, len), len - 1 - 32);
+    }
+
+    #[test]
+    fn parse_hex_with_prefix() {
+        assert_eq!(EntropyMapApp::parse_offset("0x1F"), Some(31));
+        assert_eq!(EntropyMapApp::parse_offset("0X1000"), Some(4096));
+    }
+
+    #[test]
+    fn parse_hex_without_prefix() {
+        assert_eq!(EntropyMapApp::parse_offset("1F"), Some(31));
+        assert_eq!(EntropyMapApp::parse_offset("DEADBEEF"), Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn parse_allows_underscores_and_whitespace() {
+        assert_eq!(EntropyMapApp::parse_offset(" 0x1_000 "), Some(4096));
+    }
+
+    #[test]
+    fn parse_invalid_returns_none() {
+        assert_eq!(EntropyMapApp::parse_offset(""), None);
+        assert_eq!(EntropyMapApp::parse_offset("xyz"), None);
+        assert_eq!(EntropyMapApp::parse_offset("0x"), None);
+        assert_eq!(EntropyMapApp::parse_offset("-5"), None);
     }
 }

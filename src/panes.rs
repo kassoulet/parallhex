@@ -86,6 +86,25 @@ impl RowGeo {
     }
 }
 
+/// Number of histogram bins across the byte-value range (shared by the
+/// entropy pane's per-row histogram band and the side-panel inspector).
+pub(crate) const N_BINS: usize = 32;
+
+/// Midpoint byte value of histogram bin `i` (used to color the bin by class).
+pub(crate) fn bin_mid(i: usize) -> u8 {
+    (((2 * i + 1) as u32 * 256) / (2 * N_BINS as u32)) as u8
+}
+
+/// Count `bytes` into `N_BINS` value bins (bin `i` covers the byte range
+/// `[i*256/N_BINS, (i+1)*256/N_BINS)`). Shared by the pane band and inspector.
+pub(crate) fn row_bin_counts(bytes: &[u8]) -> [u32; N_BINS] {
+    let mut counts = [0u32; N_BINS];
+    for &b in bytes {
+        counts[(b as usize * N_BINS) / 256] += 1;
+    }
+    counts
+}
+
 /// Draw a per-row byte histogram (value distribution) band: 32 bins across
 /// the byte-value range, bar height normalized to the row's maximum bin
 /// count, bars colored by the byte-class palette of each bin's value range.
@@ -97,17 +116,13 @@ fn draw_histogram(
     n: usize,
     y: f32,
 ) {
-    const N_BINS: usize = 32;
     let hist_rect = egui::Rect::from_min_size(
         egui::pos2(geo.hex_start, y),
         egui::vec2(geo.hex_w, HIST_H),
     );
     painter.rect_filled(hist_rect, 0.0, egui::Color32::from_gray(14));
 
-    let mut counts = [0u32; N_BINS];
-    for &b in &data[row_start..row_start + n] {
-        counts[(b as usize * N_BINS) / 256] += 1;
-    }
+    let counts = row_bin_counts(&data[row_start..row_start + n]);
     let max_c = counts.iter().copied().max().unwrap_or(1).max(1);
     let bin_w = geo.hex_w / N_BINS as f32;
     for (i, &c) in counts.iter().enumerate() {
@@ -115,12 +130,11 @@ fn draw_histogram(
             continue;
         }
         let bar_h = (c as f32 / max_c as f32) * HIST_H;
-        let mid = (((2 * i + 1) as u32 * 256) / (2 * N_BINS as u32)) as u8;
         let bar = egui::Rect::from_min_max(
             egui::pos2(hist_rect.min.x + i as f32 * bin_w, y + HIST_H - bar_h),
             egui::pos2(hist_rect.min.x + (i as f32 + 1.0) * bin_w, y + HIST_H),
         );
-        painter.rect_filled(bar, 0.0, color::class_color(mid));
+        painter.rect_filled(bar, 0.0, color::class_color(bin_mid(i)));
     }
 }
 

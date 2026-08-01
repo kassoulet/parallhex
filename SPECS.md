@@ -160,17 +160,21 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 
 6. **Keyboard navigation:** arrow keys move the selection by one byte / one row; PageUp / PageDown move by a page (visible rows); Home / End jump to the file start / end. The view auto-scrolls to keep the selection centered.
 
+7. **Jump to offset (Ctrl/Cmd+G):** a centered dialog accepts a hex offset (`0x…` prefix optional, underscores allowed), prefilled with the current selection; Enter or **Jump** navigates to that byte (scrolls, selects, and hovers it). Out-of-range or invalid input shows an error and keeps the dialog open. Also reachable via the **Jump to offset… (Ctrl+G)** button in the top panel.
+
 ### Top Panel Controls
 
 * **Open File…** (and Ctrl/Cmd+O) — `rfd` native dialog.
 * **Bytes/Row** combo: `16 / 32 / 64` (default 32; wider rows fill the wide window).
 * **Entropy window** slider: `16..=4096`, logarithmic (default 256).
 * **Reset view** — jump scroll back to row 0.
+* **Jump to offset… (Ctrl+G)** — open the jump-to-offset dialog.
 
 ### Side Panel (Right)
 
 * File name, size (`human_size`).
 * Inspector: hovered and selected byte — offset (`0x%08X`), value (`0x%02X`), printable char, and local entropy `H`.
+* Row histogram: for the hovered row (falling back to the selected row), a compact 32-bin value-distribution strip (same bins/colors as the entropy pane band) plus the distinct byte values in the row with their counts — the hovered byte is highlighted.
 * Selection section: range `0x…–0x…`, length, **Copy Hex**, **Copy ASCII**, **Clear**.
 * **Mini overview map**: a whole-file thumbnail — greyscale row on top, entropy row below — with click/drag navigation (jumps the central view to the clicked offset, centered, and selects/hovers the byte so the status bar and inspector update immediately), a translucent band showing the currently visible range, and hover preview: moving the pointer over the map shows the file offset (with byte value + entropy) under the cursor in the bottom status bar.
 
