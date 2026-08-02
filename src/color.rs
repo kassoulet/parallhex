@@ -13,8 +13,8 @@ pub fn class_color(b: u8) -> Rgba {
     }
 }
 
-/// Foreground text color with sufficient contrast against a class background.
-pub fn fg_for_class(bg: Rgba) -> Rgba {
+/// Foreground text color with sufficient contrast against any cell background.
+pub fn fg_for_bg(bg: Rgba) -> Rgba {
     let luma = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
     if luma > 140.0 / 255.0 {
         rgb(0x0f0f0f)
@@ -67,37 +67,45 @@ pub fn entropy_color(h: f32) -> Rgba {
         | u32::from(lerp(lo.1.2, hi.1.2)))
 }
 
-/// The colormap used by the pixels column and the whole-file overview:
-/// each byte is rendered with exactly one of these mappings.
+/// The colormap a panel uses to color each byte. Every panel picks its own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Colormap {
+    /// No colormap: nothing is painted for the byte.
+    None,
     /// Byte value mapped to greyscale brightness.
-    Greyscale,
+    Value,
+    /// The binvis.io byte-class palette.
+    Class,
     /// Shannon entropy gradient.
     Entropy,
-    /// The binvis.io byte-class palette.
-    ByteClass,
 }
 
 impl Colormap {
     /// Every available colormap, in display order.
-    pub const ALL: [Colormap; 3] = [Colormap::Greyscale, Colormap::Entropy, Colormap::ByteClass];
+    pub const ALL: [Colormap; 4] = [
+        Colormap::None,
+        Colormap::Value,
+        Colormap::Class,
+        Colormap::Entropy,
+    ];
 
     /// Human-readable label.
     pub fn label(self) -> &'static str {
         match self {
-            Colormap::Greyscale => "Greyscale",
+            Colormap::None => "None",
+            Colormap::Value => "Value",
+            Colormap::Class => "Class",
             Colormap::Entropy => "Entropy",
-            Colormap::ByteClass => "Byte class",
         }
     }
 
     /// Config-file key.
     pub fn key(self) -> &'static str {
         match self {
-            Colormap::Greyscale => "greyscale",
+            Colormap::None => "none",
+            Colormap::Value => "value",
+            Colormap::Class => "class",
             Colormap::Entropy => "entropy",
-            Colormap::ByteClass => "byte_class",
         }
     }
 
@@ -106,17 +114,19 @@ impl Colormap {
         Colormap::ALL.iter().copied().find(|c| c.key() == s)
     }
 
-    /// Color a single byte under this colormap.
-    pub fn color_for(self, b: u8, entropy: f32) -> Rgba {
+    /// Color a single byte under this colormap, or `None` when this colormap
+    /// paints nothing — callers skip drawing entirely rather than filling.
+    pub fn color_for(self, b: u8, entropy: f32) -> Option<Rgba> {
         match self {
-            Colormap::Greyscale => Rgba {
+            Colormap::None => Option::None,
+            Colormap::Value => Some(Rgba {
                 r: f32::from(b) / 255.0,
                 g: f32::from(b) / 255.0,
                 b: f32::from(b) / 255.0,
                 a: 1.0,
-            },
-            Colormap::Entropy => entropy_color(entropy),
-            Colormap::ByteClass => class_color(b),
+            }),
+            Colormap::Class => Some(class_color(b)),
+            Colormap::Entropy => Some(entropy_color(entropy)),
         }
     }
 }
@@ -134,5 +144,44 @@ pub fn human_size(bytes: usize) -> String {
         format!("{bytes} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colormap_keys_round_trip() {
+        for cm in Colormap::ALL {
+            assert_eq!(Colormap::from_key(cm.key()), Some(cm), "{cm:?}");
+        }
+        assert_eq!(Colormap::ALL.len(), 4);
+        assert_eq!(Colormap::from_key("greyscale"), None); // retired key
+        assert_eq!(Colormap::from_key("byte_class"), None); // retired key
+        assert_eq!(Colormap::from_key(""), None);
+    }
+
+    #[test]
+    fn none_colormap_paints_nothing() {
+        assert_eq!(Colormap::None.color_for(0x41, 4.0), None);
+        assert!(Colormap::Value.color_for(0x41, 4.0).is_some());
+        assert!(Colormap::Class.color_for(0x41, 4.0).is_some());
+        assert!(Colormap::Entropy.color_for(0x41, 4.0).is_some());
+    }
+
+    #[test]
+    fn value_colormap_is_byte_brightness() {
+        let c = Colormap::Value.color_for(0x80, 0.0).expect("value paints");
+        assert_eq!(c.r, c.g);
+        assert_eq!(c.g, c.b);
+        assert!((c.r - 128.0 / 255.0).abs() < 1e-6, "r={}", c.r);
+    }
+
+    #[test]
+    fn fg_contrast_flips_on_light_backgrounds() {
+        // Dark glyphs on a light cell, light glyphs on a dark one.
+        assert!(fg_for_bg(rgb(0xffffff)).r < 0.5);
+        assert!(fg_for_bg(rgb(0x000000)).r > 0.5);
     }
 }

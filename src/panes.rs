@@ -22,9 +22,6 @@ use gpui::{
 
 use crate::color::{self, Colormap};
 
-pub(crate) const HEX_ZOOM_DEFAULT: f32 = 1.0;
-pub(crate) const HEX_ZOOM_MIN: f32 = 0.5;
-pub(crate) const HEX_ZOOM_MAX: f32 = 4.0;
 pub(crate) const PIXEL_ZOOM_DEFAULT: f32 = 4.0;
 pub(crate) const PIXEL_ZOOM_MIN: f32 = 1.0;
 pub(crate) const PIXEL_ZOOM_MAX: f32 = 24.0;
@@ -32,13 +29,18 @@ pub(crate) const PIXEL_ZOOM_MAX: f32 = 24.0;
 /// Keyboard zoom step factor (`+` / `-`), applied multiplicatively per press.
 pub(crate) const ZOOM_STEP: f32 = 1.25;
 
-/// Hex row geometry at zoom 1.0 (pixels).
+/// Hex row geometry: the text size is fixed, so these are constants.
 pub(crate) const ROW_H: f32 = 18.0;
 pub(crate) const ROW_GAP: f32 = 3.0;
-/// Base monospace size for hex cells at zoom 1.0.
+/// Monospace size for hex cells.
 pub(crate) const HEX_FONT_SIZE: f32 = 13.0;
 /// Left padding for the address gutter.
 pub(crate) const ADDR_X: f32 = 8.0;
+/// Height of one hex row including its separator gap. The hex text size is
+/// fixed, so this is a constant rather than a function of a zoom.
+pub(crate) const BLOCK_H: f32 = ROW_H + ROW_GAP;
+/// Glyph color when the panel's colormap paints no background to contrast with.
+const DEFAULT_FG: u32 = 0xc0caf5;
 
 /// Apply a multiplicative zoom step, clamped to `[min, max]`. Shared by the
 /// Ctrl+wheel handlers and the `+`/`-` keyboard shortcuts.
@@ -46,14 +48,71 @@ pub(crate) fn zoom_step(zoom: f32, factor: f32, min: f32, max: f32) -> f32 {
     (zoom * factor).clamp(min, max)
 }
 
-/// Height of one hex row at zoom `zoom` (1.0 = default).
-pub(crate) fn hex_row_h(zoom: f32) -> f32 {
-    ROW_H * zoom
+/// Width a hex row of `n` bytes needs: the address gutter, `"HH "` per byte, a
+/// space between 8-byte groups, the two-space gap, then one ASCII glyph per
+/// byte. Mirrors `build_row_text` exactly (see the §6 invariant in SPECS.md).
+// Callers arrive with the panels in later tasks of the three-column rework.
+#[allow(dead_code)]
+fn hex_row_width(n: usize, char_w: f32) -> f32 {
+    let chars = 12 + 4 * n + n.saturating_sub(1) / 8;
+    ADDR_X + char_w * chars as f32
 }
 
-/// Height of one hex row including its separator gap.
-pub(crate) fn hex_block_h(zoom: f32) -> f32 {
-    hex_row_h(zoom) + ROW_GAP
+/// Bytes per row for a hex panel `panel_width` wide: the largest multiple of 8
+/// that fits, floored at 8 so the 8-byte grouping is never split.
+// Callers arrive with the panels in later tasks of the three-column rework.
+#[allow(dead_code)]
+pub(crate) fn hex_bytes_per_row(panel_width: f32, char_w: f32) -> usize {
+    if !char_w.is_finite() || char_w <= 0.0 || !panel_width.is_finite() {
+        return 8;
+    }
+    let mut n = 8;
+    // 4096 bytes per row is far past any real window; the bound only stops a
+    // pathological `char_w` from spinning.
+    while n < 4096 && hex_row_width(n + 8, char_w) <= panel_width {
+        n += 8;
+    }
+    n
+}
+
+/// Bytes per row for the zoom panel: one `zoom`-wide block per byte.
+// Callers arrive with the panels in later tasks of the three-column rework.
+#[allow(dead_code)]
+pub(crate) fn zoom_bytes_per_row(panel_width: f32, zoom: f32) -> usize {
+    if !zoom.is_finite() || zoom <= 0.0 || !panel_width.is_finite() {
+        return 1;
+    }
+    ((panel_width / zoom).floor() as usize).max(1)
+}
+
+/// The byte offset of the first row a panel with `bpr` bytes per row shows when
+/// the shared anchor sits at `anchor`.
+// Callers arrive with the panels in later tasks of the three-column rework.
+#[allow(dead_code)]
+pub(crate) fn row_start_for(anchor: usize, bpr: usize) -> usize {
+    if bpr == 0 {
+        return anchor;
+    }
+    anchor - anchor % bpr
+}
+
+/// The furthest the shared anchor may scroll: the start of the row holding the
+/// last byte, in the hex column's row length (the scroll reference, SPECS §4.2).
+// Callers arrive with the panels in later tasks of the three-column rework.
+#[allow(dead_code)]
+pub(crate) fn max_anchor(file_size: usize, hex_bpr: usize) -> usize {
+    if file_size == 0 || hex_bpr == 0 {
+        return 0;
+    }
+    row_start_for(file_size - 1, hex_bpr)
+}
+
+/// Rows needed to cover `panel_height`, including a partially visible last row.
+pub(crate) fn visible_rows(panel_height: f32, row_h: f32) -> usize {
+    if !row_h.is_finite() || row_h <= 0.0 || !panel_height.is_finite() {
+        return 1;
+    }
+    ((panel_height / row_h).ceil() as usize).max(1)
 }
 
 /// Format a half-open byte range as a hex header label, e.g.
@@ -92,6 +151,15 @@ fn to_hsla(c: Rgba) -> Hsla {
     Hsla::from(c)
 }
 
+/// Glyph color for a byte: contrasting against its cell background when the
+/// panel's colormap paints one, otherwise the default foreground.
+fn glyph_color(b: u8, entropy: f32, colormap: Colormap) -> Hsla {
+    match colormap.color_for(b, entropy) {
+        Some(bg) => to_hsla(color::fg_for_bg(bg)),
+        None => to_hsla(rgb(DEFAULT_FG)),
+    }
+}
+
 /// Per-row horizontal geometry for one bytes-per-row layout. All offsets are
 /// derived from the monospace glyph width so the text, the background cells
 /// and the hit-testing always agree.
@@ -109,8 +177,11 @@ impl RowGeo {
     pub fn new(char_w: f32, bpr: usize) -> Self {
         let hex_start = ADDR_X + 8.0 * char_w + 2.0 * char_w;
         let cell_w = 3.0 * char_w; // two hex digits + one space
-        let group_gap = char_w; // extra space every 8 bytes
-        let hex_w = bpr as f32 * cell_w + (bpr / 8) as f32 * group_gap;
+        let group_gap = char_w; // extra space between 8-byte groups
+        // `build_row_text` emits a space *between* groups, so a row of `bpr`
+        // bytes has `(bpr - 1) / 8` of them, not `bpr / 8`. Counting one too
+        // many put the ASCII block a full character right of its glyphs.
+        let hex_w = bpr as f32 * cell_w + (bpr.saturating_sub(1) / 8) as f32 * group_gap;
         let ascii_start = hex_start + hex_w + 2.0 * char_w;
         Self {
             bpr,
@@ -154,29 +225,56 @@ impl RowGeo {
 }
 
 /// Map a canvas-local point to a file offset, or `None` when outside the
-/// content or over a gap. `local` is relative to the hex canvas origin.
+/// content or over a gap. `local` is relative to the hex canvas origin and rows
+/// start at the row-aligned `first_row_start`.
 pub(crate) fn hex_offset_at(
     local: Point<Pixels>,
     geo: &RowGeo,
-    scroll_rows: f32,
-    block_h: f32,
-    total_rows: usize,
+    first_row_start: usize,
     len: usize,
 ) -> Option<usize> {
     let y = local.y.to_f64() as f32;
-    if y < 0.0 {
+    if y < 0.0 || len == 0 {
         return None;
     }
-    let row = ((y / block_h).floor() + scroll_rows) as usize;
-    if row >= total_rows {
-        return None;
-    }
-    let row_start = row * geo.bpr;
+    let row = (y / BLOCK_H) as usize;
+    let row_start = first_row_start.checked_add(row.checked_mul(geo.bpr)?)?;
     if row_start >= len {
         return None;
     }
     let i = geo.byte_at_x(local.x.to_f64() as f32)?;
     let off = row_start + i;
+    (off < len).then_some(off)
+}
+
+/// Map a point in the zoom canvas to a file offset, or `None` when it is
+/// outside the painted bytes. Rows are flush: one `zoom`-sized band per byte,
+/// `zoom` tall, starting at the row-aligned `first_row_start`.
+///
+/// `paint_zoom` only draws `bpr` blocks per row, so anything to the right of
+/// them is empty background and must not resolve to a byte — without the `col`
+/// bound the offset would silently run on into later rows.
+pub(crate) fn zoom_offset_at(
+    local: Point<Pixels>,
+    bpr: usize,
+    first_row_start: usize,
+    zoom: f32,
+    len: usize,
+) -> Option<usize> {
+    let x = local.x.to_f64() as f32;
+    let y = local.y.to_f64() as f32;
+    if x < 0.0 || y < 0.0 || len == 0 || bpr == 0 || !zoom.is_finite() || zoom <= 0.0 {
+        return None;
+    }
+    let col = (x / zoom) as usize;
+    if col >= bpr {
+        return None;
+    }
+    let row = (y / zoom) as usize;
+    let off = row
+        .checked_mul(bpr)?
+        .checked_add(first_row_start)?
+        .checked_add(col)?;
     (off < len).then_some(off)
 }
 
@@ -222,6 +320,7 @@ pub(crate) fn build_row_text(data: &[u8], row_start: usize, n: usize) -> RowText
 
 /// Build the color runs for a row line: gray address, contrast-colored hex
 /// digits and ASCII glyphs per byte, neutral (invisible) spaces.
+#[allow(clippy::too_many_arguments)]
 fn build_row_runs(
     data: &[u8],
     row_start: usize,
@@ -230,6 +329,9 @@ fn build_row_runs(
     ascii_offsets: &[usize],
     font: &Font,
     total_len: usize,
+    entropies: &[f32],
+    entropy_window: usize,
+    colormap: Colormap,
 ) -> Vec<TextRun> {
     let neutral = to_hsla(rgba(0x00000000));
     let addr_color = to_hsla(rgb(0x9a9a9a));
@@ -263,7 +365,11 @@ fn build_row_runs(
     for i in 0..n {
         gap(cur, hex_offsets[i], &mut runs);
         cur = hex_offsets[i];
-        let fg = to_hsla(color::fg_for_class(color::class_color(data[row_start + i])));
+        let fg = glyph_color(
+            data[row_start + i],
+            entropy_at(entropies, entropy_window, row_start + i),
+            colormap,
+        );
         runs.push(TextRun {
             len: 2,
             font: font.clone(),
@@ -292,7 +398,11 @@ fn build_row_runs(
 
     // ASCII cells.
     for i in 0..n {
-        let fg = to_hsla(color::fg_for_class(color::class_color(data[row_start + i])));
+        let fg = glyph_color(
+            data[row_start + i],
+            entropy_at(entropies, entropy_window, row_start + i),
+            colormap,
+        );
         runs.push(TextRun {
             len: 1,
             font: font.clone(),
@@ -342,63 +452,70 @@ pub(crate) fn paint_hex(
     bounds: Bounds<Pixels>,
     data: &[u8],
     font: &Font,
-    zoom: f32,
     bpr: usize,
-    scroll_rows: f32,
+    first_row_start: usize,
     hovered: Option<usize>,
     sel: Option<&Range<usize>>,
+    entropies: &[f32],
+    entropy_window: usize,
+    colormap: Colormap,
 ) {
     let len = data.len();
-    if len == 0 {
+    if len == 0 || bpr == 0 {
         return;
     }
-    let total_rows = len.div_ceil(bpr);
-    let row_h = hex_row_h(zoom);
-    let block_h = hex_block_h(zoom);
-    let font_size = px(HEX_FONT_SIZE * zoom);
+    let row_h = ROW_H;
+    let font_size = px(HEX_FONT_SIZE);
     let char_w = hex_char_width(window, font, font_size);
     let geo = RowGeo::new(char_w, bpr);
 
-    let first = scroll_rows.floor().max(0.0) as usize;
-    let vis_rows = (bounds.size.height / px(block_h)).ceil() as usize + 1;
-    let last = (first + vis_rows).min(total_rows);
+    let rows = visible_rows(bounds.size.height.to_f64() as f32, BLOCK_H);
 
     let origin = bounds.origin;
-    for row in first..last {
-        let y0 = (row as f32 - scroll_rows) * block_h;
-        let row_start = row * bpr;
+    for r in 0..rows {
+        let row_start = first_row_start + r * bpr;
+        if row_start >= len {
+            break;
+        }
+        let y0 = r as f32 * BLOCK_H;
         let n = (len - row_start).min(bpr);
 
         // Cell backgrounds (+ selection overlay).
         for i in 0..n {
             let off = row_start + i;
-            let class: Background = color::class_color(data[off]).into();
+            let cell_bg = colormap.color_for(data[off], entropy_at(entropies, entropy_window, off));
             let hex_x = geo.cell_x(i);
             let hex_rect = Bounds::new(
                 point(origin.x + px(hex_x), origin.y + px(y0)),
                 size(px(geo.cell_w), px(row_h)),
             );
-            window.paint_quad(quad(
-                hex_rect,
-                px(0.),
-                class,
-                px(0.),
-                transparent_black(),
-                BorderStyle::default(),
-            ));
+            if let Some(bg) = cell_bg {
+                let class: Background = bg.into();
+                window.paint_quad(quad(
+                    hex_rect,
+                    px(0.),
+                    class,
+                    px(0.),
+                    transparent_black(),
+                    BorderStyle::default(),
+                ));
+            }
             let ascii_x = geo.ascii_x(i);
             let ascii_rect = Bounds::new(
                 point(origin.x + px(ascii_x), origin.y + px(y0)),
                 size(px(geo.char_w), px(row_h)),
             );
-            window.paint_quad(quad(
-                ascii_rect,
-                px(0.),
-                class,
-                px(0.),
-                transparent_black(),
-                BorderStyle::default(),
-            ));
+            if let Some(bg) = cell_bg {
+                let class: Background = bg.into();
+                window.paint_quad(quad(
+                    ascii_rect,
+                    px(0.),
+                    class,
+                    px(0.),
+                    transparent_black(),
+                    BorderStyle::default(),
+                ));
+            }
             if sel.is_some_and(|r| r.contains(&off)) {
                 let tint: Background = rgba(0xffffff3d).into();
                 window.paint_quad(quad(
@@ -450,25 +567,35 @@ pub(crate) fn paint_hex(
             &rt.ascii_offsets,
             font,
             rt.text.len(),
+            entropies,
+            entropy_window,
+            colormap,
         );
         let line = window
             .text_system()
             .shape_line(rt.text.into(), font_size, &runs, None);
-        let _ = line.paint(point(origin.x, origin.y + px(y0)), px(row_h), window, cx);
+        // `RowGeo` builds ADDR_X into `hex_start`, so the glyphs need the same
+        // gutter or every background sits half a byte right of its digits.
+        let _ = line.paint(
+            point(origin.x + px(ADDR_X), origin.y + px(y0)),
+            px(row_h),
+            window,
+            cx,
+        );
     }
 }
 
-/// Paint the pixels column into `bounds`: a per-byte band in the selected
-/// colormap over an entropy band, at an adjustable zoom. Virtualized.
+/// Paint the zoom column into `bounds`: one `zoom`-sized band per byte in
+/// `colormap`, rows flush so the panel reads as a pixel image. Virtualized to
+/// the visible rows starting at the row-aligned `first_row_start`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paint_pixels(
+pub(crate) fn paint_zoom(
     window: &mut Window,
-    _cx: &mut App,
     bounds: Bounds<Pixels>,
     data: &[u8],
     bpr: usize,
-    scroll_rows: f32,
-    pixel_zoom: f32,
+    first_row_start: usize,
+    zoom: f32,
     hovered: Option<usize>,
     sel: Option<&Range<usize>>,
     entropies: &[f32],
@@ -476,61 +603,40 @@ pub(crate) fn paint_pixels(
     colormap: Colormap,
 ) {
     let len = data.len();
-    if len == 0 {
+    if len == 0 || bpr == 0 || !zoom.is_finite() || zoom <= 0.0 {
         return;
     }
-    let total_rows = len.div_ceil(bpr);
-    let px_size = pixel_zoom.clamp(PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX);
-    let band_h = px_size;
-    let row_h = 2.0 * band_h + 1.0;
-
-    let first = scroll_rows.floor().max(0.0) as usize;
-    let vis_rows = (bounds.size.height / px(row_h)).ceil() as usize + 1;
-    let last = (first + vis_rows).min(total_rows);
-
-    for row in first..last {
-        let y = bounds.top().to_f64() as f32 + (row as f32 - scroll_rows) * row_h;
-        let row_start = row * bpr;
+    let rows = visible_rows(bounds.size.height.to_f64() as f32, zoom);
+    for r in 0..rows {
+        let row_start = first_row_start + r * bpr;
+        if row_start >= len {
+            break;
+        }
+        let y = bounds.top().to_f64() as f32 + r as f32 * zoom;
         let n = (len - row_start).min(bpr);
         for i in 0..n {
             let off = row_start + i;
-            let b = data[off];
-            let x = bounds.left() + px(i as f32 * px_size);
-            let grey_rect = Bounds::new(point(x, px(y)), size(px(px_size), px(band_h)));
-            let top: Background = colormap
-                .color_for(b, entropy_at(entropies, entropy_window, off))
-                .into();
-            window.paint_quad(quad(
-                grey_rect,
-                px(0.),
-                top,
-                px(0.),
-                transparent_black(),
-                BorderStyle::default(),
-            ));
-            let entr_rect = Bounds::new(point(x, px(y + band_h)), size(px(px_size), px(band_h)));
-            let bot: Background =
-                color::entropy_color(entropy_at(entropies, entropy_window, off)).into();
-            window.paint_quad(quad(
-                entr_rect,
-                px(0.),
-                bot,
-                px(0.),
-                transparent_black(),
-                BorderStyle::default(),
-            ));
-            if sel.is_some_and(|r| r.contains(&off)) {
-                let tint: Background = rgba(0xffffff30).into();
+            let rect = Bounds::new(
+                point(bounds.left() + px(i as f32 * zoom), px(y)),
+                size(px(zoom), px(zoom)),
+            );
+            if let Some(c) =
+                colormap.color_for(data[off], entropy_at(entropies, entropy_window, off))
+            {
+                let bg: Background = c.into();
                 window.paint_quad(quad(
-                    grey_rect,
+                    rect,
                     px(0.),
-                    tint,
+                    bg,
                     px(0.),
                     transparent_black(),
                     BorderStyle::default(),
                 ));
+            }
+            if sel.is_some_and(|s| s.contains(&off)) {
+                let tint: Background = rgba(0xffffff30).into();
                 window.paint_quad(quad(
-                    entr_rect,
+                    rect,
                     px(0.),
                     tint,
                     px(0.),
@@ -538,21 +644,16 @@ pub(crate) fn paint_pixels(
                     BorderStyle::default(),
                 ));
             }
-        }
-        if let Some(o) = hovered
-            && (row_start..row_start + n).contains(&o)
-        {
-            let i = o - row_start;
-            let x = bounds.left() + px(i as f32 * px_size);
-            let rect = Bounds::new(point(x, px(y)), size(px(px_size), px(row_h)));
-            window.paint_quad(quad(
-                rect,
-                px(0.),
-                transparent_black(),
-                px(1.),
-                gpui::white(),
-                BorderStyle::default(),
-            ));
+            if hovered == Some(off) {
+                window.paint_quad(quad(
+                    rect,
+                    px(0.),
+                    transparent_black(),
+                    px(1.),
+                    gpui::white(),
+                    BorderStyle::default(),
+                ));
+            }
         }
     }
 }
@@ -654,113 +755,98 @@ pub(crate) fn render_image_from_rgba(
     Arc::new(RenderImage::new(vec![frame]))
 }
 
-/// Compute the raw RGBA pixels (`w` × `2h`) of the 2D whole-file overview.
-/// Extracted from `build_overview_image` so the pixel math is unit-testable
-/// without a gpui window; the wrapper only wraps the buffer as an image.
+/// Compute the raw RGBA pixels (`w` × `h`) of the 2D whole-file overview: one
+/// band per cell in `colormap`. Extracted from `build_overview_image` so the
+/// pixel math is unit-testable without a gpui window.
+///
+/// Under `Colormap::None` every cell is left transparent, so the panel
+/// background shows through (SPECS §3.C).
 fn build_overview_rgba(
     data: &[u8],
     entropies: &[f32],
     entropy_window: usize,
     w: usize,
     h: usize,
+    colormap: Colormap,
 ) -> Vec<u8> {
     // `sample_average` needs at least one byte (it indexes `len - 1`); an
-    // empty buffer is the safe placeholder for a missing file. Zero
-    // dimensions would divide by zero below (`k % w`), so floor them at 1.
+    // empty buffer is the safe placeholder for a missing file. Zero dimensions
+    // would divide by zero below (`k % w`), so floor them at 1.
     let w = w.max(1);
     let h = h.max(1);
     if data.is_empty() {
-        return vec![0u8; w * 2 * h * 4];
+        return vec![0u8; w * h * 4];
     }
     let len = data.len();
     let cells = (w * h).max(1);
-    let mut pixels = vec![0u8; w * 2 * h * 4];
+    let mut pixels = vec![0u8; w * h * 4];
     for k in 0..cells {
         let start = k * len / cells;
         let end = ((k + 1) * len / cells).max(start + 1);
-        // Cell k sits at grid (col = k % w, row = k / w); each cell is a 1×2
-        // block of pixels: a colormap band over an entropy band.
-        let col = k % w;
-        let row = 2 * (k / w);
-        let avg = sample_average(data, start, end);
-        set_pixel(
-            &mut pixels,
-            w,
-            col,
-            row,
-            Colormap::Greyscale.color_for(avg, 0.0),
-        );
         let mid = (start + (end - start) / 2).min(len - 1);
-        set_pixel(
-            &mut pixels,
-            w,
-            col,
-            row + 1,
-            color::entropy_color(entropy_at(entropies, entropy_window, mid)),
-        );
+        let avg = sample_average(data, start, end);
+        // Cell k sits at grid (col = k % w, row = k / w).
+        if let Some(c) = colormap.color_for(avg, entropy_at(entropies, entropy_window, mid)) {
+            set_pixel(&mut pixels, w, k % w, k / w, c);
+        }
     }
     pixels
 }
 
 /// Build the 2D whole-file overview: the file is downsampled into a `w × h`
-/// cell grid, each cell drawn as a colormap band over an entropy band. The
-/// texture is `w` wide and `2h` rows tall (two rows per cell).
+/// cell grid, each cell one band in `colormap`.
 pub(crate) fn build_overview_image(
     data: &[u8],
     entropies: &[f32],
     entropy_window: usize,
     w: usize,
     h: usize,
+    colormap: Colormap,
 ) -> (Arc<RenderImage>, (usize, usize)) {
     // Keep the reported cell grid consistent with the guarded buffer dims.
     let w = w.max(1);
     let h = h.max(1);
-    let pixels = build_overview_rgba(data, entropies, entropy_window, w, h);
-    (render_image_from_rgba(w, 2 * h, pixels), (w, h))
+    let pixels = build_overview_rgba(data, entropies, entropy_window, w, h, colormap);
+    (render_image_from_rgba(w, h, pixels), (w, h))
 }
 
-/// Compute the raw RGBA pixels (256×2) of the horizontal whole-file preview
+/// Compute the raw RGBA pixels (256×1) of the horizontal whole-file preview
 /// strip. Extracted from `build_strip_image` for the same reason as
 /// `build_overview_rgba`.
-fn build_strip_rgba(data: &[u8], entropies: &[f32], entropy_window: usize) -> Vec<u8> {
+fn build_strip_rgba(
+    data: &[u8],
+    entropies: &[f32],
+    entropy_window: usize,
+    colormap: Colormap,
+) -> Vec<u8> {
     const W: usize = 256;
     if data.is_empty() {
-        return vec![0u8; W * 2 * 4];
+        return vec![0u8; W * 4];
     }
     let len = data.len();
-    let mut pixels = vec![0u8; W * 2 * 4];
+    let mut pixels = vec![0u8; W * 4];
     for x in 0..W {
         let start = x * len / W;
         let end = ((x + 1) * len / W).max(start + 1);
-        let avg = sample_average(data, start, end);
-        set_pixel(
-            &mut pixels,
-            W,
-            x,
-            0,
-            Colormap::Greyscale.color_for(avg, 0.0),
-        );
         let mid = (start + (end - start) / 2).min(len - 1);
-        set_pixel(
-            &mut pixels,
-            W,
-            x,
-            1,
-            color::entropy_color(entropy_at(entropies, entropy_window, mid)),
-        );
+        let avg = sample_average(data, start, end);
+        if let Some(c) = colormap.color_for(avg, entropy_at(entropies, entropy_window, mid)) {
+            set_pixel(&mut pixels, W, x, 0, c);
+        }
     }
     pixels
 }
 
-/// Build the horizontal whole-file preview strip: a fixed 256×2 colormap /
-/// entropy thumbnail, x mapping to file offset.
+/// Build the horizontal whole-file preview strip: a fixed 256×1 band in
+/// `colormap`, x mapping to file offset.
 pub(crate) fn build_strip_image(
     data: &[u8],
     entropies: &[f32],
     entropy_window: usize,
+    colormap: Colormap,
 ) -> Arc<RenderImage> {
-    let pixels = build_strip_rgba(data, entropies, entropy_window);
-    render_image_from_rgba(256, 2, pixels)
+    let pixels = build_strip_rgba(data, entropies, entropy_window, colormap);
+    render_image_from_rgba(256, 1, pixels)
 }
 
 #[cfg(test)]
@@ -779,10 +865,11 @@ mod tests {
     }
 
     #[test]
-    fn overview_buffer_is_w_by_2h_and_opaque() {
+    fn overview_buffer_is_w_by_h_and_opaque() {
         let data = [0x41u8; 4096];
-        let buf = build_overview_rgba(&data, &[], 256, 8, 4);
-        assert_eq!(buf.len(), 8 * (2 * 4) * 4); // w × 2h × 4 channels
+        let e = entropies(&data);
+        let buf = build_overview_rgba(&data, &e, 256, 8, 4, Colormap::Value);
+        assert_eq!(buf.len(), 8 * 4 * 4); // w × h × 4 channels, one band per cell
         for (i, &b) in buf.iter().enumerate() {
             if i % 4 == 3 {
                 assert_eq!(b, 255, "alpha at byte {i} must be opaque");
@@ -791,48 +878,52 @@ mod tests {
     }
 
     #[test]
-    fn overview_greyscale_band_is_byte_brightness() {
+    fn overview_value_colormap_is_byte_brightness() {
         let data = [0xAAu8; 512];
-        let buf = build_overview_rgba(&data, &[], 256, 2, 2);
-        // Every cell's top pixel (greyscale band) mirrors the average byte.
-        assert_eq!(px(&buf, 2, 0, 0), (170, 170, 170, 255));
-        assert_eq!(px(&buf, 2, 1, 0), (170, 170, 170, 255));
-        assert_eq!(px(&buf, 2, 0, 2), (170, 170, 170, 255));
-        assert_eq!(px(&buf, 2, 1, 2), (170, 170, 170, 255));
+        let e = entropies(&data);
+        let buf = build_overview_rgba(&data, &e, 256, 2, 2, Colormap::Value);
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            assert_eq!(px(&buf, 2, x, y), (170, 170, 170, 255), "cell ({x},{y})");
+        }
+    }
+
+    #[test]
+    fn overview_none_colormap_leaves_cells_transparent() {
+        let data = [0xAAu8; 512];
+        let e = entropies(&data);
+        let buf = build_overview_rgba(&data, &e, 256, 2, 2, Colormap::None);
+        assert!(buf.iter().all(|&b| b == 0), "None must paint nothing");
     }
 
     #[test]
     fn overview_cells_tile_the_file_in_row_major_order() {
-        // First half of the file is 0xFF, second half 0x00. With w = 1, h = 2
-        // the two cells split the file exactly in half: cell 0 (rows 0-1)
-        // should be white over the low-entropy purple, cell 1 (rows 2-3)
-        // black over the same purple.
-        let data: Vec<u8> = [vec![0xFF; 256], vec![0x00; 256]].concat();
+        // Four cells over four bytes: cell k is byte k, so row-major order is
+        // directly visible in the buffer.
+        let data = vec![0x00u8, 0x40, 0x80, 0xC0];
         let e = entropies(&data);
-        let buf = build_overview_rgba(&data, &e, 256, 1, 2);
-        assert_eq!(px(&buf, 1, 0, 0), (255, 255, 255, 255)); // cell 0 greyscale
-        assert_eq!(px(&buf, 1, 0, 1), (12, 0, 40, 255)); // cell 0 entropy (uniform)
-        assert_eq!(px(&buf, 1, 0, 2), (0, 0, 0, 255)); // cell 1 greyscale
-        assert_eq!(px(&buf, 1, 0, 3), (12, 0, 40, 255)); // cell 1 entropy (uniform)
+        let buf = build_overview_rgba(&data, &e, 256, 2, 2, Colormap::Value);
+        assert_eq!(px(&buf, 2, 0, 0).0, 0x00);
+        assert_eq!(px(&buf, 2, 1, 0).0, 0x40);
+        assert_eq!(px(&buf, 2, 0, 1).0, 0x80);
+        assert_eq!(px(&buf, 2, 1, 1).0, 0xC0);
     }
 
     #[test]
-    fn overview_entropy_band_high_for_full_range_bytes() {
-        // One full 0..=255 cycle has entropy 8.0 (the hot end of the gradient)
-        // and a mean byte of 112 on the greyscale band.
+    fn overview_entropy_colormap_is_hot_for_full_range_bytes() {
+        // One full 0..=255 cycle has entropy 8.0 — the hot end of the gradient.
         let data: Vec<u8> = (0..=255u8).cycle().take(256).collect();
         let e = entropies(&data);
         assert!((e[0] - 8.0).abs() < 0.01, "e={}", e[0]);
-        let buf = build_overview_rgba(&data, &e, 256, 1, 1);
-        assert_eq!(px(&buf, 1, 0, 0), (112, 112, 112, 255));
-        assert_eq!(px(&buf, 1, 0, 1), (255, 60, 40, 255)); // entropy_color(8.0)
+        let buf = build_overview_rgba(&data, &e, 256, 1, 1, Colormap::Entropy);
+        assert_eq!(px(&buf, 1, 0, 0), (255, 60, 40, 255)); // entropy_color(8.0)
     }
 
     #[test]
-    fn strip_buffer_is_256x2_and_opaque() {
+    fn strip_buffer_is_256x1_and_opaque() {
         let data = [0u8; 512];
-        let buf = build_strip_rgba(&data, &[], 256);
-        assert_eq!(buf.len(), 256 * 2 * 4);
+        let e = entropies(&data);
+        let buf = build_strip_rgba(&data, &e, 256, Colormap::Value);
+        assert_eq!(buf.len(), 256 * 4);
         for (i, &b) in buf.iter().enumerate() {
             if i % 4 == 3 {
                 assert_eq!(b, 255, "alpha at byte {i} must be opaque");
@@ -842,31 +933,25 @@ mod tests {
 
     #[test]
     fn strip_maps_file_offset_to_x() {
-        // 512 bytes over 256 strip columns -> 2 bytes per column. The left
-        // half is 0xFF, the right half 0x00; each entropy block is uniform, so
-        // the entropy band sits at the low end of the gradient.
+        // 512 bytes over 256 columns -> 2 bytes each; left half 0xFF, right 0x00.
         let data: Vec<u8> = [vec![0xFF; 256], vec![0x00; 256]].concat();
         let e = entropies(&data);
-        let buf = build_strip_rgba(&data, &e, 256);
+        let buf = build_strip_rgba(&data, &e, 256, Colormap::Value);
         assert_eq!(px(&buf, 256, 0, 0), (255, 255, 255, 255));
         assert_eq!(px(&buf, 256, 127, 0), (255, 255, 255, 255));
         assert_eq!(px(&buf, 256, 128, 0), (0, 0, 0, 255));
         assert_eq!(px(&buf, 256, 255, 0), (0, 0, 0, 255));
-        assert_eq!(px(&buf, 256, 0, 1), (12, 0, 40, 255));
-        assert_eq!(px(&buf, 256, 255, 1), (12, 0, 40, 255));
     }
 
     #[test]
     fn strip_handles_a_single_byte_file() {
-        // Every strip column maps back to the one byte; a uniform 1-byte file
-        // has entropy 0.
+        // Every strip column maps back to the one byte.
         let data = [0xABu8; 1];
         let e = entropies(&data);
-        let buf = build_strip_rgba(&data, &e, 256);
-        assert_eq!(buf.len(), 256 * 2 * 4);
+        let buf = build_strip_rgba(&data, &e, 256, Colormap::Value);
+        assert_eq!(buf.len(), 256 * 4);
         assert_eq!(px(&buf, 256, 0, 0), (171, 171, 171, 255));
         assert_eq!(px(&buf, 256, 200, 0), (171, 171, 171, 255));
-        assert_eq!(px(&buf, 256, 0, 1), (12, 0, 40, 255)); // uniform -> entropy 0
     }
 
     #[test]
@@ -874,11 +959,15 @@ mod tests {
         // The app never builds thumbnails without a file, but the generators
         // should not panic (sample_average indexes len - 1) if handed one.
         assert!(
-            build_overview_rgba(&[], &[], 256, 4, 2)
+            build_overview_rgba(&[], &[], 256, 4, 2, Colormap::Value)
                 .iter()
                 .all(|&b| b == 0)
         );
-        assert!(build_strip_rgba(&[], &[], 256).iter().all(|&b| b == 0));
+        assert!(
+            build_strip_rgba(&[], &[], 256, Colormap::Value)
+                .iter()
+                .all(|&b| b == 0)
+        );
     }
 
     #[test]
@@ -886,10 +975,16 @@ mod tests {
         // A zero width/height must not panic (k % w would divide by zero and
         // the image crate rejects 0-sized buffers); the dimensions floor at 1.
         let data = [0x41u8; 64];
-        // w → 1, so 1 × 2·4 × 4 channels = 32 bytes; h → 1, so 3 × 2·1 × 4 = 24.
-        assert_eq!(build_overview_rgba(&data, &[], 256, 0, 4).len(), 32);
-        assert_eq!(build_overview_rgba(&data, &[], 256, 3, 0).len(), 24);
-        let (_image, cells) = build_overview_image(&data, &[], 256, 0, 2);
+        // w → 1, so 1 × 4 × 4 channels = 16 bytes; h → 1, so 3 × 1 × 4 = 12.
+        assert_eq!(
+            build_overview_rgba(&data, &[], 256, 0, 4, Colormap::Value).len(),
+            16
+        );
+        assert_eq!(
+            build_overview_rgba(&data, &[], 256, 3, 0, Colormap::Value).len(),
+            12
+        );
+        let (_image, cells) = build_overview_image(&data, &[], 256, 0, 2, Colormap::Value);
         assert_eq!(cells, (1, 2));
     }
 
@@ -900,9 +995,9 @@ mod tests {
         // Both wrappers route the RGBA buffer through the image crate, which
         // panics on a buffer-size mismatch — so simply constructing them here
         // verifies the pixel-buffer invariants end to end.
-        let (_image, cells) = build_overview_image(&data, &e, 256, 3, 2);
+        let (_image, cells) = build_overview_image(&data, &e, 256, 3, 2, Colormap::Value);
         assert_eq!(cells, (3, 2));
-        let _strip = build_strip_image(&data, &e, 256);
+        let _strip = build_strip_image(&data, &e, 256, Colormap::Value);
     }
 
     /// The test harness binary is itself an ELF. Feed a genuine ELF through
@@ -934,8 +1029,8 @@ mod tests {
         );
 
         // Strip: valid 256×2 buffer, fully opaque, with genuine content.
-        let strip = build_strip_rgba(&data, &e, 256);
-        assert_eq!(strip.len(), 256 * 2 * 4);
+        let strip = build_strip_rgba(&data, &e, 256, Colormap::Value);
+        assert_eq!(strip.len(), 256 * 4);
         assert!(strip.iter().skip(3).step_by(4).all(|&a| a == 255));
         let distinct: std::collections::HashSet<[u8; 4]> = strip
             .chunks_exact(4)
@@ -950,12 +1045,12 @@ mod tests {
         // Overview: valid buffer for a small grid; both image wrappers build
         // (they run the buffer through the image crate's size checks).
         let (w, h) = (16usize, 8usize);
-        let overview = build_overview_rgba(&data, &e, 256, w, h);
-        assert_eq!(overview.len(), w * (2 * h) * 4);
+        let overview = build_overview_rgba(&data, &e, 256, w, h, Colormap::Value);
+        assert_eq!(overview.len(), w * h * 4);
         assert!(overview.iter().skip(3).step_by(4).all(|&a| a == 255));
-        let (_image, cells) = build_overview_image(&data, &e, 256, w, h);
+        let (_image, cells) = build_overview_image(&data, &e, 256, w, h, Colormap::Value);
         assert_eq!(cells, (w, h));
-        let _strip = build_strip_image(&data, &e, 256);
+        let _strip = build_strip_image(&data, &e, 256, Colormap::Value);
     }
 
     #[test]
@@ -974,13 +1069,42 @@ mod tests {
         RowGeo::new(10.0, 16)
     }
 
+    /// The x a monospace glyph lands at, given its character offset in the row
+    /// text: the row is painted at `ADDR_X`, so glyph `k` sits at
+    /// `ADDR_X + k * char_w`.
+    fn glyph_x(char_offset: usize, char_w: f32) -> f32 {
+        ADDR_X + char_offset as f32 * char_w
+    }
+
+    #[test]
+    fn hex_and_ascii_glyphs_sit_on_their_background_cells() {
+        let char_w = 10.0;
+        for bpr in [8usize, 16, 32] {
+            let geo = RowGeo::new(char_w, bpr);
+            let data: Vec<u8> = (0..bpr).map(|i| i as u8).collect();
+            let rt = build_row_text(&data, 0, bpr);
+            for i in 0..bpr {
+                assert_eq!(
+                    glyph_x(rt.hex_offsets[i], char_w),
+                    geo.cell_x(i),
+                    "hex byte {i} of {bpr} misaligned"
+                );
+                assert_eq!(
+                    glyph_x(rt.ascii_offsets[i], char_w),
+                    geo.ascii_x(i),
+                    "ascii byte {i} of {bpr} misaligned"
+                );
+            }
+        }
+    }
+
     #[test]
     fn row_geo_byte_at_x_maps_cells_gaps_and_ascii() {
         let geo = row_geo();
         // Derived layout: addr gutter (8 + 10 glyphs), then hex cells.
         assert_eq!(geo.hex_start, 108.0);
         assert_eq!(geo.cell_w, 30.0);
-        assert_eq!(geo.ascii_start, 628.0);
+        assert_eq!(geo.ascii_start, 618.0);
 
         // Hex cells are contiguous: cell i spans [cell_x(i), cell_x(i)+cell_w).
         assert_eq!(geo.cell_x(0), 108.0);
@@ -998,76 +1122,152 @@ mod tests {
         assert_eq!(geo.byte_at_x(358.0), Some(8));
 
         // ASCII cells sit after a fixed gap and are char_w wide.
-        assert_eq!(geo.byte_at_x(627.9), None);
-        assert_eq!(geo.byte_at_x(628.0), Some(0));
-        assert_eq!(geo.byte_at_x(643.0), Some(1));
+        assert_eq!(geo.byte_at_x(617.9), None);
+        assert_eq!(geo.byte_at_x(618.0), Some(0));
+        assert_eq!(geo.byte_at_x(633.0), Some(1));
         assert_eq!(geo.byte_at_x(geo.ascii_x(15) + geo.char_w), None); // past last byte
+    }
+
+    #[test]
+    fn zoom_offset_at_maps_rows_flush_and_rejects_blank_space() {
+        // 16 bytes/row at 4 px: bytes span x in [0,64); rows are 4 px tall.
+        let hit = |x: f32, y: f32, first: usize| {
+            zoom_offset_at(point(gpui::px(x), gpui::px(y)), 16, first, 4.0, 60)
+        };
+
+        assert_eq!(hit(0.0, 0.0, 0), Some(0));
+        assert_eq!(hit(63.9, 0.0, 0), Some(15));
+        assert_eq!(hit(64.0, 0.0, 0), None); // right of the last byte
+        assert_eq!(hit(300.0, 0.0, 0), None);
+        // Rows are flush: the second row starts at y = zoom, not 2*zoom + 1.
+        assert_eq!(hit(0.0, 4.0, 0), Some(16));
+        assert_eq!(hit(0.0, 8.0, 0), Some(32));
+        // Anchored elsewhere in the file.
+        assert_eq!(hit(0.0, 0.0, 32), Some(32));
+        assert_eq!(hit(4.0, 4.0, 32), Some(49));
+        // Past end of file (the last row holds only 48..60).
+        assert_eq!(hit(48.0, 0.0, 48), None);
+        assert_eq!(hit(44.0, 0.0, 48), Some(59));
+        // Degenerate inputs.
+        assert_eq!(hit(-1.0, 0.0, 0), None);
+        assert_eq!(hit(0.0, -1.0, 0), None);
+        assert_eq!(
+            zoom_offset_at(point(gpui::px(0.), gpui::px(0.)), 16, 0, 4.0, 0),
+            None
+        );
+        assert_eq!(
+            zoom_offset_at(point(gpui::px(0.), gpui::px(0.)), 16, 0, 0.0, 60),
+            None
+        );
     }
 
     #[test]
     fn hex_offset_at_maps_y_to_row_and_x_to_byte() {
         let geo = row_geo();
-        let block_h = hex_block_h(1.0); // 18 + 3 = 21 px per row
-        assert_eq!(block_h, 21.0);
+        assert_eq!(BLOCK_H, 21.0);
         let len = 64usize;
-        let total_rows = len.div_ceil(geo.bpr);
-        let hit = |y: f32, x: f32| {
-            hex_offset_at(
-                point(gpui::px(x), gpui::px(y)),
-                &geo,
-                0.0,
-                block_h,
-                total_rows,
-                len,
-            )
-        };
+        let hit = |y: f32, x: f32| hex_offset_at(point(gpui::px(x), gpui::px(y)), &geo, 0, len);
 
         // Row 0 (offsets 0..16), both hex and ascii cells.
         assert_eq!(hit(0.0, 108.0), Some(0));
         assert_eq!(hit(0.0, 138.0), Some(1));
         assert_eq!(hit(10.0, 108.0), Some(0)); // still within the first row block
-        assert_eq!(hit(0.0, 628.0), Some(0));
-        // Row 1 starts at y = block_h.
+        assert_eq!(hit(0.0, 618.0), Some(0));
+        // Row 1 starts at y = BLOCK_H.
         assert_eq!(hit(21.0, 108.0), Some(16));
-        assert_eq!(hit(21.0, 628.0), Some(16));
+        assert_eq!(hit(21.0, 618.0), Some(16));
         // Last full row (offsets 48..64).
         assert_eq!(hit(63.0, 108.0), Some(48));
 
         // Outside the content.
         assert_eq!(hit(-1.0, 108.0), None); // above the first row
-        assert_eq!(hit(84.0, 108.0), None); // row 4 >= total_rows
+        assert_eq!(hit(84.0, 108.0), None); // past end of file
         assert_eq!(hit(0.0, 50.0), None); // address gutter
         assert_eq!(hit(0.0, 350.0), None); // group gap between bytes 7 and 8
     }
 
     #[test]
-    fn hex_offset_at_scrolls_and_clamps_to_file_end() {
+    fn hex_offset_at_is_anchored_and_clamps_to_file_end() {
         let geo = row_geo();
-        let block_h = hex_block_h(1.0);
-        // 60 bytes -> 4 rows, but the last row holds only 12 bytes (48..60).
+        // 60 bytes -> the last row holds only 12 bytes (48..60).
         let len = 60usize;
-        let total_rows = len.div_ceil(geo.bpr);
-        let hit = |y: f32, x: f32| {
-            hex_offset_at(
-                point(gpui::px(x), gpui::px(y)),
-                &geo,
-                2.5,
-                block_h,
-                total_rows,
-                len,
-            )
-        };
+        let hit = |y: f32, x: f32| hex_offset_at(point(gpui::px(x), gpui::px(y)), &geo, 32, len);
 
-        // Scroll of 2.5 rows: row 2 sits at the viewport top (y=0) and row 3
-        // spans [21, 42); the fractional part is dropped by the `as usize` cast.
+        // Anchored at byte 32: the top row is 32..48, the next 48..60.
         assert_eq!(hit(0.0, 108.0), Some(32));
-        assert_eq!(hit(21.0, 108.0), Some(48)); // row 3 (offsets 48..60)
-        // Last byte of the file sits in cell 11 of row 3 (48 + 11 = 59).
+        assert_eq!(hit(21.0, 108.0), Some(48));
+        // Last byte of the file sits in cell 11 of that row (48 + 11 = 59).
         assert_eq!(geo.cell_x(11), 448.0);
         assert_eq!(hit(21.0, 448.0), Some(59));
         // Cell 12 would be offset 60 == len: clamped to None.
         assert_eq!(hit(21.0, 478.0), None);
         // A row below the last one is always None.
         assert_eq!(hit(42.0, 108.0), None);
+    }
+
+    #[test]
+    fn hex_bytes_per_row_fits_and_snaps_to_eight() {
+        let char_w = 10.0;
+        // width_for(n) = ADDR_X + char_w * (12 + 4n + (n-1)/8)
+        // n = 8  -> 8 + 10 * (12 + 32 + 0) = 448
+        // n = 16 -> 8 + 10 * (12 + 64 + 1) = 778
+        // n = 24 -> 8 + 10 * (12 + 96 + 2) = 1108
+        assert_eq!(hex_bytes_per_row(448.0, char_w), 8);
+        assert_eq!(hex_bytes_per_row(777.0, char_w), 8);
+        assert_eq!(hex_bytes_per_row(778.0, char_w), 16);
+        assert_eq!(hex_bytes_per_row(1107.0, char_w), 16);
+        assert_eq!(hex_bytes_per_row(1108.0, char_w), 24);
+        // Always a multiple of 8, never below 8, however narrow the panel.
+        assert_eq!(hex_bytes_per_row(0.0, char_w), 8);
+        assert_eq!(hex_bytes_per_row(-50.0, char_w), 8);
+        for w in [500.0, 900.0, 1500.0, 4000.0] {
+            assert_eq!(hex_bytes_per_row(w, char_w) % 8, 0, "width {w}");
+        }
+        // Degenerate glyph width must not divide by zero or loop forever.
+        assert_eq!(hex_bytes_per_row(1000.0, 0.0), 8);
+        assert_eq!(hex_bytes_per_row(f32::NAN, char_w), 8);
+    }
+
+    #[test]
+    fn zoom_bytes_per_row_is_width_over_zoom() {
+        assert_eq!(zoom_bytes_per_row(320.0, 4.0), 80);
+        assert_eq!(zoom_bytes_per_row(320.0, 8.0), 40);
+        assert_eq!(zoom_bytes_per_row(321.0, 8.0), 40); // floors
+        assert_eq!(zoom_bytes_per_row(7.0, 8.0), 1); // never zero
+        assert_eq!(zoom_bytes_per_row(0.0, 8.0), 1);
+        assert_eq!(zoom_bytes_per_row(320.0, 0.0), 1); // degenerate zoom
+        assert_eq!(zoom_bytes_per_row(f32::NAN, 8.0), 1);
+    }
+
+    #[test]
+    fn row_start_aligns_the_anchor_to_each_panel() {
+        assert_eq!(row_start_for(0, 16), 0);
+        assert_eq!(row_start_for(15, 16), 0);
+        assert_eq!(row_start_for(16, 16), 16);
+        assert_eq!(row_start_for(100, 16), 96);
+        // The same anchor aligns differently per panel — that is the point.
+        assert_eq!(row_start_for(100, 40), 80);
+        assert_eq!(row_start_for(100, 1), 100);
+        assert_eq!(row_start_for(100, 0), 100); // degenerate bpr is a no-op
+    }
+
+    #[test]
+    fn max_anchor_is_the_last_hex_row_start() {
+        // 60 bytes, 16 per row -> rows at 0,16,32,48; the last starts at 48.
+        assert_eq!(max_anchor(60, 16), 48);
+        assert_eq!(max_anchor(64, 16), 48);
+        assert_eq!(max_anchor(65, 16), 64);
+        assert_eq!(max_anchor(1, 16), 0);
+        assert_eq!(max_anchor(0, 16), 0); // empty file
+        assert_eq!(max_anchor(60, 0), 0); // degenerate bpr
+    }
+
+    #[test]
+    fn visible_rows_covers_partial_rows() {
+        assert_eq!(visible_rows(100.0, 20.0), 5);
+        assert_eq!(visible_rows(101.0, 20.0), 6); // 5 full + 1 partial
+        assert_eq!(visible_rows(0.0, 20.0), 1);
+        assert_eq!(visible_rows(100.0, 0.0), 1); // degenerate row height
+        assert_eq!(visible_rows(f32::NAN, 20.0), 1);
     }
 }

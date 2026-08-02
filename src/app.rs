@@ -7,12 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Background, BorderStyle, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Element,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, Window, canvas, div, fill, font, point,
-    prelude::*, px, quad, relative, rgb, rgba, size, transparent_black,
+    App, Background, BorderStyle, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
+    Decorations, Entity, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage, ResizeEdge, ScrollDelta,
+    ScrollWheelEvent, SharedString, Window, canvas, div, font, point, prelude::*, px, quad, rgb,
+    rgba, size, transparent_black,
 };
 
 use memmap2::{Mmap, MmapOptions};
@@ -20,17 +19,26 @@ use memmap2::{Mmap, MmapOptions};
 use crate::color::{self, Colormap};
 use crate::config;
 use crate::entropy;
+use crate::jump::{JumpField, JumpFieldEvent};
 use crate::panes;
 use crate::{
-    Backspace, ClearSelection, CopySelectionAscii, CopySelectionHex, Delete, JumpCancel,
-    JumpSubmit, JumpToOffset, NavigateDown, NavigateEnd, NavigateHome, NavigateLeft,
-    NavigatePageDown, NavigatePageUp, NavigateRight, NavigateUp, OpenFile, Paste, ResetColumns,
-    ResetSettings, ResetView, ZoomIn, ZoomOut,
+    ClearSelection, CopySelectionAscii, CopySelectionHex, JumpCancel, JumpSubmit, JumpToOffset,
+    NavigateDown, NavigateEnd, NavigateHome, NavigateLeft, NavigatePageDown, NavigatePageUp,
+    NavigateRight, NavigateUp, OpenFile, Quit, ResetColumns, ResetSettings, ResetView, ZoomIn,
+    ZoomOut,
 };
 
 /// Size of the horizontal whole-file preview strip in the top bar.
 const STRIP_W: f32 = 320.0;
 const STRIP_H: f32 = 36.0;
+
+/// Button labels naming the `secondary` accelerator, which `main.rs` binds to
+/// Cmd on macOS and Ctrl elsewhere — the label has to follow the binding.
+const JUMP_BUTTON_LABEL: &str = if cfg!(target_os = "macos") {
+    "Jump to offset… (Cmd+G)"
+} else {
+    "Jump to offset… (Ctrl+G)"
+};
 
 /// The navigation key pressed this frame (one-hot).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -45,511 +53,66 @@ pub(crate) enum NavigationAction {
     End,
 }
 
-impl NavigationAction {
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[allow(clippy::fn_params_excessive_bools)] // one-hot test helper
-    fn new(
-        left: bool,
-        right: bool,
-        up: bool,
-        down: bool,
-        page_up: bool,
-        page_down: bool,
-        home: bool,
-    ) -> Self {
-        if left {
-            Self::Left
-        } else if right {
-            Self::Right
-        } else if up {
-            Self::Up
-        } else if down {
-            Self::Down
-        } else if page_up {
-            Self::PageUp
-        } else if page_down {
-            Self::PageDown
-        } else if home {
-            Self::Home
-        } else {
-            // Only reachable when a navigation key is held: End.
-            Self::End
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Jump dialog text field
-// ---------------------------------------------------------------------------
-
-/// Events emitted by the jump field to its parent view.
-#[derive(Clone, Debug)]
-pub(crate) enum JumpFieldEvent {
-    Submit(String),
-    Cancel,
-}
-
-impl EventEmitter<JumpFieldEvent> for JumpField {}
-
-/// A minimal single-line text field used by the jump-to-offset dialog. It
-/// implements `EntityInputHandler` so the platform IME / typing works, and
-/// handles Backspace/Delete/arrow keys via actions.
-pub(crate) struct JumpField {
-    focus_handle: FocusHandle,
-    content: SharedString,
-    selected_range: Range<usize>,
-    last_layout: Option<ShapedLine>,
-    last_bounds: Option<Bounds<Pixels>>,
-    is_selecting: bool,
-}
-
-impl JumpField {
-    fn new(cx: &mut Context<Self>) -> Self {
-        Self {
-            focus_handle: cx.focus_handle(),
-            content: SharedString::new_static(""),
-            selected_range: 0..0,
-            last_layout: None,
-            last_bounds: None,
-            is_selecting: false,
-        }
-    }
-
-    fn set_content(&mut self, s: &str) {
-        self.content = s.to_string().into();
-        self.selected_range = s.len()..s.len();
-    }
-
-    fn cursor_offset(&self) -> usize {
-        if self.selected_range.is_empty() {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
-    }
-
-    fn move_cursor_left(&mut self, cx: &mut Context<Self>) {
-        let start = self.previous_boundary(self.cursor_offset());
-        self.selected_range = start..start;
-        cx.notify();
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .char_indices()
-            .take_while(|(i, _)| *i < offset)
-            .map(|(i, c)| i + c.len_utf8())
-            .last()
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content
-            .char_indices()
-            .find_map(|(i, _c)| (i > offset).then_some(i))
-            .unwrap_or(self.content.len())
-    }
-
-    fn move_cursor_right(&mut self, cx: &mut Context<Self>) {
-        let next = self.next_boundary(self.cursor_offset());
-        self.selected_range = next..next;
-        cx.notify();
-    }
-
-    fn on_backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.selected_range =
-                self.previous_boundary(self.cursor_offset())..self.cursor_offset();
-        }
-        self.replace_range(&self.selected_range.clone(), "");
-        cx.notify();
-    }
-
-    fn on_delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            let end = self.next_boundary(self.cursor_offset());
-            self.selected_range = self.cursor_offset()..end;
-        }
-        self.replace_range(&self.selected_range.clone(), "");
-        cx.notify();
-    }
-
-    fn on_navigate_left(&mut self, _: &NavigateLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_cursor_left(cx);
-    }
-
-    fn on_navigate_right(&mut self, _: &NavigateRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_cursor_right(cx);
-    }
-
-    fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard()
-            && let Some(text) = item.text()
-        {
-            let range = self.selected_range.clone();
-            self.replace_range(&range, &text);
-            cx.notify();
-        }
-    }
-
-    fn on_submit(&mut self, _: &JumpSubmit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(JumpFieldEvent::Submit(self.content.to_string()));
-    }
-
-    #[allow(clippy::unused_self)] // signature shape required by cx.listener
-    fn on_cancel(&mut self, _: &JumpCancel, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(JumpFieldEvent::Cancel);
-    }
-
-    /// Replace `range` with `text` and move the cursor to the end of it.
-    fn replace_range(&mut self, range: &Range<usize>, text: &str) {
-        let start = range.start.min(self.content.len());
-        let end = range.end.min(self.content.len());
-        self.content = (self.content[0..start].to_owned() + text + &self.content[end..]).into();
-        let cursor = start + text.len();
-        self.selected_range = cursor..cursor;
-    }
-
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.is_selecting = true;
-        let index = self
-            .last_bounds
-            .as_ref()
-            .and_then(|bounds| self.index_for_point(event.position, *bounds))
-            .unwrap_or(self.content.len());
-        self.selected_range = index..index;
-        cx.notify();
-    }
-
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.is_selecting = false;
-    }
-
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting
-            && let Some(bounds) = self.last_bounds
-            && let Some(index) = self.index_for_point(event.position, bounds)
-        {
-            let start = self.selected_range.start;
-            self.selected_range = start.min(index)..start.max(index);
-            cx.notify();
-        }
-    }
-
-    fn index_for_point(&self, point: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<usize> {
-        let local = bounds.localize(&point)?;
-        let layout = self.last_layout.as_ref()?;
-        layout.index_for_x(local.x)
-    }
-}
-
-impl Focusable for JumpField {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl EntityInputHandler for JumpField {
-    fn text_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        adjusted_range: &mut Option<Range<usize>>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<String> {
-        let range = range_from_utf16(&self.content, range_utf16);
-        adjusted_range.replace(range_to_utf16(&self.content, range.clone()));
-        Some(self.content[range].to_string())
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _: bool,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        Some(UTF16Selection {
-            range: range_to_utf16(&self.content, self.selected_range.clone()),
-            reversed: false,
-        })
-    }
-
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
-    }
-
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
-
-    fn replace_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        text: &str,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let range = range_utf16.map_or_else(
-            || self.selected_range.clone(),
-            |r| range_from_utf16(&self.content, r),
-        );
-        self.replace_range(&range, text);
-        cx.notify();
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        text: &str,
-        _: Option<Range<usize>>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let range = range_utf16.map_or_else(
-            || self.selected_range.clone(),
-            |r| range_from_utf16(&self.content, r),
-        );
-        self.replace_range(&range, text);
-        cx.notify();
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _: Range<usize>,
-        bounds: Bounds<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        Some(bounds)
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        point: Point<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<usize> {
-        let bounds = self.last_bounds?;
-        let index = self.index_for_point(point, bounds)?;
-        Some(range_to_utf16(&self.content, index..index).start)
-    }
-}
-
-/// Convert a UTF-16-based range to a UTF-8 byte range.
-fn range_from_utf16(s: &str, range: Range<usize>) -> Range<usize> {
-    let mut start = s.len();
-    let mut end = s.len();
-    let mut units = 0usize;
-    for (i, ch) in s.char_indices() {
-        if units == range.start {
-            start = i;
-        }
-        if units == range.end {
-            end = i;
-            break;
-        }
-        units += ch.len_utf16();
-    }
-    start..end
-}
-
-/// Convert a UTF-8 byte range to a UTF-16-based range.
-fn range_to_utf16(s: &str, range: Range<usize>) -> Range<usize> {
-    let mut units = 0usize;
-    let mut start = 0usize;
-    let mut end = s.encode_utf16().count();
-    for (i, ch) in s.char_indices() {
-        if i == range.start {
-            start = units;
-        }
-        if i == range.end {
-            end = units;
-            break;
-        }
-        units += ch.len_utf16();
-    }
-    start..end
-}
-
-/// The element that renders the field's text + cursor and wires the IME
-/// input handler.
-struct JumpFieldElement {
-    field: Entity<JumpField>,
-}
-
-struct JumpFieldPrepaint {
-    line: Option<ShapedLine>,
-    cursor: Option<gpui::PaintQuad>,
-}
-
-impl IntoElement for JumpFieldElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for JumpFieldElement {
-    type RequestLayoutState = ();
-    type PrepaintState = JumpFieldPrepaint;
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = px(22.).into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        let field = self.field.read(cx);
-        let content = field.content.clone();
-        let cursor = field.cursor_offset();
-        let placeholder = content.is_empty();
-
-        let style = window.text_style();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let text_color = if placeholder {
-            Hsla::from(rgba(0x565f8980))
-        } else {
-            style.color
-        };
-        let run = TextRun {
-            len: if placeholder { 6 } else { content.len() },
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let display = if placeholder {
-            SharedString::new_static("0x1000")
-        } else {
-            content.clone()
-        };
-        let line = window
-            .text_system()
-            .shape_line(display, font_size, &[run], None);
-
-        let cursor_x = line.x_for_index(cursor);
-        let cursor_quad = fill(
-            Bounds::new(
-                point(bounds.left() + cursor_x, bounds.top()),
-                size(px(2.), bounds.size.height),
-            ),
-            rgb(0x7aa2f7),
-        );
-
-        window.handle_input(
-            &field.focus_handle,
-            ElementInputHandler::new(bounds, self.field.clone()),
-            cx,
-        );
-
-        JumpFieldPrepaint {
-            line: Some(line),
-            cursor: Some(cursor_quad),
-        }
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let line = prepaint.line.take();
-        self.field.update(cx, |field, _cx| {
-            field.last_layout.clone_from(&line);
-            field.last_bounds = Some(bounds);
-        });
-        if let Some(cursor) = prepaint.cursor.take()
-            && self.field.read(cx).focus_handle.is_focused(window)
-        {
-            window.paint_quad(cursor);
-        }
-        if let Some(line) = line {
-            let _ = line.paint(bounds.origin, window.line_height(), window, cx);
-        }
-    }
-}
-
-impl Render for JumpField {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .key_context("JumpField")
-            .track_focus(&self.focus_handle(cx))
-            .cursor(CursorStyle::IBeam)
-            .on_action(cx.listener(Self::on_backspace))
-            .on_action(cx.listener(Self::on_delete))
-            .on_action(cx.listener(Self::on_navigate_left))
-            .on_action(cx.listener(Self::on_navigate_right))
-            .on_action(cx.listener(Self::on_paste))
-            .on_action(cx.listener(Self::on_submit))
-            .on_action(cx.listener(Self::on_cancel))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(rgb(0x0f1017))
-            .border_1()
-            .border_color(rgb(0x3b4261))
-            .rounded_md()
-            .w_full()
-            .h(px(26.))
-            .px_2()
-            .child(JumpFieldElement { field: cx.entity() })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The main view
 // ---------------------------------------------------------------------------
 
+/// How a copied byte range is rendered to text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CopyKind {
+    /// Space-separated uppercase hex pairs, e.g. `DE AD BE EF`.
+    Hex,
+    /// Printable ASCII, non-printable bytes as `.`.
+    Ascii,
+}
+
+/// Render `range` of `data` for the clipboard, or `None` when the range is
+/// empty after clamping to the file. Shared by the copy actions and the hex
+/// column's right-click copy so the two can't drift apart.
+fn selection_text(data: &[u8], range: &Range<usize>, kind: CopyKind) -> Option<String> {
+    let start = range.start.min(data.len());
+    let end = range.end.min(data.len());
+    if start >= end {
+        return None;
+    }
+    let bytes = &data[start..end];
+    Some(match kind {
+        CopyKind::Hex => bytes
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        CopyKind::Ascii => bytes.iter().map(|&b| color::printable(b)).collect(),
+    })
+}
+
 /// Which slider the pointer is currently dragging.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SliderKind {
-    HexZoom,
     PixelZoom,
     EntropyWindow,
+}
+
+/// Which column a per-panel control belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Panel {
+    Overview,
+    Zoom,
+    Hex,
 }
 
 /// Which column divider the pointer is currently dragging.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DividerKind {
-    OverviewPixels,
-    PixelsHex,
+    OverviewZoom,
+    ZoomHex,
 }
 
 /// Clamp ranges for the two drag-resizable column widths.
 const OVERVIEW_W_MIN: f32 = 140.0;
 const OVERVIEW_W_MAX: f32 = 2000.0;
-const PIXELS_W_MIN: f32 = 200.0;
-const PIXELS_W_MAX: f32 = 3000.0;
+const ZOOM_W_MIN: f32 = 200.0;
+const ZOOM_W_MAX: f32 = 3000.0;
 
 /// The many booleans track per-column drag/interaction bookkeeping; a
 /// state machine would add more complexity than it removes.
@@ -559,13 +122,13 @@ pub struct ParallHexApp {
     pub mmap: Option<Arc<Mmap>>,
     pub file_size: usize,
 
-    // Hex-viewer parameters
-    pub bytes_per_row: usize,
     pub entropy_window: usize,
-    pub pixel_colormap: Colormap,
 
-    // One-shot: jump the central scroll area back to the top.
-    pub scroll_reset: bool,
+    // Each panel colors its bytes independently (SPECS §3.C).
+    pub overview_colormap: Colormap,
+    pub zoom_colormap: Colormap,
+    pub hex_colormap: Colormap,
+
     // One-shot: scroll the central view to a specific file offset.
     pub scroll_to_offset: Option<usize>,
 
@@ -581,12 +144,15 @@ pub struct ParallHexApp {
     pub strip_image: Option<Arc<RenderImage>>,
     pub strip_dirty: bool,
 
-    // Three-column layout: per-column zoom, the shared scroll position (in
-    // rows) and each column's last-frame canvas bounds (filled by the
-    // canvases' prepaint callbacks, used for hit-testing).
-    pub hex_zoom: f32,
+    // Three-column layout. The zoom column is the only one that zooms; the
+    // shared scroll position is a *byte anchor* because each panel derives its
+    // own row length from its own width, so rows no longer line up (SPECS
+    // §4.2). `hex_bpr` / `zoom_bpr` are recomputed in each canvas's prepaint
+    // from its measured width, and reused for hit-testing and navigation.
     pub pixel_zoom: f32,
-    pub scroll_rows: f32,
+    pub scroll_offset: usize,
+    pub hex_bpr: usize,
+    pub zoom_bpr: usize,
     pub hex_bounds: Bounds<Pixels>,
     pub pixels_bounds: Bounds<Pixels>,
     pub overview_bounds: Bounds<Pixels>,
@@ -622,7 +188,7 @@ pub struct ParallHexApp {
 
     // Persisted layout prefs (written a couple of seconds after a change).
     pub overview_width: f32,
-    pub pixels_width: f32,
+    pub zoom_width: f32,
     pub saved_cfg: config::Config,
     pub last_save: Instant,
 
@@ -638,13 +204,12 @@ pub struct ParallHexApp {
     pub divider_start_w: f32,
 
     // Header sliders.
-    pub hex_slider_bounds: Bounds<Pixels>,
     pub pixels_slider_bounds: Bounds<Pixels>,
     pub entropy_slider_bounds: Bounds<Pixels>,
     pub dragging_slider: Option<SliderKind>,
 
     // Colormap selector dropdown in the pixels-column header.
-    pub colormap_menu_open: bool,
+    pub open_colormap_menu: Option<Panel>,
     // True while a mouse-down that began on the dropdown toggle is in
     // flight, so the root's outside-click handler doesn't immediately close
     // the menu that the toggle's click is about to open or toggle closed.
@@ -669,13 +234,10 @@ impl ParallHexApp {
             file_path: None,
             mmap: None,
             file_size: 0,
-            bytes_per_row: match prefs.bytes_per_row {
-                16 | 32 | 64 => prefs.bytes_per_row,
-                _ => 32,
-            },
             entropy_window: prefs.entropy_window.clamp(16, 4096),
-            pixel_colormap: prefs.pixel_colormap,
-            scroll_reset: false,
+            overview_colormap: prefs.overview_colormap,
+            zoom_colormap: prefs.zoom_colormap,
+            hex_colormap: prefs.hex_colormap,
             scroll_to_offset: None,
             entropies: Arc::new(Vec::new()),
             overview_image: None,
@@ -683,13 +245,12 @@ impl ParallHexApp {
             overview_gen_size: None,
             strip_image: None,
             strip_dirty: false,
-            hex_zoom: prefs
-                .hex_zoom
-                .clamp(panes::HEX_ZOOM_MIN, panes::HEX_ZOOM_MAX),
             pixel_zoom: prefs
                 .pixel_zoom
                 .clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
-            scroll_rows: 0.0,
+            scroll_offset: 0,
+            hex_bpr: 32,
+            zoom_bpr: 64,
             hex_bounds: Bounds::default(),
             pixels_bounds: Bounds::default(),
             overview_bounds: Bounds::default(),
@@ -711,7 +272,7 @@ impl ParallHexApp {
             jump_error: None,
             jump_field,
             overview_width: prefs.overview_width.clamp(OVERVIEW_W_MIN, OVERVIEW_W_MAX),
-            pixels_width: prefs.pixels_width.clamp(PIXELS_W_MIN, PIXELS_W_MAX),
+            zoom_width: prefs.zoom_width.clamp(ZOOM_W_MIN, ZOOM_W_MAX),
             window_bounds: prefs.window_bounds,
             window_maximized: prefs.window_maximized,
             saved_cfg: prefs,
@@ -719,11 +280,10 @@ impl ParallHexApp {
             resizing_divider: None,
             divider_start_x: 0.0,
             divider_start_w: 0.0,
-            hex_slider_bounds: Bounds::default(),
             pixels_slider_bounds: Bounds::default(),
             entropy_slider_bounds: Bounds::default(),
             dragging_slider: None,
-            colormap_menu_open: false,
+            open_colormap_menu: None,
             colormap_toggle_down: false,
             mono_family,
             message: None,
@@ -756,11 +316,76 @@ impl ParallHexApp {
         self.mmap.as_ref().map(|m| &m[..])
     }
 
+    fn colormap(&self, panel: Panel) -> Colormap {
+        match panel {
+            Panel::Overview => self.overview_colormap,
+            Panel::Zoom => self.zoom_colormap,
+            Panel::Hex => self.hex_colormap,
+        }
+    }
+
+    fn set_colormap(&mut self, panel: Panel, cm: Colormap) {
+        match panel {
+            Panel::Overview => {
+                self.overview_colormap = cm;
+                // The thumbnails bake the colormap into their pixels, so both
+                // have to be regenerated when it changes.
+                self.overview_gen_size = None;
+                self.strip_dirty = true;
+            }
+            Panel::Zoom => self.zoom_colormap = cm,
+            Panel::Hex => self.hex_colormap = cm,
+        }
+    }
+
+    /// Row height of the zoom column: rows are flush, so it is the zoom itself.
+    fn zoom_row_h(&self) -> f32 {
+        self.pixel_zoom
+            .clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX)
+    }
+
+    /// Clamp the shared anchor to the hex column's last row (SPECS §4.2).
+    fn clamp_anchor(&mut self) {
+        self.scroll_offset = self
+            .scroll_offset
+            .min(panes::max_anchor(self.file_size, self.hex_bpr.max(8)));
+    }
+
+    /// Scroll by whole rows of `panel`, negative for up.
+    fn scroll_rows_by(&mut self, panel: Panel, rows: i32) {
+        let bpr = match panel {
+            Panel::Zoom => self.zoom_bpr.max(1),
+            _ => self.hex_bpr.max(8),
+        };
+        let delta = rows.unsigned_abs() as usize * bpr;
+        self.scroll_offset = if rows < 0 {
+            self.scroll_offset.saturating_sub(delta)
+        } else {
+            self.scroll_offset.saturating_add(delta)
+        };
+        self.clamp_anchor();
+    }
+
     fn recompute_entropies(&mut self) {
         self.entropies = Arc::new(match self.data() {
             Some(d) => entropy::block_entropies(d, self.entropy_window),
             None => Vec::new(),
         });
+    }
+
+    /// Rebuild the fixed-resolution top-bar strip when the file, entropy window
+    /// or its colormap changed.
+    fn refresh_strip(&mut self) {
+        if !self.strip_dirty {
+            return;
+        }
+        self.strip_dirty = false;
+        let entropies = self.entropies.clone();
+        let window = self.entropy_window;
+        let colormap = self.overview_colormap;
+        self.strip_image = self
+            .data()
+            .map(|d| panes::build_strip_image(d, &entropies, window, colormap));
     }
 
     fn file_name_str(&self) -> String {
@@ -777,13 +402,13 @@ impl ParallHexApp {
     /// pixels so an unchanged layout doesn't rewrite the file).
     fn current_config(&self) -> config::Config {
         config::Config {
-            bytes_per_row: self.bytes_per_row,
             entropy_window: self.entropy_window,
-            hex_zoom: self.hex_zoom,
             pixel_zoom: self.pixel_zoom,
-            pixel_colormap: self.pixel_colormap,
+            overview_colormap: self.overview_colormap,
+            zoom_colormap: self.zoom_colormap,
+            hex_colormap: self.hex_colormap,
             overview_width: self.overview_width.round(),
-            pixels_width: self.pixels_width.round(),
+            zoom_width: self.zoom_width.round(),
             window_bounds: self.window_bounds,
             window_maximized: self.window_maximized,
         }
@@ -820,14 +445,18 @@ impl ParallHexApp {
             window_maximized: self.window_maximized,
             ..config::Config::default()
         };
-        self.bytes_per_row = defaults.bytes_per_row;
         self.entropy_window = defaults.entropy_window;
-        self.hex_zoom = defaults.hex_zoom;
         self.pixel_zoom = defaults.pixel_zoom;
+        // Every field of `defaults` is written to disk below, so each one must
+        // also be applied here or the file would disagree with the UI until
+        // the next debounced save undid the reset.
+        self.overview_colormap = defaults.overview_colormap;
+        self.zoom_colormap = defaults.zoom_colormap;
+        self.hex_colormap = defaults.hex_colormap;
         self.overview_width = defaults.overview_width;
-        self.pixels_width = defaults.pixels_width;
-        self.scroll_reset = true;
-        self.colormap_menu_open = false;
+        self.zoom_width = defaults.zoom_width;
+        self.scroll_offset = 0;
+        self.open_colormap_menu = None;
         self.recompute_entropies();
         self.overview_gen_size = None;
         self.strip_dirty = true;
@@ -873,8 +502,7 @@ impl ParallHexApp {
         self.overview_cells = None;
         self.strip_image = None;
         self.strip_dirty = true;
-        self.scroll_reset = true;
-        self.scroll_rows = 0.0;
+        self.scroll_offset = 0;
         self.scroll_to_offset = None;
         self.hovered_offset = None;
         self.selected_offset = None;
@@ -883,7 +511,7 @@ impl ParallHexApp {
         self.overview_hover_offset = None;
         self.show_jump_dialog = false;
         self.jump_error = None;
-        self.colormap_menu_open = false;
+        self.open_colormap_menu = None;
         self.message = None;
     }
 
@@ -900,12 +528,19 @@ impl ParallHexApp {
         cx.notify();
     }
 
+    /// Quit the application (Cmd/Ctrl+Q). Compositors that don't draw a
+    /// titlebar / close button leave no other way to exit the window.
+    fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        config::save(&self.current_config());
+        cx.quit();
+    }
+
     fn on_jump_to_offset(&mut self, _: &JumpToOffset, window: &mut Window, cx: &mut Context<Self>) {
         self.open_jump_dialog(window, cx);
     }
 
     fn on_reset_view(&mut self, _: &ResetView, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_reset = true;
+        self.scroll_offset = 0;
         cx.notify();
     }
 
@@ -914,7 +549,7 @@ impl ParallHexApp {
     fn on_reset_columns(&mut self, _: &ResetColumns, _: &mut Window, cx: &mut Context<Self>) {
         let defaults = config::Config::default();
         self.overview_width = defaults.overview_width;
-        self.pixels_width = defaults.pixels_width;
+        self.zoom_width = defaults.zoom_width;
         cx.notify();
     }
 
@@ -942,14 +577,8 @@ impl ParallHexApp {
     /// size), clamped to its range.
     fn zoom_under_pointer(&mut self, window: &Window, factor: f32) {
         let p = window.mouse_position();
-        if self.hex_bounds.contains(&p) {
-            self.hex_zoom = panes::zoom_step(
-                self.hex_zoom,
-                factor,
-                panes::HEX_ZOOM_MIN,
-                panes::HEX_ZOOM_MAX,
-            );
-        } else if self.pixels_bounds.contains(&p) {
+        // Only the zoom column zooms; the hex text size is fixed.
+        if self.pixels_bounds.contains(&p) {
             self.pixel_zoom = panes::zoom_step(
                 self.pixel_zoom,
                 factor,
@@ -997,9 +626,9 @@ impl ParallHexApp {
         if len == 0 {
             return;
         }
-        let bpr = self.bytes_per_row.max(1);
-        let page_rows = (self.view_height / panes::hex_row_h(self.hex_zoom)).max(1.0) as usize;
-        let page_bytes = page_rows * bpr;
+        // The hex column is the scroll reference, so a page is its visible rows.
+        let bpr = self.hex_bpr.max(8);
+        let page_bytes = panes::visible_rows(self.view_height, panes::BLOCK_H) * bpr;
 
         // First navigation with no selection yet: honor Home/End, otherwise
         // place the cursor at offset 0.
@@ -1046,11 +675,11 @@ impl ParallHexApp {
     }
 
     fn on_copy_hex(&mut self, _: &CopySelectionHex, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_selection("hex", cx);
+        self.copy_selection(CopyKind::Hex, cx);
     }
 
     fn on_copy_ascii(&mut self, _: &CopySelectionAscii, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_selection("ascii", cx);
+        self.copy_selection(CopyKind::Ascii, cx);
     }
 
     fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
@@ -1058,30 +687,22 @@ impl ParallHexApp {
         cx.notify();
     }
 
-    fn copy_selection(&mut self, kind: &str, cx: &mut Context<Self>) {
-        if let Some(d) = self.data() {
-            let range = if let Some(r) = self.selection_range.clone() {
-                r
-            } else {
-                let Some(o) = self.hovered_offset.or(self.selected_offset) else {
-                    return;
-                };
-                o..(o + 1)
-            };
-            let start = range.start;
-            let end = range.end.min(d.len());
-            if start < end {
-                let s = if kind == "hex" {
-                    d[start..end]
-                        .iter()
-                        .map(|b| format!("{b:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                } else {
-                    d[start..end].iter().map(|&b| color::printable(b)).collect()
-                };
-                cx.write_to_clipboard(ClipboardItem::new_string(s));
-            }
+    /// The byte range a copy applies to: the selection when there is one,
+    /// otherwise the single byte under the pointer (or the cursor).
+    fn copy_range(&self) -> Option<Range<usize>> {
+        self.selection_range.clone().or_else(|| {
+            let o = self.hovered_offset.or(self.selected_offset)?;
+            Some(o..o + 1)
+        })
+    }
+
+    fn copy_selection(&mut self, kind: CopyKind, cx: &mut Context<Self>) {
+        let Some(d) = self.data() else { return };
+        let Some(range) = self.copy_range() else {
+            return;
+        };
+        if let Some(s) = selection_text(d, &range, kind) {
+            cx.write_to_clipboard(ClipboardItem::new_string(s));
         }
     }
 
@@ -1089,7 +710,7 @@ impl ParallHexApp {
         if !self.show_jump_dialog {
             return;
         }
-        let text = self.jump_field.read(cx).content.to_string();
+        let text = self.jump_field.read(cx).content().to_owned();
         self.jump_submit(&text, cx);
     }
 
@@ -1148,7 +769,7 @@ impl ParallHexApp {
         });
         self.show_jump_dialog = true;
         self.jump_error = None;
-        self.colormap_menu_open = false;
+        self.open_colormap_menu = None;
         window.focus(&self.jump_field.read(cx).focus_handle(cx));
         cx.notify();
     }
@@ -1157,23 +778,15 @@ impl ParallHexApp {
 
     fn hex_offset_at_pos(&self, window: &mut Window, pos: Point<Pixels>) -> Option<usize> {
         let local = self.hex_bounds.localize(&pos)?;
-        let bpr = self.bytes_per_row.max(1);
-        let len = self.file_size;
-        let total_rows = len.div_ceil(bpr);
-        if total_rows == 0 {
-            return None;
-        }
-        let font_size = px(panes::HEX_FONT_SIZE * self.hex_zoom);
+        let bpr = self.hex_bpr.max(8);
         let font = font(self.mono_family.clone());
-        let char_w = panes::hex_char_width(window, &font, font_size);
+        let char_w = panes::hex_char_width(window, &font, px(panes::HEX_FONT_SIZE));
         let geo = panes::RowGeo::new(char_w, bpr);
         panes::hex_offset_at(
             local,
             &geo,
-            self.scroll_rows,
-            panes::hex_block_h(self.hex_zoom),
-            total_rows,
-            len,
+            panes::row_start_for(self.scroll_offset, bpr),
+            self.file_size,
         )
     }
 
@@ -1207,23 +820,12 @@ impl ParallHexApp {
                         self.selection_range = Some(off..off + 1);
                         self.selected_offset = Some(off);
                     }
-                    let s = self.data().map(|d| {
-                        let r = self.selection_range.clone().unwrap_or(off..off + 1);
-                        let start = r.start.min(d.len());
-                        let end = r.end.min(d.len());
-                        if start < end {
-                            d[start..end]
-                                .iter()
-                                .map(|b| format!("{b:02X}"))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        } else {
-                            String::new()
-                        }
-                    });
-                    if let Some(s) = s {
-                        // Deferred copy needs cx; stored here via message.
-                        self.pending_copy = Some(s);
+                    // This handler has no `Context`, so the text is parked in
+                    // `pending_copy` for the caller to put on the clipboard.
+                    if let Some(d) = self.data()
+                        && let Some(range) = self.copy_range()
+                    {
+                        self.pending_copy = selection_text(d, &range, CopyKind::Hex);
                     }
                 }
             }
@@ -1267,80 +869,54 @@ impl ParallHexApp {
     }
 
     fn on_hex_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        if event.modifiers.control || event.modifiers.platform {
-            // Ctrl+wheel zooms the hex cells.
-            let factor = wheel_zoom_factor(&event.delta);
-            if factor != 1.0 {
-                self.hex_zoom = panes::zoom_step(
-                    self.hex_zoom,
-                    factor,
-                    panes::HEX_ZOOM_MIN,
-                    panes::HEX_ZOOM_MAX,
-                );
-                cx.notify();
-            }
-        } else {
-            self.scroll_by_wheel(&event.delta);
-        }
+        // The hex text size is fixed, so there is nothing to zoom here.
+        self.scroll_by_wheel(Panel::Hex, &event.delta, panes::BLOCK_H);
+        cx.notify();
     }
 
     // ----- mouse handlers (pixels column) -----
 
-    fn pixels_row_h(&self) -> f32 {
-        2.0 * self
-            .pixel_zoom
-            .clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX)
-            + 1.0
-    }
-
-    fn pixels_offset_at(&self, _window: &Window, pos: Point<Pixels>) -> Option<usize> {
+    fn pixels_offset_at(&self, pos: Point<Pixels>) -> Option<usize> {
         let local = self.pixels_bounds.localize(&pos)?;
-        let bpr = self.bytes_per_row.max(1);
-        let len = self.file_size;
-        if len == 0 {
-            return None;
-        }
-        let px_size = self
-            .pixel_zoom
-            .clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX);
-        let row_h = self.pixels_row_h();
-        let row = self.scroll_rows + (local.y.to_f64() as f32) / row_h;
-        let col = ((local.x.to_f64() as f32) / px_size).floor();
-        if row < 0.0 || col < 0.0 {
-            return None;
-        }
-        let off = (row as usize * bpr + col as usize).min(len.saturating_sub(1));
-        Some(off)
+        let bpr = self.zoom_bpr.max(1);
+        panes::zoom_offset_at(
+            local,
+            bpr,
+            panes::row_start_for(self.scroll_offset, bpr),
+            self.zoom_row_h(),
+            self.file_size,
+        )
     }
 
-    fn on_pixels_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window) {
+    fn on_pixels_mouse_down(&mut self, event: &MouseDownEvent) {
         self.pixels_dragging = true;
         self.last_pixels_y = Some(event.position.y.to_f64() as f32);
         if event.button == MouseButton::Left
-            && let Some(off) = self.pixels_offset_at(window, event.position)
+            && let Some(off) = self.pixels_offset_at(event.position)
         {
             self.selected_offset = Some(off);
             self.hovered_offset = Some(off);
         }
     }
 
-    fn on_pixels_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window) {
+    fn on_pixels_mouse_move(&mut self, event: &MouseMoveEvent) {
         let y = event.position.y.to_f64() as f32;
         if self.pixels_dragging
             && event.dragging()
             && let Some(last) = self.last_pixels_y
         {
             // Content follows the cursor: dragging down (dy > 0) shows
-            // earlier rows, so the scroll offset decreases.
-            self.scroll_rows -= (y - last) / self.pixels_row_h();
-            self.clamp_scroll();
+            // earlier rows, so the anchor moves back through the file.
+            let rows = ((y - last) / self.zoom_row_h()).round() as i32;
+            if rows != 0 {
+                self.scroll_rows_by(Panel::Zoom, -rows);
+                self.last_pixels_y = Some(y);
+            }
         }
-        self.last_pixels_y = Some(y);
-        if let Some(off) = self.pixels_offset_at(window, event.position) {
-            self.hovered_offset = Some(off);
-        } else {
-            self.hovered_offset = None;
+        if !self.pixels_dragging {
+            self.last_pixels_y = Some(y);
         }
+        self.hovered_offset = self.pixels_offset_at(event.position);
     }
 
     fn on_pixels_mouse_up(&mut self) {
@@ -1361,33 +937,20 @@ impl ParallHexApp {
                 cx.notify();
             }
         } else {
-            self.scroll_by_wheel(&event.delta);
+            self.scroll_by_wheel(Panel::Zoom, &event.delta, self.zoom_row_h());
         }
     }
 
     // ----- scroll helpers -----
 
-    fn scroll_by_wheel(&mut self, delta: &ScrollDelta) {
-        let block_h = panes::hex_block_h(self.hex_zoom);
-        let pixels = delta.pixel_delta(px(16.0));
-        // Positive wheel-up delta decreases the scroll offset (toward the
-        // top of the file).
-        self.scroll_rows -= pixels.y.to_f64() as f32 / block_h;
-        self.clamp_scroll();
-    }
-
-    fn clamp_scroll(&mut self) {
-        let bpr = self.bytes_per_row.max(1);
-        let total_rows = self.file_size.div_ceil(bpr);
-        let block_h = panes::hex_block_h(self.hex_zoom);
-        let content_h = total_rows as f32 * block_h;
-        let view_h = self.view_height;
-        let max_scroll = if content_h > view_h {
-            (content_h - view_h) / block_h
-        } else {
-            0.0
-        };
-        self.scroll_rows = self.scroll_rows.clamp(0.0, max_scroll);
+    /// Convert a wheel delta into whole rows of `panel` and move the anchor.
+    fn scroll_by_wheel(&mut self, panel: Panel, delta: &ScrollDelta, row_h: f32) {
+        let pixels = delta.pixel_delta(px(16.0)).y.to_f64() as f32;
+        // Positive wheel-up delta moves back through the file.
+        let rows = -(pixels / row_h.max(1.0)).round() as i32;
+        if rows != 0 {
+            self.scroll_rows_by(panel, rows);
+        }
     }
 
     // ----- overview / strip -----
@@ -1415,12 +978,13 @@ impl ParallHexApp {
     }
 
     fn strip_offset_at(&self, pos: Point<Pixels>) -> Option<usize> {
-        if self.file_size == 0 {
+        let w = self.strip_bounds.size.width.to_f64() as f32;
+        // The bounds are zero until the strip's first prepaint; dividing by
+        // that width would yield NaN.
+        if self.file_size == 0 || w <= 0.0 {
             return None;
         }
-        let t = ((pos.x - self.strip_bounds.left()).to_f64() as f32
-            / self.strip_bounds.size.width.to_f64() as f32)
-            .clamp(0.0, 1.0);
+        let t = ((pos.x - self.strip_bounds.left()).to_f64() as f32 / w).clamp(0.0, 1.0);
         Some(((t * self.file_size as f32) as usize).min(self.file_size.saturating_sub(1)))
     }
 
@@ -1429,8 +993,12 @@ impl ParallHexApp {
             if let Some(off) = self.overview_offset_at(pos) {
                 self.jump_to(off);
             }
-        } else if let Some(off) = self.overview_offset_at(pos) {
-            self.overview_hover_offset = Some(off);
+        } else {
+            // Assign unconditionally: a miss inside the pane (empty file, no
+            // cells yet) must clear the preview rather than leave it latched
+            // on the last hit, because `byte_readout` prefers it over the
+            // hex/pixels hover.
+            self.overview_hover_offset = self.overview_offset_at(pos);
         }
     }
 
@@ -1450,8 +1018,17 @@ impl ParallHexApp {
             if let Some(off) = self.strip_offset_at(pos) {
                 self.jump_to(off);
             }
-        } else if let Some(off) = self.strip_offset_at(pos) {
-            self.overview_hover_offset = Some(off);
+        } else {
+            self.overview_hover_offset = self.strip_offset_at(pos);
+        }
+    }
+
+    /// Drop the overview/strip hover preview when the pointer leaves those
+    /// panes, so the status-bar readout goes back to tracking the hex and
+    /// pixels columns (and the keyboard selection).
+    fn on_overview_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered && self.overview_hover_offset.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -1480,8 +1057,8 @@ impl ParallHexApp {
         self.resizing_divider = Some(kind);
         self.divider_start_x = pos.x.to_f64() as f32;
         self.divider_start_w = match kind {
-            DividerKind::OverviewPixels => self.overview_width,
-            DividerKind::PixelsHex => self.pixels_width,
+            DividerKind::OverviewZoom => self.overview_width,
+            DividerKind::ZoomHex => self.zoom_width,
         };
     }
 
@@ -1495,19 +1072,19 @@ impl ParallHexApp {
         };
         let dx = pos.x.to_f64() as f32 - self.divider_start_x;
         let (min, max) = match kind {
-            DividerKind::OverviewPixels => (OVERVIEW_W_MIN, OVERVIEW_W_MAX),
-            DividerKind::PixelsHex => (PIXELS_W_MIN, PIXELS_W_MAX),
+            DividerKind::OverviewZoom => (OVERVIEW_W_MIN, OVERVIEW_W_MAX),
+            DividerKind::ZoomHex => (ZOOM_W_MIN, ZOOM_W_MAX),
         };
         let w = divider_width(self.divider_start_w, dx, min, max);
         match kind {
-            DividerKind::OverviewPixels => {
+            DividerKind::OverviewZoom => {
                 let changed = (w - self.overview_width).abs() > 0.5;
                 self.overview_width = w;
                 changed
             }
-            DividerKind::PixelsHex => {
-                let changed = (w - self.pixels_width).abs() > 0.5;
-                self.pixels_width = w;
+            DividerKind::ZoomHex => {
+                let changed = (w - self.zoom_width).abs() > 0.5;
+                self.zoom_width = w;
                 changed
             }
         }
@@ -1567,11 +1144,11 @@ impl ParallHexApp {
                     .flex()
                     .items_center()
                     .gap_4()
-                    .child(div().text_color(rgb(0x565f89)).child(format!(
-                        "hex ×{:.2} · px {}",
-                        self.hex_zoom,
-                        self.pixel_zoom.round() as u32
-                    )))
+                    .child(
+                        div()
+                            .text_color(rgb(0x565f89))
+                            .child(format!("px {}", self.pixel_zoom.round() as u32)),
+                    )
                     .when(scroll.is_some(), |d| {
                         d.child(
                             div()
@@ -1603,23 +1180,24 @@ impl ParallHexApp {
         if self.file_size == 0 {
             return None;
         }
-        let bpr = self.bytes_per_row.max(1);
+        let bpr = self.hex_bpr.max(8);
         let total_rows = self.file_size.div_ceil(bpr);
-        let block_h = panes::hex_block_h(self.hex_zoom);
-        let first = self.scroll_rows.floor().max(0.0) as usize;
-        let vis = ((self.view_height / block_h).ceil() as usize).max(1);
+        let first = panes::row_start_for(self.scroll_offset, bpr) / bpr;
+        let vis = panes::visible_rows(self.view_height, panes::BLOCK_H);
         let last = (first + vis).min(total_rows);
         let pct = (self.view_frac * 100.0).round() as u32;
-        Some(format!("rows {first}–{last} / {total_rows} · {pct}%"))
+        Some(format!(
+            "{bpr} B/row · rows {first}–{last} / {total_rows} · {pct}%"
+        ))
     }
 
     // ----- top info bar -----
 
     /// The top info bar: app title, file name/size and the action controls
-    /// (open, bytes-per-row, entropy window, reset/jump) plus the horizontal
+    /// (open, entropy window, reset/jump) plus the horizontal
     /// whole-file preview strip. Live readouts live in the bottom status bar.
     #[allow(clippy::too_many_lines)] // single-purpose element builder
-    fn top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn top_bar(&mut self, cx: &mut Context<Self>, client_side: bool) -> impl IntoElement {
         let file_size = self.file_size;
         let file_name = self.file_name_str();
         let has_file = self.mmap.is_some();
@@ -1631,42 +1209,14 @@ impl ParallHexApp {
             .child(button(cx, "Open File…", |this, window, cx| {
                 this.on_open_file(&OpenFile, window, cx);
             }))
-            .child(div().child("Bytes/Row:"))
-            .children([16usize, 32, 64].into_iter().map(|bpr| {
-                let sel = self.bytes_per_row == bpr;
-                let mut b = div()
-                    .id(("bpr", bpr))
-                    .px_1()
-                    .rounded_md()
-                    .child(format!("{bpr}"))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.bytes_per_row != bpr {
-                            this.bytes_per_row = bpr;
-                            this.scroll_reset = true;
-                            this.clamp_scroll();
-                            cx.notify();
-                        }
-                    }));
-                b = if sel {
-                    b.bg(rgb(0x3b4261)).text_color(rgb(0xffffff))
-                } else {
-                    b.hover(|s| s.bg(rgb(0x232738)))
-                };
-                b
-            }))
             .child(self.slider(cx, SliderKind::EntropyWindow))
             .child(div().child("Entropy win"))
             .child(button(cx, "Reset view", |this, window, cx| {
                 this.on_reset_view(&ResetView, window, cx);
             }))
-            .child(button(
-                cx,
-                "Jump to offset… (Ctrl+G)",
-                |this, window, cx| {
-                    this.on_jump_to_offset(&JumpToOffset, window, cx);
-                },
-            ))
+            .child(button(cx, JUMP_BUTTON_LABEL, |this, window, cx| {
+                this.on_jump_to_offset(&JumpToOffset, window, cx);
+            }))
             .child(button(cx, "Reset all settings", |this, window, cx| {
                 this.on_reset_settings(&ResetSettings, window, cx);
             }));
@@ -1686,15 +1236,47 @@ impl ParallHexApp {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(div().text_xl().text_color(rgb(0x7aa2f7)).child("ParallHex"))
-                    .child(div().child(format!(
-                        "{file_name} · {file_size} bytes ({})",
-                        color::human_size(file_size)
-                    )))
-                    .when(has_file, |d| {
-                        d.flex_1()
-                            .child(div().flex().justify_end().child(self.strip(cx)))
-                    }),
+                    // The title / file-name area doubles as the titlebar drag
+                    // handle. The strip and the window buttons are siblings, not
+                    // children, so their own clicks never start a window move.
+                    .child(
+                        div()
+                            .id("titlebar-drag")
+                            .flex()
+                            .flex_1()
+                            // Let the title text be the thing that gives way in
+                            // a narrow window: without min_w_0 this grow-1 area
+                            // refuses to shrink below its text and squeezes the
+                            // fixed-size preview strip out of the row instead.
+                            .min_w_0()
+                            .overflow_hidden()
+                            .items_center()
+                            .gap_3()
+                            .when(client_side, |d| {
+                                d.on_mouse_down(
+                                    MouseButton::Left,
+                                    |_: &MouseDownEvent, window: &mut Window, _: &mut App| {
+                                        window.start_window_move();
+                                    },
+                                )
+                                .on_click(
+                                    |ev: &ClickEvent, window: &mut Window, _: &mut App| {
+                                        if ev.is_right_click() {
+                                            window.show_window_menu(ev.position());
+                                        } else if ev.click_count() >= 2 {
+                                            window.zoom_window();
+                                        }
+                                    },
+                                )
+                            })
+                            .child(div().text_xl().text_color(rgb(0x7aa2f7)).child("ParallHex"))
+                            .child(div().child(format!(
+                                "{file_name} · {file_size} bytes ({})",
+                                color::human_size(file_size)
+                            ))),
+                    )
+                    .when(has_file, |d| d.child(self.strip(cx)))
+                    .when(client_side, |d| d.child(window_buttons(cx))),
             )
             .child(row2)
     }
@@ -1722,7 +1304,7 @@ impl ParallHexApp {
         if !self.show_jump_dialog {
             return None;
         }
-        let content = self.jump_field.read(cx).content.to_string();
+        let content = self.jump_field.read(cx).content().to_owned();
         match Self::parse_offset(&content) {
             Some(o) if o < self.file_size => {
                 let d = self.data();
@@ -1755,13 +1337,20 @@ impl ParallHexApp {
         let view_frac = self.view_frac;
         let view_frac_h = self.view_frac_h;
         div()
+            // `on_hover` below needs a stateful element, hence the id.
+            .id("preview-strip")
             .w(px(STRIP_W))
             .h(px(STRIP_H))
+            // Fixed size: never let a long file name shrink the preview away.
+            .flex_shrink_0()
             .rounded_md()
             .overflow_hidden()
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
                 this.on_strip_move(ev.position, ev.dragging());
                 cx.notify();
+            }))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.on_overview_hover(*hovered, cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1784,28 +1373,34 @@ impl ParallHexApp {
                     cx.notify();
                 }),
             )
-            .child(canvas(
-                move |bounds, _window, cx| {
-                    entity.update(cx, |this, _| {
-                        this.strip_bounds = bounds;
-                    });
-                },
-                move |bounds, (), window, cx| {
-                    if let Some(img) = &strip_image {
-                        panes::paint_strip(
-                            window,
-                            cx,
-                            bounds,
-                            img,
-                            file_size,
-                            view_frac,
-                            view_frac_h,
-                        );
-                    } else {
-                        window.paint_quad(quad_dark(bounds));
-                    }
-                },
-            ))
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        entity.update(cx, |this, _| {
+                            this.strip_bounds = bounds;
+                        });
+                    },
+                    move |bounds, (), window, cx| {
+                        if let Some(img) = &strip_image {
+                            panes::paint_strip(
+                                window,
+                                cx,
+                                bounds,
+                                img,
+                                file_size,
+                                view_frac,
+                                view_frac_h,
+                            );
+                        } else {
+                            window.paint_quad(quad_dark(bounds));
+                        }
+                    },
+                )
+                // A `canvas` has no intrinsic size: without this it lays out
+                // zero-height and paints nothing (`Canvas::request_layout` refines
+                // `Style::default()`, and it has no children to measure).
+                .size_full(),
+            )
     }
 
     // ----- column builders -----
@@ -1862,19 +1457,17 @@ impl ParallHexApp {
         let file_size = self.file_size;
         let view_frac = self.view_frac;
         let view_frac_h = self.view_frac_h;
+        let overview_colormap = self.overview_colormap;
 
+        let overview_width = self.overview_width;
         let header = column_header(
             "Overview",
             (file_size > 0).then(|| panes::range_label(0, file_size)),
-            div().child(
-                div()
-                    .text_color(rgb(0x565f89))
-                    .child("whole file · grey/entropy"),
-            ),
+            self.colormap_picker(cx, Panel::Overview),
         );
 
         div()
-            .w(px(self.overview_width))
+            .w(px(overview_width))
             .h_full()
             .flex()
             .flex_col()
@@ -1884,11 +1477,16 @@ impl ParallHexApp {
             .child(header)
             .child(
                 div()
+                    // `on_hover` below needs a stateful element, hence the id.
+                    .id("overview-canvas")
                     .flex_1()
                     .min_h_0()
                     .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
                         this.on_overview_move(ev.position, ev.dragging());
                         cx.notify();
+                    }))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.on_overview_hover(*hovered, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1911,63 +1509,75 @@ impl ParallHexApp {
                             cx.notify();
                         }),
                     )
-                    .child(canvas(
-                        {
-                            let entity = entity.clone();
-                            move |bounds, _window, cx| {
-                                // Regenerate the thumbnail when the panel resizes.
-                                let w = (bounds.size.width.to_f64() as usize).clamp(64, 512);
-                                let h = (bounds.size.height.to_f64() as usize).clamp(32, 1024);
-                                let dirty = entity.read(cx).overview_gen_size != Some((w, h));
-                                if dirty {
-                                    let img = data.as_deref().map(|d| {
-                                        panes::build_overview_image(
-                                            d,
-                                            &entropies,
-                                            entropy_window,
-                                            w,
-                                            h,
-                                        )
-                                    });
+                    .child(
+                        canvas(
+                            {
+                                let entity = entity.clone();
+                                move |bounds, _window, cx| {
+                                    // Regenerate the thumbnail when the panel resizes.
+                                    let w = (bounds.size.width.to_f64() as usize).clamp(64, 512);
+                                    let h = (bounds.size.height.to_f64() as usize).clamp(32, 1024);
+                                    // Regenerating is O(cells) over the whole file
+                                    // and runs inside prepaint, so skip it while a
+                                    // divider drag is resizing the panel every
+                                    // frame: the existing image scales until the
+                                    // drag ends, and the size mismatch makes the
+                                    // next frame regenerate once.
+                                    let this = entity.read(cx);
+                                    let dirty = this.overview_gen_size != Some((w, h))
+                                        && this.resizing_divider.is_none();
+                                    if dirty {
+                                        let img = data.as_deref().map(|d| {
+                                            panes::build_overview_image(
+                                                d,
+                                                &entropies,
+                                                entropy_window,
+                                                w,
+                                                h,
+                                                overview_colormap,
+                                            )
+                                        });
+                                        entity.update(cx, |this, _| {
+                                            if let Some((image, cells)) = img {
+                                                this.overview_image = Some(image);
+                                                this.overview_cells = Some(cells);
+                                            } else {
+                                                this.overview_image = None;
+                                                this.overview_cells = None;
+                                            }
+                                        });
+                                        entity.update(cx, |this, _| {
+                                            this.overview_gen_size = Some((w, h));
+                                        });
+                                    }
                                     entity.update(cx, |this, _| {
-                                        if let Some((image, cells)) = img {
-                                            this.overview_image = Some(image);
-                                            this.overview_cells = Some(cells);
-                                        } else {
-                                            this.overview_image = None;
-                                            this.overview_cells = None;
-                                        }
-                                    });
-                                    entity.update(cx, |this, _| {
-                                        this.overview_gen_size = Some((w, h));
+                                        this.overview_bounds = bounds;
                                     });
                                 }
-                                entity.update(cx, |this, _| {
-                                    this.overview_bounds = bounds;
-                                });
-                            }
-                        },
-                        {
-                            let entity = entity.clone();
-                            move |bounds, (), window, cx| {
-                                let image = entity.read(cx).overview_image.clone();
-                                match image {
-                                    Some(img) => panes::paint_overview(
-                                        window,
-                                        cx,
-                                        bounds,
-                                        &img,
-                                        file_size,
-                                        view_frac,
-                                        view_frac_h,
-                                    ),
-                                    None => {
-                                        window.paint_quad(quad_dark(bounds));
+                            },
+                            {
+                                let entity = entity.clone();
+                                move |bounds, (), window, cx| {
+                                    let image = entity.read(cx).overview_image.clone();
+                                    match image {
+                                        Some(img) => panes::paint_overview(
+                                            window,
+                                            cx,
+                                            bounds,
+                                            &img,
+                                            file_size,
+                                            view_frac,
+                                            view_frac_h,
+                                        ),
+                                        None => {
+                                            window.paint_quad(quad_dark(bounds));
+                                        }
                                     }
                                 }
-                            }
-                        },
-                    ))
+                            },
+                        )
+                        .size_full(),
+                    )
                     .size_full(),
             )
     }
@@ -1978,44 +1588,41 @@ impl ParallHexApp {
         let data = self.mmap.clone();
         let entropies = self.entropies.clone();
         let entropy_window = self.entropy_window;
-        let bpr = self.bytes_per_row.max(1);
+        let bpr = self.zoom_bpr.max(1);
         let len = self.file_size;
-        let scroll_rows = self.scroll_rows;
-        let pixel_zoom = self.pixel_zoom;
+        let first_row_start = panes::row_start_for(self.scroll_offset, bpr);
+        let pixel_zoom = self.zoom_row_h();
         let hovered = self.hovered_offset;
         let sel = self.selection_range.clone();
-        let colormap = self.pixel_colormap;
+        let colormap = self.zoom_colormap;
 
         let range = (len > 0).then(|| {
-            let row_h = self.pixels_row_h();
-            let first = self.scroll_rows.floor().max(0.0) as usize;
-            let vis_rows = ((self.view_height / row_h).ceil() as usize + 1)
-                .min(len.div_ceil(bpr).saturating_sub(first));
-            panes::range_label(first * bpr, ((first + vis_rows) * bpr).min(len))
+            let rows = panes::visible_rows(self.view_height, self.zoom_row_h());
+            panes::range_label(first_row_start, (first_row_start + rows * bpr).min(len))
         });
 
         div()
-            .w(px(self.pixels_width))
+            .w(px(self.zoom_width))
             .h_full()
             .flex()
             .flex_col()
             .bg(rgb(0x10101a))
             .border_r_1()
             .border_color(rgb(0x232740))
-            .child(self.pixels_header(cx, range))
+            .child(self.zoom_header(cx, range))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            this.on_pixels_mouse_down(ev, window);
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            this.on_pixels_mouse_down(ev);
                             cx.notify();
                         }),
                     )
-                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
-                        this.on_pixels_mouse_move(ev, window);
+                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                        this.on_pixels_mouse_move(ev);
                         cx.notify();
                     }))
                     .on_mouse_up(
@@ -2036,47 +1643,66 @@ impl ParallHexApp {
                         this.on_pixels_scroll(ev, cx);
                         cx.notify();
                     }))
-                    .child(canvas(
-                        move |bounds, _window, cx| {
-                            entity.update(cx, |this, _| {
-                                this.pixels_bounds = bounds;
-                            });
-                        },
-                        move |bounds, (), window, cx| {
-                            if let Some(d) = &data {
-                                panes::paint_pixels(
-                                    window,
-                                    cx,
-                                    bounds,
-                                    d,
-                                    bpr,
-                                    scroll_rows,
-                                    pixel_zoom,
-                                    hovered,
-                                    sel.as_ref(),
-                                    &entropies,
-                                    entropy_window,
-                                    colormap,
-                                );
-                            }
-                        },
-                    ))
+                    .child(
+                        canvas(
+                            move |bounds, _window, cx| {
+                                entity.update(cx, |this, _| {
+                                    this.pixels_bounds = bounds;
+                                });
+                            },
+                            move |bounds, (), window, _cx| {
+                                if let Some(d) = &data {
+                                    panes::paint_zoom(
+                                        window,
+                                        bounds,
+                                        d,
+                                        bpr,
+                                        first_row_start,
+                                        pixel_zoom,
+                                        hovered,
+                                        sel.as_ref(),
+                                        &entropies,
+                                        entropy_window,
+                                        colormap,
+                                    );
+                                }
+                            },
+                        )
+                        .size_full(),
+                    )
                     .size_full(),
             )
     }
 
-    /// The pixels-column header: title + zoom controls, a range row that
-    /// hosts the colormap dropdown toggle, and (when open) the expanded
-    /// colormap options row.
-    fn pixels_header(&mut self, cx: &mut Context<Self>, range: Option<String>) -> impl IntoElement {
-        let open = self.colormap_menu_open;
-        let current_label = self.pixel_colormap.label();
-        // Consume the range eagerly: the builder closures below can only
-        // borrow it, and it must outlive the returned element.
-        let range = range.unwrap_or_default();
+    /// The zoom column's header: title, the zoom readout / slider / reset, the
+    /// visible byte range and this panel's colormap picker.
+    fn zoom_header(&mut self, cx: &mut Context<Self>, range: Option<String>) -> impl IntoElement {
+        let zoom_controls = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_color(rgb(0x565f89))
+                    .child(format!("{} px", self.pixel_zoom.round() as u32)),
+            )
+            .child(self.slider(cx, SliderKind::PixelZoom))
+            .child(button(cx, "Reset", move |this, _window, cx| {
+                this.pixel_zoom = panes::PIXEL_ZOOM_DEFAULT;
+                cx.notify();
+            }))
+            .child(self.colormap_picker(cx, Panel::Zoom));
+        column_header("Zoom", range, zoom_controls)
+    }
 
+    /// A panel's colormap control: a `Map: … ▾` toggle that expands into the
+    /// four options. Only one panel's menu is open at a time, so the pills can
+    /// live in the header row without stealing space when collapsed.
+    fn colormap_picker(&mut self, cx: &mut Context<Self>, panel: Panel) -> impl IntoElement {
+        let open = self.open_colormap_menu == Some(panel);
+        let current = self.colormap(panel);
         let toggle = div()
-            .id("colormap-toggle")
+            .id(("colormap-toggle", panel as usize))
             .px_2()
             .py_1()
             .rounded_md()
@@ -2095,135 +1721,75 @@ impl ParallHexApp {
             )
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx| {
-                    this.colormap_menu_open = !this.colormap_menu_open;
+                    this.open_colormap_menu = if this.open_colormap_menu == Some(panel) {
+                        None
+                    } else {
+                        Some(panel)
+                    };
                     cx.notify();
                 }),
             )
-            .child(swatch(self.pixel_colormap))
-            .child(div().child(format!("Map: {current_label}")))
+            .child(swatch(current))
+            .child(div().child(format!("Map: {}", current.label())))
             .child(div().child("▾"));
 
-        div()
-            .w_full()
-            .px_2()
-            .py_1()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .border_b_1()
-            .border_color(rgb(0x232740))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_color(rgb(0x9d7cd8)).child("Pixels"))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_color(rgb(0x565f89))
-                                    .child(format!("{} px", self.pixel_zoom.round() as u32)),
-                            )
-                            .child(self.slider(cx, SliderKind::PixelZoom))
-                            .child(button(cx, "Reset", move |this, _window, cx| {
-                                this.pixel_zoom = panes::PIXEL_ZOOM_DEFAULT;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .when(!range.is_empty(), |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_color(rgb(0x565f89))
-                                .text_size(px(11.))
-                                .child(range.clone()),
-                        )
-                        .child(toggle),
-                )
-            })
-            .when(open, |d| d.child(self.colormap_menu(cx)))
-    }
-
-    /// The expanded colormap options row (Greyscale / Entropy / Byte class).
-    /// Clicking an option applies it to the pixels column and collapses the
-    /// row back to the toggle.
-    fn colormap_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.pixel_colormap;
         div()
             .flex()
             .items_center()
             .gap_1()
-            .children(Colormap::ALL.into_iter().enumerate().map(|(idx, cm)| {
-                let selected = cm == current;
-                let mut pill = div()
-                    .id(("colormap", idx))
-                    .px_1()
-                    .py_1()
-                    .rounded_md()
-                    .text_size(px(11.))
-                    .cursor_pointer()
-                    .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx| {
-                            this.pixel_colormap = cm;
-                            this.colormap_menu_open = false;
-                            cx.notify();
-                        }),
-                    );
-                pill = if selected {
-                    pill.bg(rgb(0x7aa2f7)).text_color(rgb(0x0f1017))
-                } else {
-                    pill.bg(rgb(0x24283b))
-                        .text_color(rgb(0xc0caf5))
-                        .hover(|s| s.bg(rgb(0x3b4261)))
-                };
-                pill.child(cm.label())
-            }))
+            .child(toggle)
+            .when(open, |d| {
+                d.children(Colormap::ALL.into_iter().enumerate().map(|(idx, cm)| {
+                    let mut pill = div()
+                        .id(("colormap", panel as usize * Colormap::ALL.len() + idx))
+                        .px_1()
+                        .py_1()
+                        .rounded_md()
+                        .text_size(px(11.))
+                        .cursor_pointer()
+                        .on_click(
+                            cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx| {
+                                this.set_colormap(panel, cm);
+                                this.open_colormap_menu = None;
+                                cx.notify();
+                            }),
+                        );
+                    pill = if cm == current {
+                        pill.bg(rgb(0x7aa2f7)).text_color(rgb(0x0f1017))
+                    } else {
+                        pill.bg(rgb(0x24283b))
+                            .text_color(rgb(0xc0caf5))
+                            .hover(|s| s.bg(rgb(0x3b4261)))
+                    };
+                    pill.child(cm.label())
+                }))
+            })
     }
 
-    /// Right column: class-colored hex + ASCII cells (master scroll).
+    /// Right column: colormap-backed hex + ASCII cells. Its row length comes
+    /// from its own width and it is the scroll reference (SPECS §4.2).
     #[allow(clippy::too_many_lines)] // single-purpose element builder
     fn hex_column(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let data = self.mmap.clone();
-        let bpr = self.bytes_per_row.max(1);
+        let bpr = self.hex_bpr.max(8);
         let len = self.file_size;
-        let scroll_rows = self.scroll_rows;
-        let hex_zoom = self.hex_zoom;
+        let first_row_start = panes::row_start_for(self.scroll_offset, bpr);
         let hovered = self.hovered_offset;
         let sel = self.selection_range.clone();
         let font = panes::mono_font(&self.mono_family);
+        let hex_font = panes::mono_font(&self.mono_family);
+        let hex_entropies = self.entropies.clone();
+        let entropy_window = self.entropy_window;
+        let hex_colormap = self.hex_colormap;
 
         let range = (len > 0).then(|| {
-            let block_h = panes::hex_block_h(self.hex_zoom);
-            let first = self.scroll_rows.floor().max(0.0) as usize;
-            let vis_rows = ((self.view_height / block_h).ceil() as usize + 1)
-                .min(len.div_ceil(bpr).saturating_sub(first));
-            panes::range_label(first * bpr, ((first + vis_rows) * bpr).min(len))
+            let rows = panes::visible_rows(self.view_height, panes::BLOCK_H);
+            panes::range_label(first_row_start, (first_row_start + rows * bpr).min(len))
         });
 
-        let header_extra = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .text_color(rgb(0x565f89))
-                    .child(format!("×{hex_zoom:.2}")),
-            )
-            .child(self.slider(cx, SliderKind::HexZoom))
-            .child(button(cx, "Reset zoom", move |this, _window, cx| {
-                this.hex_zoom = panes::HEX_ZOOM_DEFAULT;
-                cx.notify();
-            }));
+        // The hex text size is fixed, so this header carries no zoom controls.
+        let header_extra = self.colormap_picker(cx, Panel::Hex);
 
         div()
             .flex_1()
@@ -2237,16 +1803,9 @@ impl ParallHexApp {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            this.on_hex_mouse_down(ev, window);
-                            if let Some(copy) = this.pending_copy.take() {
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy));
-                            }
-                            cx.notify();
-                        }),
-                    )
+                    // `on_any_mouse_down` covers left, middle and right (the
+                    // handler dispatches on the button itself); adding a
+                    // separate left binding would run it twice per click.
                     .on_any_mouse_down(cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                         this.on_hex_mouse_down(ev, window);
                         if let Some(copy) = this.pending_copy.take() {
@@ -2290,67 +1849,70 @@ impl ParallHexApp {
                         this.on_hex_scroll(ev, cx);
                         cx.notify();
                     }))
-                    .child(canvas(
-                        move |bounds, _window, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.hex_bounds = bounds;
-                                this.view_height = bounds.size.height.to_f64() as f32;
-                                // Resolve one-shot scroll requests, then clamp.
-                                let block_h = panes::hex_block_h(this.hex_zoom);
-                                let total_rows = this.file_size.div_ceil(this.bytes_per_row.max(1));
-                                let content_h = total_rows as f32 * block_h;
-                                let view_h = this.view_height;
-                                let mut changed = false;
-                                if this.scroll_reset {
-                                    this.scroll_rows = 0.0;
-                                    this.scroll_reset = false;
-                                    changed = true;
-                                }
-                                if let Some(off) = this.scroll_to_offset.take() {
-                                    let row = (off / this.bytes_per_row.max(1)) as f32;
-                                    let target = (row * block_h - view_h * 0.5).max(0.0);
-                                    this.scroll_rows = target / block_h.max(1.0);
-                                    changed = true;
-                                }
-                                let max_scroll = if content_h > view_h {
-                                    (content_h - view_h) / block_h
-                                } else {
-                                    0.0
-                                };
-                                let clamped = this.scroll_rows.clamp(0.0, max_scroll);
-                                if (clamped - this.scroll_rows).abs() > 0.0001 {
-                                    this.scroll_rows = clamped;
-                                    changed = true;
-                                }
-                                if content_h > 0.0 {
-                                    this.view_frac =
-                                        ((this.scroll_rows * block_h) / content_h).clamp(0.0, 1.0);
-                                    this.view_frac_h = (view_h / content_h).clamp(0.0, 1.0);
-                                }
-                                if changed {
-                                    cx.notify();
-                                }
-                            });
-                        },
-                        move |bounds, (), window, cx| {
-                            if let Some(d) = &data {
-                                panes::paint_hex(
+                    .child(
+                        canvas(
+                            move |bounds, window, cx| {
+                                let char_w = panes::hex_char_width(
                                     window,
-                                    cx,
-                                    bounds,
-                                    d,
-                                    &font,
-                                    hex_zoom,
-                                    bpr,
-                                    scroll_rows,
-                                    hovered,
-                                    sel.as_ref(),
+                                    &hex_font,
+                                    px(panes::HEX_FONT_SIZE),
                                 );
-                            } else {
-                                window.paint_quad(quad_dark(bounds));
-                            }
-                        },
-                    ))
+                                entity.update(cx, |this, cx| {
+                                    this.hex_bounds = bounds;
+                                    this.view_height = bounds.size.height.to_f64() as f32;
+                                    // Content fits the panel: as many whole
+                                    // 8-byte groups as the width allows.
+                                    this.hex_bpr = panes::hex_bytes_per_row(
+                                        bounds.size.width.to_f64() as f32,
+                                        char_w,
+                                    );
+                                    let bpr = this.hex_bpr.max(8);
+                                    let before = this.scroll_offset;
+                                    // Centre a pending jump on this column, the
+                                    // scroll reference for the whole window.
+                                    if let Some(off) = this.scroll_to_offset.take() {
+                                        let rows =
+                                            panes::visible_rows(this.view_height, panes::BLOCK_H);
+                                        this.scroll_offset = off.saturating_sub(rows / 2 * bpr);
+                                    }
+                                    this.clamp_anchor();
+                                    if this.file_size > 0 {
+                                        let visible =
+                                            panes::visible_rows(this.view_height, panes::BLOCK_H)
+                                                * bpr;
+                                        let len = this.file_size as f32;
+                                        this.view_frac =
+                                            (this.scroll_offset as f32 / len).clamp(0.0, 1.0);
+                                        this.view_frac_h = (visible as f32 / len).clamp(0.0, 1.0);
+                                    }
+                                    if this.scroll_offset != before {
+                                        cx.notify();
+                                    }
+                                });
+                            },
+                            move |bounds, (), window, cx| {
+                                if let Some(d) = &data {
+                                    panes::paint_hex(
+                                        window,
+                                        cx,
+                                        bounds,
+                                        d,
+                                        &font,
+                                        bpr,
+                                        first_row_start,
+                                        hovered,
+                                        sel.as_ref(),
+                                        &hex_entropies,
+                                        entropy_window,
+                                        hex_colormap,
+                                    );
+                                } else {
+                                    window.paint_quad(quad_dark(bounds));
+                                }
+                            },
+                        )
+                        .size_full(),
+                    )
                     .size_full(),
             )
     }
@@ -2419,7 +1981,7 @@ impl ParallHexApp {
                                 cx.notify();
                             }))
                             .child(button(cx, "Jump", move |this, _window, cx| {
-                                let text = this.jump_field.read(cx).content.to_string();
+                                let text = this.jump_field.read(cx).content().to_owned();
                                 this.jump_submit(&text, cx);
                             })),
                     ),
@@ -2432,12 +1994,10 @@ impl ParallHexApp {
     fn slider(&mut self, cx: &mut Context<Self>, kind: SliderKind) -> impl IntoElement {
         let entity = cx.entity();
         let value = match kind {
-            SliderKind::HexZoom => self.hex_zoom,
             SliderKind::PixelZoom => self.pixel_zoom,
             SliderKind::EntropyWindow => self.entropy_window as f32,
         };
         let (min, max) = match kind {
-            SliderKind::HexZoom => (panes::HEX_ZOOM_MIN, panes::HEX_ZOOM_MAX),
             SliderKind::PixelZoom => (panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
             SliderKind::EntropyWindow => (16.0, 4096.0),
         };
@@ -2503,10 +2063,13 @@ impl ParallHexApp {
                         transparent_black(),
                         BorderStyle::default(),
                     ));
-                    let thumb_x = 2.0 + t * (w - 16.0);
+                    let thumb_x = slider_thumb_left(t, w);
                     let thumb = Bounds::new(
-                        point(bounds.left() + px(thumb_x), bounds.top() + px(h * 0.5 - 6.)),
-                        size(px(12.), px(12.)),
+                        point(
+                            bounds.left() + px(thumb_x),
+                            bounds.top() + px(h * 0.5 - SLIDER_THUMB_W * 0.5),
+                        ),
+                        size(px(SLIDER_THUMB_W), px(SLIDER_THUMB_W)),
                     );
                     window.paint_quad(quad(
                         thumb,
@@ -2522,7 +2085,6 @@ impl ParallHexApp {
 
     fn slider_bounds(&self, kind: SliderKind) -> Bounds<Pixels> {
         match kind {
-            SliderKind::HexZoom => self.hex_slider_bounds,
             SliderKind::PixelZoom => self.pixels_slider_bounds,
             SliderKind::EntropyWindow => self.entropy_slider_bounds,
         }
@@ -2530,7 +2092,6 @@ impl ParallHexApp {
 
     fn set_slider_bounds(&mut self, kind: SliderKind, bounds: Bounds<Pixels>) {
         match kind {
-            SliderKind::HexZoom => self.hex_slider_bounds = bounds,
             SliderKind::PixelZoom => self.pixels_slider_bounds = bounds,
             SliderKind::EntropyWindow => self.entropy_slider_bounds = bounds,
         }
@@ -2538,9 +2099,6 @@ impl ParallHexApp {
 
     fn set_slider_value(&mut self, kind: SliderKind, v: f32, cx: &mut Context<Self>) {
         match kind {
-            SliderKind::HexZoom => {
-                self.hex_zoom = v.clamp(panes::HEX_ZOOM_MIN, panes::HEX_ZOOM_MAX);
-            }
             SliderKind::PixelZoom => {
                 self.pixel_zoom = v.clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX);
             }
@@ -2567,6 +2125,10 @@ impl Focusable for ParallHexApp {
 impl Render for ParallHexApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.capture_window_geometry(window);
+        // With client-side decorations nothing else draws a titlebar, so the
+        // top bar has to provide move / maximize / close and the edges have to
+        // provide resize. See `main.rs`'s `DECORATIONS`.
+        let client_side = matches!(window.window_decorations(), Decorations::Client { .. });
         // Debounced config save.
         let current = self.current_config();
         if current != self.saved_cfg && self.last_save.elapsed() >= Duration::from_secs(2) {
@@ -2575,18 +2137,12 @@ impl Render for ParallHexApp {
             self.last_save = Instant::now();
         }
 
-        // Regenerate the fixed-resolution strip when needed.
-        if self.strip_dirty {
-            self.strip_dirty = false;
-            self.strip_image = self
-                .data()
-                .map(|d| panes::build_strip_image(d, &self.entropies, self.entropy_window));
-        }
+        self.refresh_strip();
 
         let show_jump = self.show_jump_dialog;
         let no_file = self.mmap.is_none();
 
-        let root = div()
+        div()
             .id("parallhex-root")
             .size_full()
             .flex()
@@ -2596,6 +2152,7 @@ impl Render for ParallHexApp {
             .key_context("ParallHex")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::on_open_file))
+            .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_jump_to_offset))
             .on_action(cx.listener(Self::on_reset_view))
             .on_action(cx.listener(Self::on_reset_columns))
@@ -2622,8 +2179,8 @@ impl Render for ParallHexApp {
                     // own click (handled next) can toggle the menu instead.
                     let on_toggle = this.colormap_toggle_down;
                     this.colormap_toggle_down = false;
-                    if this.colormap_menu_open && !on_toggle {
-                        this.colormap_menu_open = false;
+                    if this.open_colormap_menu.is_some() && !on_toggle {
+                        this.open_colormap_menu = None;
                         cx.notify();
                     }
                     // Clear any divider resize left over from a release that
@@ -2647,30 +2204,38 @@ impl Render for ParallHexApp {
                     cx.notify();
                 }
             }))
-            .child(self.top_bar(cx))
-            .when(no_file, |d| {
-                d.flex_1().flex().items_center().justify_center().child(
-                    div()
-                        .text_color(rgb(0x565f89))
-                        .child("No file loaded.\n\nOpen a binary file to explore its bytes."),
-                )
-            })
-            .when(!no_file, |d| {
-                d.flex_1()
-                    .flex()
-                    .flex_row()
+            .child(self.top_bar(cx, client_side))
+            // The central area (no-file placeholder or the three-column
+            // row) must be a dedicated child of the column root: mutating
+            // the root itself with `.when(...).flex_row()` would flatten
+            // the columns next to the top/status bars.
+            .child(
+                div()
+                    .flex_1()
                     .min_h_0()
-                    .child(self.overview_column(cx))
-                    .child(Self::column_divider(cx, DividerKind::OverviewPixels))
-                    .child(self.pixels_column(cx))
-                    .child(Self::column_divider(cx, DividerKind::PixelsHex))
-                    .child(self.hex_column(cx))
-            })
+                    .when(no_file, |d| {
+                        d.flex().items_center().justify_center().child(
+                            div().text_color(rgb(0x565f89)).child(
+                                "No file loaded.\n\nOpen a binary file to explore its bytes.",
+                            ),
+                        )
+                    })
+                    .when(!no_file, |d| {
+                        d.flex()
+                            .flex_row()
+                            .min_h_0()
+                            .child(self.overview_column(cx))
+                            .child(Self::column_divider(cx, DividerKind::OverviewZoom))
+                            .child(self.pixels_column(cx))
+                            .child(Self::column_divider(cx, DividerKind::ZoomHex))
+                            .child(self.hex_column(cx))
+                    }),
+            )
             .child(self.status_bar(cx))
-            .when(show_jump, |d| d.child(self.jump_dialog(cx)));
-
-        let _ = window;
-        root
+            .when(show_jump, |d| d.child(self.jump_dialog(cx)))
+            // Last children so they sit above everything and win hit-testing
+            // in the few pixels along each window edge.
+            .when(client_side, |d| d.children(resize_handles(cx)))
     }
 }
 
@@ -2708,13 +2273,128 @@ fn button(
         .child(label)
 }
 
+/// Width of the invisible resize border along each window edge, used only with
+/// client-side decorations (nothing else provides resize handles then).
+const RESIZE_EDGE_W: f32 = 6.0;
+
+/// Minimize / maximize / close, for when the app supplies its own titlebar.
+/// Closing goes through the same save-then-quit path as the Quit action so
+/// preferences are never lost to a click on the close button.
+fn window_buttons(cx: &mut Context<ParallHexApp>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(window_button(
+            cx,
+            "window-minimize",
+            "–",
+            false,
+            |window| {
+                window.minimize_window();
+            },
+        ))
+        .child(window_button(
+            cx,
+            "window-maximize",
+            "□",
+            false,
+            |window| {
+                window.zoom_window();
+            },
+        ))
+        .child(window_button(cx, "window-close", "✕", true, |_| {}))
+}
+
+/// One window-control button. `danger` tints the hover state red (close).
+/// `on_window` runs against the window; the close button is special-cased by
+/// `danger` so it can save preferences and quit through the view.
+fn window_button(
+    cx: &mut Context<ParallHexApp>,
+    id: &'static str,
+    glyph: &'static str,
+    danger: bool,
+    on_window: impl Fn(&mut Window) + 'static,
+) -> impl IntoElement {
+    let mut b = div()
+        .id(id)
+        .w(px(22.))
+        .h(px(22.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .text_color(rgb(0xc0caf5))
+        .cursor_pointer()
+        .active(|s| s.opacity(0.7))
+        .child(glyph);
+    b = if danger {
+        b.hover(|s| s.bg(rgb(0xf7768e)).text_color(rgb(0x16161e)))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                config::save(&this.current_config());
+                cx.quit();
+            }))
+    } else {
+        b.hover(|s| s.bg(rgb(0x3b4261)))
+            .on_click(cx.listener(move |_this, _: &ClickEvent, window, _cx| on_window(window)))
+    };
+    b
+}
+
+/// The eight resize affordances (four edges, then four corners) as absolutely
+/// positioned overlay children. Corners come last so they win where they
+/// overlap an edge.
+fn resize_handles(cx: &mut Context<ParallHexApp>) -> Vec<gpui::AnyElement> {
+    [
+        ResizeEdge::Top,
+        ResizeEdge::Bottom,
+        ResizeEdge::Left,
+        ResizeEdge::Right,
+        ResizeEdge::TopLeft,
+        ResizeEdge::TopRight,
+        ResizeEdge::BottomLeft,
+        ResizeEdge::BottomRight,
+    ]
+    .into_iter()
+    .map(|edge| resize_handle(cx, edge))
+    .collect()
+}
+
+fn resize_handle(cx: &mut Context<ParallHexApp>, edge: ResizeEdge) -> gpui::AnyElement {
+    let cursor = match edge {
+        ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+        ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorStyle::ResizeUpLeftDownRight,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorStyle::ResizeUpRightDownLeft,
+    };
+    let w = px(RESIZE_EDGE_W);
+    let base = div().absolute().cursor(cursor).on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |_this, _: &MouseDownEvent, window, _cx| {
+            window.start_window_resize(edge);
+        }),
+    );
+    match edge {
+        ResizeEdge::Top => base.top(px(0.)).left(px(0.)).w_full().h(w),
+        ResizeEdge::Bottom => base.bottom(px(0.)).left(px(0.)).w_full().h(w),
+        ResizeEdge::Left => base.left(px(0.)).top(px(0.)).h_full().w(w),
+        ResizeEdge::Right => base.right(px(0.)).top(px(0.)).h_full().w(w),
+        ResizeEdge::TopLeft => base.top(px(0.)).left(px(0.)).w(w).h(w),
+        ResizeEdge::TopRight => base.top(px(0.)).right(px(0.)).w(w).h(w),
+        ResizeEdge::BottomLeft => base.bottom(px(0.)).left(px(0.)).w(w).h(w),
+        ResizeEdge::BottomRight => base.bottom(px(0.)).right(px(0.)).w(w).h(w),
+    }
+    .into_any_element()
+}
+
 /// A small color swatch previewing what a colormap looks like, shown in the
 /// pixels-column dropdown toggle.
 fn swatch(cm: Colormap) -> impl IntoElement {
     let color = match cm {
-        Colormap::Greyscale => rgb(0x9aa5ce),
+        Colormap::None => rgb(0x3b4261),
+        Colormap::Value => rgb(0x9aa5ce),
+        Colormap::Class => color::class_color(0x41),
         Colormap::Entropy => color::entropy_color(4.0),
-        Colormap::ByteClass => color::class_color(0x41),
     };
     div().w(px(10.)).h(px(10.)).rounded_md().bg(color)
 }
@@ -2732,6 +2412,31 @@ fn quad_dark(bounds: Bounds<Pixels>) -> gpui::PaintQuad {
     )
 }
 
+/// Slider thumb geometry. The thumb is a fixed-width knob whose left edge
+/// travels between `SLIDER_PAD` and `w - SLIDER_PAD - SLIDER_THUMB_W`, so the
+/// value corresponds to the thumb's *center*. Painting and hit-testing both go
+/// through the two helpers below; computing either one inline is how the thumb
+/// ends up not sitting under the pointer that set it.
+const SLIDER_PAD: f32 = 2.0;
+const SLIDER_THUMB_W: f32 = 12.0;
+
+/// Horizontal distance the thumb's left edge can travel in a slider of width `w`.
+fn slider_travel(w: f32) -> f32 {
+    (w - 2.0 * SLIDER_PAD - SLIDER_THUMB_W).max(1.0)
+}
+
+/// The thumb's left edge for a normalized position `t`, relative to the
+/// slider's left edge.
+fn slider_thumb_left(t: f32, w: f32) -> f32 {
+    SLIDER_PAD + t.clamp(0.0, 1.0) * slider_travel(w)
+}
+
+/// The normalized position a pointer at `x` (relative to the slider's left
+/// edge) selects — the inverse of `slider_thumb_left` about the thumb center.
+fn slider_t_at_x(x: f32, w: f32) -> f32 {
+    ((x - SLIDER_PAD - SLIDER_THUMB_W * 0.5) / slider_travel(w)).clamp(0.0, 1.0)
+}
+
 /// Map a slider drag position (window coords) to a value, using the stored
 /// bounds from the previous frame.
 fn slider_value_at(kind: SliderKind, pos: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<f32> {
@@ -2739,9 +2444,8 @@ fn slider_value_at(kind: SliderKind, pos: Point<Pixels>, bounds: Bounds<Pixels>)
         return None;
     }
     let w = bounds.size.width.to_f64() as f32;
-    let t = ((pos.x - bounds.left()).to_f64() as f32 / w).clamp(0.0, 1.0);
+    let t = slider_t_at_x((pos.x - bounds.left()).to_f64() as f32, w);
     let (min, max) = match kind {
-        SliderKind::HexZoom => (panes::HEX_ZOOM_MIN, panes::HEX_ZOOM_MAX),
         SliderKind::PixelZoom => (panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
         SliderKind::EntropyWindow => (16.0, 4096.0),
     };
@@ -2838,49 +2542,36 @@ fn pick_monospace_family(window: &Window) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::{
-        NavigationAction, OVERVIEW_W_MAX, OVERVIEW_W_MIN, PIXELS_W_MAX, PIXELS_W_MIN, ParallHexApp,
-        divider_width,
+        CopyKind, NavigationAction, OVERVIEW_W_MAX, OVERVIEW_W_MIN, ParallHexApp, SLIDER_THUMB_W,
+        ZOOM_W_MAX, ZOOM_W_MIN, divider_width, selection_text, slider_t_at_x, slider_thumb_left,
     };
 
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum NavKey {
-        Left,
-        Right,
-        Up,
-        Down,
-        PageUp,
-        PageDown,
-        Home,
-        End,
-    }
-
-    fn action(key: NavKey) -> NavigationAction {
-        NavigationAction::new(
-            key == NavKey::Left,
-            key == NavKey::Right,
-            key == NavKey::Up,
-            key == NavKey::Down,
-            key == NavKey::PageUp,
-            key == NavKey::PageDown,
-            key == NavKey::Home,
-        )
-    }
-
-    fn next(key: NavKey, cur: usize, bpr: usize, page_bytes: usize, len: usize) -> usize {
-        ParallHexApp::nav_next(action(key), cur.min(len - 1), bpr, page_bytes, len)
+    /// `navigate` clamps a stale selection before delegating, so the tests
+    /// exercise `nav_next` through the same clamp.
+    fn next(
+        action: NavigationAction,
+        cur: usize,
+        bpr: usize,
+        page_bytes: usize,
+        len: usize,
+    ) -> usize {
+        ParallHexApp::nav_next(action, cur.min(len - 1), bpr, page_bytes, len)
     }
 
     #[test]
     fn arrows_clamp_at_boundaries() {
         let len = 1000usize;
         let bpr = 32usize;
-        assert_eq!(next(NavKey::Left, 0, bpr, 0, len), 0);
-        assert_eq!(next(NavKey::Up, 0, bpr, 0, len), 0);
-        assert_eq!(next(NavKey::Right, len - 1, bpr, 0, len), len - 1);
-        assert_eq!(next(NavKey::Down, len - 1, bpr, 0, len), len - 1);
-        assert_eq!(next(NavKey::Right, len - 2, bpr, 0, len), len - 1);
-        assert_eq!(next(NavKey::Down, len - 32, bpr, 0, len), len - 1);
-        assert_eq!(next(NavKey::Down, len - 64, bpr, 0, len), len - 64 + bpr);
+        assert_eq!(next(NavigationAction::Left, 0, bpr, 0, len), 0);
+        assert_eq!(next(NavigationAction::Up, 0, bpr, 0, len), 0);
+        assert_eq!(next(NavigationAction::Right, len - 1, bpr, 0, len), len - 1);
+        assert_eq!(next(NavigationAction::Down, len - 1, bpr, 0, len), len - 1);
+        assert_eq!(next(NavigationAction::Right, len - 2, bpr, 0, len), len - 1);
+        assert_eq!(next(NavigationAction::Down, len - 32, bpr, 0, len), len - 1);
+        assert_eq!(
+            next(NavigationAction::Down, len - 64, bpr, 0, len),
+            len - 64 + bpr
+        );
     }
 
     #[test]
@@ -2888,17 +2579,17 @@ mod tests {
         let len = 1000usize;
         let bpr = 32usize;
         let page_bytes = 448usize;
-        assert_eq!(next(NavKey::PageUp, 10, bpr, page_bytes, len), 0);
+        assert_eq!(next(NavigationAction::PageUp, 10, bpr, page_bytes, len), 0);
         assert_eq!(
-            next(NavKey::PageDown, len - 5, bpr, page_bytes, len),
+            next(NavigationAction::PageDown, len - 5, bpr, page_bytes, len),
             len - 1
         );
         assert_eq!(
-            next(NavKey::PageDown, 100, bpr, page_bytes, len),
+            next(NavigationAction::PageDown, 100, bpr, page_bytes, len),
             100 + page_bytes
         );
         assert_eq!(
-            next(NavKey::PageUp, 500, bpr, page_bytes, len),
+            next(NavigationAction::PageUp, 500, bpr, page_bytes, len),
             500 - page_bytes
         );
     }
@@ -2906,30 +2597,43 @@ mod tests {
     #[test]
     fn home_end_jump_to_boundaries() {
         let len = 1000usize;
-        assert_eq!(next(NavKey::Home, 500, 32, 448, len), 0);
-        assert_eq!(next(NavKey::End, 500, 32, 448, len), len - 1);
-        assert_eq!(next(NavKey::End, 0, 32, 448, len), len - 1);
+        assert_eq!(next(NavigationAction::Home, 500, 32, 448, len), 0);
+        assert_eq!(next(NavigationAction::End, 500, 32, 448, len), len - 1);
+        assert_eq!(next(NavigationAction::End, 0, 32, 448, len), len - 1);
     }
 
     #[test]
     fn stale_selection_is_clamped_before_moving() {
         let len = 1000usize;
-        assert_eq!(next(NavKey::Right, 5000, 32, 448, len), len - 1);
-        assert_eq!(next(NavKey::PageDown, 5000, 32, 448, len), len - 1);
-        assert_eq!(next(NavKey::Up, 5000, 32, 448, len), len - 1 - 32);
+        assert_eq!(next(NavigationAction::Right, 5000, 32, 448, len), len - 1);
+        assert_eq!(
+            next(NavigationAction::PageDown, 5000, 32, 448, len),
+            len - 1
+        );
+        assert_eq!(next(NavigationAction::Up, 5000, 32, 448, len), len - 1 - 32);
     }
 
+    /// Only the zoom column zooms now, so the step is exercised over its range.
     #[test]
     fn zoom_step_multiplies_and_clamps() {
+        use crate::panes::{PIXEL_ZOOM_MAX, PIXEL_ZOOM_MIN};
         assert_eq!(
-            crate::panes::zoom_step(1.0, crate::panes::ZOOM_STEP, 0.5, 4.0),
-            1.25
+            crate::panes::zoom_step(4.0, crate::panes::ZOOM_STEP, PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX),
+            5.0
         );
         assert_eq!(
-            crate::panes::zoom_step(4.0, crate::panes::ZOOM_STEP, 0.5, 4.0),
-            4.0
+            crate::panes::zoom_step(
+                24.0,
+                crate::panes::ZOOM_STEP,
+                PIXEL_ZOOM_MIN,
+                PIXEL_ZOOM_MAX
+            ),
+            24.0
         );
-        assert_eq!(crate::panes::zoom_step(0.5, 0.8, 0.5, 4.0), 0.5);
+        assert_eq!(
+            crate::panes::zoom_step(1.0, 0.8, PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX),
+            1.0
+        );
         assert_eq!(
             crate::panes::zoom_step(20.0, crate::panes::ZOOM_STEP, 1.0, 24.0),
             24.0
@@ -2993,8 +2697,46 @@ mod tests {
             "overview default must be within the drag clamp range"
         );
         assert!(
-            (PIXELS_W_MIN..=PIXELS_W_MAX).contains(&defaults.pixels_width),
-            "pixels default must be within the drag clamp range"
+            (ZOOM_W_MIN..=ZOOM_W_MAX).contains(&defaults.zoom_width),
+            "zoom column default must be within the drag clamp range"
         );
+    }
+
+    /// Clicking a slider must land the thumb under the pointer: mapping a
+    /// position to a value and back to the thumb center has to round-trip.
+    #[test]
+    fn slider_thumb_sits_where_the_pointer_selected_it() {
+        const W: f32 = 90.0;
+        for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let center = slider_thumb_left(t, W) + SLIDER_THUMB_W * 0.5;
+            let back = slider_t_at_x(center, W);
+            assert!((back - t).abs() < 1e-4, "t={t} -> x={center} -> t={back}");
+        }
+        // The extremes saturate instead of running off the track.
+        assert_eq!(slider_t_at_x(-50.0, W), 0.0);
+        assert_eq!(slider_t_at_x(500.0, W), 1.0);
+        // A degenerate width must not divide by zero.
+        assert!(slider_t_at_x(5.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn selection_text_formats_hex_and_ascii() {
+        let data = b"Hi\x00\xff!";
+        assert_eq!(
+            selection_text(data, &(0..5), CopyKind::Hex).as_deref(),
+            Some("48 69 00 FF 21")
+        );
+        assert_eq!(
+            selection_text(data, &(0..5), CopyKind::Ascii).as_deref(),
+            Some("Hi..!")
+        );
+        // Ranges are clamped to the file, and an empty result is `None`.
+        assert_eq!(
+            selection_text(data, &(3..900), CopyKind::Hex).as_deref(),
+            Some("FF 21")
+        );
+        assert_eq!(selection_text(data, &(2..2), CopyKind::Hex), None);
+        assert_eq!(selection_text(data, &(900..901), CopyKind::Hex), None);
+        assert_eq!(selection_text(&[], &(0..4), CopyKind::Ascii), None);
     }
 }

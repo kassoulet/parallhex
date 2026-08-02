@@ -1,5 +1,5 @@
-//! Persisted UI preferences: layout, zooms, bytes-per-row and the entropy
-//! window.
+//! Persisted UI preferences: layout, the zoom column's zoom, each panel's
+//! colormap and the entropy window.
 //!
 //! Stored as a tiny `key = value` text file in the platform config
 //! directory, so no serialization dependency is needed. Loading is
@@ -10,17 +10,20 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::color::Colormap;
+use crate::panes::PIXEL_ZOOM_DEFAULT;
 
 /// UI preferences that survive across sessions.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Config {
-    pub bytes_per_row: usize,
     pub entropy_window: usize,
-    pub hex_zoom: f32,
+    /// The zoom column's zoom, in pixels per byte.
     pub pixel_zoom: f32,
-    pub pixel_colormap: Colormap,
+    /// Each panel picks its own colormap (SPECS §3.C).
+    pub overview_colormap: Colormap,
+    pub zoom_colormap: Colormap,
+    pub hex_colormap: Colormap,
     pub overview_width: f32,
-    pub pixels_width: f32,
+    pub zoom_width: f32,
     /// Last window geometry `(x, y, width, height)` in screen pixels,
     /// restored on the next launch. `None` before the first save.
     pub window_bounds: Option<(f32, f32, f32, f32)>,
@@ -33,13 +36,15 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bytes_per_row: 32,
             entropy_window: 256,
-            hex_zoom: 1.0,
-            pixel_zoom: 1.0,
-            pixel_colormap: Colormap::Greyscale,
+            // Shared with the zoom column's "Reset" button: a separate literal
+            // here would make "Reset all settings" and "Reset" disagree.
+            pixel_zoom: PIXEL_ZOOM_DEFAULT,
+            overview_colormap: Colormap::Entropy,
+            zoom_colormap: Colormap::Value,
+            hex_colormap: Colormap::Class,
             overview_width: 200.0,
-            pixels_width: 320.0,
+            zoom_width: 320.0,
             window_bounds: None,
             window_maximized: false,
         }
@@ -98,21 +103,9 @@ pub fn parse(text: &str) -> Config {
         };
         let value = value.trim();
         match key.trim() {
-            "bytes_per_row" => {
-                if let Ok(n) = value.parse() {
-                    cfg.bytes_per_row = n;
-                }
-            }
             "entropy_window" => {
                 if let Ok(n) = value.parse() {
                     cfg.entropy_window = n;
-                }
-            }
-            "hex_zoom" => {
-                if let Ok(f) = value.parse::<f32>()
-                    && f.is_finite()
-                {
-                    cfg.hex_zoom = f;
                 }
             }
             "pixel_zoom" => {
@@ -122,9 +115,19 @@ pub fn parse(text: &str) -> Config {
                     cfg.pixel_zoom = f;
                 }
             }
-            "pixel_colormap" => {
+            "overview_colormap" => {
                 if let Some(cm) = Colormap::from_key(value) {
-                    cfg.pixel_colormap = cm;
+                    cfg.overview_colormap = cm;
+                }
+            }
+            "zoom_colormap" => {
+                if let Some(cm) = Colormap::from_key(value) {
+                    cfg.zoom_colormap = cm;
+                }
+            }
+            "hex_colormap" => {
+                if let Some(cm) = Colormap::from_key(value) {
+                    cfg.hex_colormap = cm;
                 }
             }
             "overview_width" => {
@@ -134,11 +137,11 @@ pub fn parse(text: &str) -> Config {
                     cfg.overview_width = f;
                 }
             }
-            "pixels_width" => {
+            "zoom_width" => {
                 if let Ok(f) = value.parse::<f32>()
                     && f.is_finite()
                 {
-                    cfg.pixels_width = f;
+                    cfg.zoom_width = f;
                 }
             }
             "window_x" => window_x = parse_finite(value),
@@ -176,13 +179,13 @@ pub fn serialize(cfg: &Config) -> String {
     let mut out = String::new();
     // `write!` into a `String` cannot fail; discard the `Result` it returns.
     let _ = writeln!(out, "# ParallHex preferences");
-    let _ = writeln!(out, "bytes_per_row = {}", cfg.bytes_per_row);
     let _ = writeln!(out, "entropy_window = {}", cfg.entropy_window);
-    let _ = writeln!(out, "hex_zoom = {}", cfg.hex_zoom);
     let _ = writeln!(out, "pixel_zoom = {}", cfg.pixel_zoom);
-    let _ = writeln!(out, "pixel_colormap = {}", cfg.pixel_colormap.key());
+    let _ = writeln!(out, "overview_colormap = {}", cfg.overview_colormap.key());
+    let _ = writeln!(out, "zoom_colormap = {}", cfg.zoom_colormap.key());
+    let _ = writeln!(out, "hex_colormap = {}", cfg.hex_colormap.key());
     let _ = writeln!(out, "overview_width = {}", cfg.overview_width.round());
-    let _ = writeln!(out, "pixels_width = {}", cfg.pixels_width.round());
+    let _ = writeln!(out, "zoom_width = {}", cfg.zoom_width.round());
     if let Some((left, top, width, height)) = cfg.window_bounds {
         let _ = writeln!(out, "window_x = {}", left.round());
         let _ = writeln!(out, "window_y = {}", top.round());
@@ -220,13 +223,13 @@ mod tests {
     #[test]
     fn parse_round_trip() {
         let cfg = Config {
-            bytes_per_row: 64,
             entropy_window: 512,
-            hex_zoom: 2.0,
             pixel_zoom: 8.0,
-            pixel_colormap: Colormap::Entropy,
+            overview_colormap: Colormap::None,
+            zoom_colormap: Colormap::Class,
+            hex_colormap: Colormap::Entropy,
             overview_width: 250.0,
-            pixels_width: 400.0,
+            zoom_width: 400.0,
             window_bounds: Some((120.0, 80.0, 1600.0, 900.0)),
             window_maximized: true,
         };
@@ -276,6 +279,37 @@ mod tests {
     }
 
     #[test]
+    fn every_colormap_value_round_trips() {
+        for cm in Colormap::ALL {
+            let cfg = Config {
+                hex_colormap: cm,
+                ..Config::default()
+            };
+            assert_eq!(parse(&serialize(&cfg)).hex_colormap, cm, "{cm:?}");
+        }
+    }
+
+    /// An older config file must load without error and keep the new defaults.
+    #[test]
+    fn retired_keys_are_ignored() {
+        let cfg = parse(
+            "bytes_per_row = 64\n\
+             hex_zoom = 2.5\n\
+             pixel_colormap = greyscale\n\
+             pixels_width = 400\n\
+             entropy_window = 1024\n",
+        );
+        assert_eq!(cfg.entropy_window, 1024);
+        assert_eq!(
+            cfg,
+            Config {
+                entropy_window: 1024,
+                ..Config::default()
+            }
+        );
+    }
+
+    #[test]
     fn parse_entropy_window() {
         assert_eq!(parse("entropy_window = 1024").entropy_window, 1024);
         assert_eq!(parse("entropy_window = abc").entropy_window, 256);
@@ -285,27 +319,33 @@ mod tests {
     fn parse_ignores_unknown_and_malformed_lines() {
         let cfg = parse(
             "# comment\n\
-             bytes_per_row = 64\n\
-             entropy_window = 1024\n\
              unknown_key = 1\n\
-             hex_zoom = 2.5\n\
-             garbage line without equals\n",
+             pixel_zoom = 6\n\
+             garbage line without equals\n\
+             hex_colormap = nonsense\n",
         );
-        assert_eq!(cfg.bytes_per_row, 64);
-        assert_eq!(cfg.entropy_window, 1024);
-        assert_eq!(cfg.hex_zoom, 2.5);
-        // Everything else keeps its default.
-        assert_eq!(cfg.pixel_zoom, 1.0);
+        assert_eq!(cfg.pixel_zoom, 6.0);
+        // An unparseable colormap keeps the default rather than blanking a panel.
+        assert_eq!(cfg.hex_colormap, Config::default().hex_colormap);
         assert_eq!(cfg.overview_width, 200.0);
     }
 
     #[test]
     fn parse_rejects_non_finite_and_unparseable_values() {
-        let cfg =
-            parse("bytes_per_row = abc\nhex_zoom =\npixel_zoom = nan\noverview_width = inf\n");
-        assert_eq!(cfg.bytes_per_row, 32);
-        assert_eq!(cfg.hex_zoom, 1.0);
-        assert_eq!(cfg.pixel_zoom, 1.0);
+        let cfg = parse("pixel_zoom = nan\noverview_width = inf\nzoom_width =\n");
+        assert_eq!(cfg.pixel_zoom, PIXEL_ZOOM_DEFAULT);
         assert_eq!(cfg.overview_width, 200.0);
+        assert_eq!(cfg.zoom_width, 320.0);
+    }
+
+    /// The persisted defaults must survive the clamps `ParallHexApp::new`
+    /// applies on load, or a fresh config would be silently rewritten.
+    #[test]
+    fn default_zoom_is_within_its_clamp() {
+        let cfg = Config::default();
+        assert!(
+            (crate::panes::PIXEL_ZOOM_MIN..=crate::panes::PIXEL_ZOOM_MAX).contains(&cfg.pixel_zoom)
+        );
+        assert!((16..=4096).contains(&cfg.entropy_window));
     }
 }

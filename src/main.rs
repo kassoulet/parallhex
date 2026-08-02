@@ -20,13 +20,14 @@ mod app;
 mod color;
 mod config;
 mod entropy;
+mod jump;
 mod panes;
 
 use std::path::PathBuf;
 
 use gpui::{
     AppContext, Application, Bounds, KeyBinding, Pixels, TitlebarOptions, WindowBounds,
-    WindowOptions, actions, point, px, size,
+    WindowDecorations, WindowOptions, actions, point, px, size,
 };
 
 // All keyboard actions. App-level (root view) bindings dispatch navigation,
@@ -37,6 +38,7 @@ actions!(
     parallhex,
     [
         OpenFile,
+        Quit,
         JumpToOffset,
         ResetView,
         ResetColumns,
@@ -63,6 +65,25 @@ actions!(
         JumpCancel,
     ]
 );
+
+/// Which decorations to ask for.
+///
+/// Linux compositors are not obliged to implement the `xdg-decoration`
+/// protocol, and GNOME's Mutter deliberately does not. In that case gpui has no
+/// decoration object to negotiate with, so `request_decorations` records the
+/// requested mode without telling anyone: asking for `Server` leaves
+/// `window_decorations()` reporting `Server` while *nothing* draws a titlebar,
+/// and the window cannot be moved or closed. Asking for `Client` instead keeps
+/// that state honest — `window_decorations()` reports `Client`, which is what
+/// `ParallHexApp::render` keys its own titlebar and resize edges off. On
+/// compositors that do implement the protocol this also declines their
+/// titlebar, so Linux gets one consistent look. macOS and Windows keep their
+/// native decorations.
+const DECORATIONS: Option<WindowDecorations> = if cfg!(target_os = "linux") {
+    Some(WindowDecorations::Client)
+} else {
+    None
+};
 
 /// Minimum window size, shared by the launch options and the restore clamp
 /// in `restored_bounds` so the two can't diverge.
@@ -122,35 +143,50 @@ fn print_usage() {
     println!("  -h, --help    print this help and exit");
 }
 
+/// Every keyboard binding, in one place so the keystroke strings can be parsed
+/// in a unit test — `KeyBinding::new` panics on an unparseable keystroke, and
+/// that would otherwise only surface as a crash on startup.
+///
+/// `secondary-` is gpui's portable accelerator: Cmd on macOS, Ctrl everywhere
+/// else. `cmd-` would bind the platform modifier literally, i.e. Super on
+/// Linux/Windows, which is not what the UI labels and SPECS.md promise
+/// ("Ctrl/Cmd+…").
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("secondary-o", OpenFile, None),
+        // Quit without relying on a window-manager close button (native
+        // Wayland compositors may not provide window decorations).
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-g", JumpToOffset, None),
+        KeyBinding::new("secondary-0", ResetView, None),
+        KeyBinding::new("shift-secondary-l", ResetColumns, None),
+        KeyBinding::new("=", ZoomIn, None),
+        KeyBinding::new("-", ZoomOut, None),
+        KeyBinding::new("left", NavigateLeft, None),
+        KeyBinding::new("right", NavigateRight, None),
+        KeyBinding::new("up", NavigateUp, None),
+        KeyBinding::new("down", NavigateDown, None),
+        KeyBinding::new("pageup", NavigatePageUp, None),
+        KeyBinding::new("pagedown", NavigatePageDown, None),
+        KeyBinding::new("home", NavigateHome, None),
+        KeyBinding::new("end", NavigateEnd, None),
+        KeyBinding::new("secondary-c", CopySelectionHex, None),
+        KeyBinding::new("shift-secondary-c", CopySelectionAscii, None),
+        KeyBinding::new("backspace", Backspace, None),
+        KeyBinding::new("delete", Delete, None),
+        KeyBinding::new("secondary-v", Paste, None),
+        KeyBinding::new("enter", JumpSubmit, None),
+        KeyBinding::new("escape", JumpCancel, None),
+    ]
+}
+
 fn main() {
     let initial_file = match parse_args(std::env::args().skip(1)) {
         Cli::Exit(code) => std::process::exit(code),
         Cli::Launch(file) => file,
     };
     Application::new().run(move |cx: &mut gpui::App| {
-        cx.bind_keys([
-            KeyBinding::new("cmd-o", OpenFile, None),
-            KeyBinding::new("cmd-g", JumpToOffset, None),
-            KeyBinding::new("cmd-0", ResetView, None),
-            KeyBinding::new("shift-cmd-l", ResetColumns, None),
-            KeyBinding::new("=", ZoomIn, None),
-            KeyBinding::new("-", ZoomOut, None),
-            KeyBinding::new("left", NavigateLeft, None),
-            KeyBinding::new("right", NavigateRight, None),
-            KeyBinding::new("up", NavigateUp, None),
-            KeyBinding::new("down", NavigateDown, None),
-            KeyBinding::new("pageup", NavigatePageUp, None),
-            KeyBinding::new("pagedown", NavigatePageDown, None),
-            KeyBinding::new("home", NavigateHome, None),
-            KeyBinding::new("end", NavigateEnd, None),
-            KeyBinding::new("cmd-c", CopySelectionHex, None),
-            KeyBinding::new("shift-cmd-c", CopySelectionAscii, None),
-            KeyBinding::new("backspace", Backspace, None),
-            KeyBinding::new("delete", Delete, None),
-            KeyBinding::new("cmd-v", Paste, None),
-            KeyBinding::new("enter", JumpSubmit, None),
-            KeyBinding::new("escape", JumpCancel, None),
-        ]);
+        cx.bind_keys(key_bindings());
 
         let prefs = config::load();
         let displays: Vec<Bounds<Pixels>> = cx.displays().iter().map(|d| d.bounds()).collect();
@@ -168,6 +204,7 @@ fn main() {
             WindowOptions {
                 window_bounds,
                 window_min_size: Some(size(px(MIN_WINDOW_W), px(MIN_WINDOW_H))),
+                window_decorations: DECORATIONS,
                 titlebar: Some(TitlebarOptions {
                     title: Some("ParallHex".into()),
                     ..Default::default()
@@ -211,7 +248,7 @@ fn restored_bounds(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, parse_args, restored_bounds};
+    use super::{Cli, key_bindings, parse_args, restored_bounds};
     use std::path::PathBuf;
 
     use crate::config;
@@ -233,6 +270,22 @@ mod tests {
             Cli::Exit(code) => code,
             Cli::Launch(_) => panic!("expected exit, got launch"),
         }
+    }
+
+    /// `KeyBinding::new` panics on a keystroke it cannot parse, so building
+    /// the table here turns a startup crash into a test failure.
+    #[test]
+    fn every_keystroke_parses() {
+        let bindings = key_bindings();
+        assert_eq!(bindings.len(), 22);
+        // `secondary-` must resolve to a real modifier on this platform.
+        let secondary = bindings[0].keystrokes().first().expect("one keystroke");
+        let mods = secondary.modifiers();
+        assert!(
+            mods.control || mods.platform,
+            "secondary- should map to Ctrl or Cmd, got {mods:?}"
+        );
+        assert!(!mods.shift);
     }
 
     #[test]
