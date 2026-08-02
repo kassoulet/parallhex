@@ -51,8 +51,6 @@ pub(crate) fn zoom_step(zoom: f32, factor: f32, min: f32, max: f32) -> f32 {
 /// Width a hex row of `n` bytes needs: the address gutter, `"HH "` per byte, a
 /// space between 8-byte groups, the two-space gap, then one ASCII glyph per
 /// byte. Mirrors `build_row_text` exactly (see the §6 invariant in SPECS.md).
-// Callers arrive with the panels in later tasks of the three-column rework.
-#[allow(dead_code)]
 fn hex_row_width(n: usize, char_w: f32) -> f32 {
     let chars = 12 + 4 * n + n.saturating_sub(1) / 8;
     ADDR_X + char_w * chars as f32
@@ -60,8 +58,6 @@ fn hex_row_width(n: usize, char_w: f32) -> f32 {
 
 /// Bytes per row for a hex panel `panel_width` wide: the largest multiple of 8
 /// that fits, floored at 8 so the 8-byte grouping is never split.
-// Callers arrive with the panels in later tasks of the three-column rework.
-#[allow(dead_code)]
 pub(crate) fn hex_bytes_per_row(panel_width: f32, char_w: f32) -> usize {
     if !char_w.is_finite() || char_w <= 0.0 || !panel_width.is_finite() {
         return 8;
@@ -75,9 +71,18 @@ pub(crate) fn hex_bytes_per_row(panel_width: f32, char_w: f32) -> usize {
     n
 }
 
-/// Bytes per row for the zoom panel: one `zoom`-wide block per byte.
-// Callers arrive with the panels in later tasks of the three-column rework.
-#[allow(dead_code)]
+/// Width of one byte's block once `bpr` of them are spread across
+/// `panel_width`. The zoom control picks a *target* block size; the panel then
+/// redistributes the bytes so a row spans the full width exactly, leaving no
+/// dead strip on the right.
+pub(crate) fn zoom_block_w(panel_width: f32, bpr: usize) -> f32 {
+    if bpr == 0 || !panel_width.is_finite() || panel_width <= 0.0 {
+        return 1.0;
+    }
+    panel_width / bpr as f32
+}
+
+/// Bytes per row for the zoom panel: as many `zoom`-sized blocks as fit.
 pub(crate) fn zoom_bytes_per_row(panel_width: f32, zoom: f32) -> usize {
     if !zoom.is_finite() || zoom <= 0.0 || !panel_width.is_finite() {
         return 1;
@@ -87,8 +92,6 @@ pub(crate) fn zoom_bytes_per_row(panel_width: f32, zoom: f32) -> usize {
 
 /// The byte offset of the first row a panel with `bpr` bytes per row shows when
 /// the shared anchor sits at `anchor`.
-// Callers arrive with the panels in later tasks of the three-column rework.
-#[allow(dead_code)]
 pub(crate) fn row_start_for(anchor: usize, bpr: usize) -> usize {
     if bpr == 0 {
         return anchor;
@@ -96,10 +99,17 @@ pub(crate) fn row_start_for(anchor: usize, bpr: usize) -> usize {
     anchor - anchor % bpr
 }
 
+/// The row-aligned first visible offset for a panel showing `rows` rows of
+/// `bpr` bytes, **centred** on the shared anchor: the anchor is the byte in the
+/// middle of the viewport, so every panel puts that byte on the same line
+/// however much data it shows (SPECS §4.2). Near the start of the file this
+/// saturates at 0 so the first rows stay reachable.
+pub(crate) fn first_row_centred(anchor: usize, bpr: usize, rows: usize) -> usize {
+    row_start_for(anchor.saturating_sub(rows / 2 * bpr), bpr)
+}
+
 /// The furthest the shared anchor may scroll: the start of the row holding the
 /// last byte, in the hex column's row length (the scroll reference, SPECS §4.2).
-// Callers arrive with the panels in later tasks of the three-column rework.
-#[allow(dead_code)]
 pub(crate) fn max_anchor(file_size: usize, hex_bpr: usize) -> usize {
     if file_size == 0 || hex_bpr == 0 {
         return 0;
@@ -113,6 +123,86 @@ pub(crate) fn visible_rows(panel_height: f32, row_h: f32) -> usize {
         return 1;
     }
     ((panel_height / row_h).ceil() as usize).max(1)
+}
+
+/// Width of the hex column's scrollbar, and the smallest thumb that stays
+/// grabbable on a huge file.
+pub(crate) const SCROLLBAR_W: f32 = 10.0;
+const MIN_THUMB_H: f32 = 24.0;
+
+/// Thumb `(top, height)` for a vertical scrollbar `track_h` tall, showing
+/// `visible` bytes of `len` anchored at `anchor`.
+pub(crate) fn scrollbar_thumb(
+    track_h: f32,
+    anchor: usize,
+    last_anchor: usize,
+    visible: usize,
+    len: usize,
+) -> (f32, f32) {
+    if !track_h.is_finite() || track_h <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if len == 0 || visible >= len || last_anchor == 0 {
+        return (0.0, track_h);
+    }
+    let height = ((visible as f32 / len as f32) * track_h).clamp(MIN_THUMB_H.min(track_h), track_h);
+    let travel = (track_h - height).max(0.0);
+    let top = ((anchor as f32 / last_anchor as f32).clamp(0.0, 1.0) * travel).min(travel);
+    (top, height)
+}
+
+/// The anchor a pointer at `y` on the track selects, grabbing the thumb by its
+/// centre so the thumb lands under the cursor.
+pub(crate) fn scrollbar_anchor_at(
+    y: f32,
+    track_h: f32,
+    last_anchor: usize,
+    visible: usize,
+    len: usize,
+) -> usize {
+    if !y.is_finite() || !track_h.is_finite() || track_h <= 0.0 || len == 0 || visible >= len {
+        return 0;
+    }
+    let (_, height) = scrollbar_thumb(track_h, 0, last_anchor, visible, len);
+    let travel = (track_h - height).max(1.0);
+    let t = ((y - height / 2.0) / travel).clamp(0.0, 1.0);
+    (t * last_anchor as f32) as usize
+}
+
+/// Paint the hex column's scrollbar: a dim track with a brighter thumb.
+pub(crate) fn paint_scrollbar(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    anchor: usize,
+    last_anchor: usize,
+    visible: usize,
+    len: usize,
+) {
+    window.paint_quad(quad(
+        bounds,
+        px(0.),
+        rgba(0x00000033),
+        px(0.),
+        transparent_black(),
+        BorderStyle::default(),
+    ));
+    let track_h = bounds.size.height.to_f64() as f32;
+    let (top, height) = scrollbar_thumb(track_h, anchor, last_anchor, visible, len);
+    if height <= 0.0 {
+        return;
+    }
+    let thumb = Bounds::new(
+        point(bounds.left() + px(2.), bounds.top() + px(top)),
+        size(bounds.size.width - px(4.), px(height)),
+    );
+    window.paint_quad(quad(
+        thumb,
+        px(3.),
+        rgba(0x565f89cc),
+        px(0.),
+        transparent_black(),
+        BorderStyle::default(),
+    ));
 }
 
 /// Format a half-open byte range as a hex header label, e.g.
@@ -258,19 +348,19 @@ pub(crate) fn zoom_offset_at(
     local: Point<Pixels>,
     bpr: usize,
     first_row_start: usize,
-    zoom: f32,
+    block: f32,
     len: usize,
 ) -> Option<usize> {
     let x = local.x.to_f64() as f32;
     let y = local.y.to_f64() as f32;
-    if x < 0.0 || y < 0.0 || len == 0 || bpr == 0 || !zoom.is_finite() || zoom <= 0.0 {
+    if x < 0.0 || y < 0.0 || len == 0 || bpr == 0 || !block.is_finite() || block <= 0.0 {
         return None;
     }
-    let col = (x / zoom) as usize;
+    let col = (x / block) as usize;
     if col >= bpr {
         return None;
     }
-    let row = (y / zoom) as usize;
+    let row = (y / block) as usize;
     let off = row
         .checked_mul(bpr)?
         .checked_add(first_row_start)?
@@ -595,17 +685,19 @@ pub(crate) fn paint_zoom(
     data: &[u8],
     bpr: usize,
     first_row_start: usize,
-    zoom: f32,
+    block: f32,
     hovered: Option<usize>,
     sel: Option<&Range<usize>>,
     entropies: &[f32],
     entropy_window: usize,
     colormap: Colormap,
+    mark: Option<&Range<usize>>,
 ) {
     let len = data.len();
-    if len == 0 || bpr == 0 || !zoom.is_finite() || zoom <= 0.0 {
+    if len == 0 || bpr == 0 || !block.is_finite() || block <= 0.0 {
         return;
     }
+    let zoom = block;
     let rows = visible_rows(bounds.size.height.to_f64() as f32, zoom);
     for r in 0..rows {
         let row_start = first_row_start + r * bpr;
@@ -656,6 +748,50 @@ pub(crate) fn paint_zoom(
             }
         }
     }
+    // The rows the next panel (hex) is showing.
+    if let Some(mark) = mark {
+        paint_row_band(window, bounds, mark, first_row_start, bpr, zoom, rows);
+    }
+}
+
+/// Outline the rows covering `mark` — the byte range the next panel to the
+/// right is displaying — so each panel shows where the next one is looking.
+fn paint_row_band(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    mark: &Range<usize>,
+    first_row_start: usize,
+    bpr: usize,
+    row_h: f32,
+    rows: usize,
+) {
+    if mark.is_empty() || bpr == 0 {
+        return;
+    }
+    let first_row = first_row_start / bpr;
+    let start_row = (mark.start / bpr).max(first_row);
+    let end_row = ((mark.end - 1) / bpr).max(start_row);
+    if end_row < first_row {
+        return;
+    }
+    let top = (start_row - first_row) as f32 * row_h;
+    let height = ((end_row - start_row + 1) as f32 * row_h).max(2.0);
+    let visible_h = rows as f32 * row_h;
+    if top >= visible_h {
+        return;
+    }
+    let band = Bounds::new(
+        point(bounds.left(), bounds.top() + px(top)),
+        size(bounds.size.width, px(height.min(visible_h - top))),
+    );
+    window.paint_quad(quad(
+        band,
+        px(0.),
+        rgba(0xffffff1f),
+        px(1.),
+        rgba(0x7aa2f7cc),
+        BorderStyle::default(),
+    ));
 }
 
 /// Paint the whole-file 2D overview into `bounds`: the greyscale/entropy
@@ -666,24 +802,28 @@ pub(crate) fn paint_overview(
     bounds: Bounds<Pixels>,
     image: &Arc<RenderImage>,
     file_size: usize,
-    view_frac: f32,
-    view_frac_h: f32,
+    mark: Option<&Range<usize>>,
 ) {
     let _ = window.paint_image(bounds, Corners::all(px(2.)), image.clone(), 0, false);
-    if file_size == 0 {
+    let Some(mark) = mark else { return };
+    if file_size == 0 || mark.is_empty() {
         return;
     }
-    let x0 = bounds.left().to_f64() as f32
-        + view_frac.clamp(0.0, 1.0) * bounds.size.width.to_f64() as f32;
-    let x1 = bounds.left().to_f64() as f32
-        + (view_frac + view_frac_h).clamp(0.0, 1.0) * bounds.size.width.to_f64() as f32;
-    let band = Bounds::from_corners(point(px(x0), bounds.top()), point(px(x1), bounds.bottom()));
+    // Cells run row-major top-to-bottom, so a byte range is a horizontal band.
+    let h = bounds.size.height.to_f64() as f32;
+    let frac = |off: usize| (off as f32 / file_size as f32).clamp(0.0, 1.0);
+    let y0 = frac(mark.start) * h;
+    let y1 = frac(mark.end) * h;
+    let band = Bounds::new(
+        point(bounds.left(), bounds.top() + px(y0)),
+        size(bounds.size.width, px((y1 - y0).max(2.0))),
+    );
     window.paint_quad(quad(
         band,
         px(0.),
         rgba(0xffffff2e),
-        px(0.),
-        transparent_black(),
+        px(1.),
+        rgba(0x7aa2f7cc),
         BorderStyle::default(),
     ));
 }
@@ -696,17 +836,18 @@ pub(crate) fn paint_strip(
     bounds: Bounds<Pixels>,
     image: &Arc<RenderImage>,
     file_size: usize,
-    view_frac: f32,
-    view_frac_h: f32,
+    mark: Option<&Range<usize>>,
 ) {
     let _ = window.paint_image(bounds, Corners::all(px(2.)), image.clone(), 0, false);
-    if file_size == 0 {
+    let Some(mark) = mark else { return };
+    if file_size == 0 || mark.is_empty() {
         return;
     }
-    let x0 = bounds.left().to_f64() as f32
-        + view_frac.clamp(0.0, 1.0) * bounds.size.width.to_f64() as f32;
-    let x1 = bounds.left().to_f64() as f32
-        + (view_frac + view_frac_h).clamp(0.0, 1.0) * bounds.size.width.to_f64() as f32;
+    // The strip maps x to file offset, so the band is vertical here.
+    let w = bounds.size.width.to_f64() as f32;
+    let frac = |off: usize| (off as f32 / file_size as f32).clamp(0.0, 1.0);
+    let x0 = bounds.left().to_f64() as f32 + frac(mark.start) * w;
+    let x1 = (bounds.left().to_f64() as f32 + frac(mark.end) * w).max(x0 + 2.0);
     let band = Bounds::from_corners(point(px(x0), bounds.top()), point(px(x1), bounds.bottom()));
     window.paint_quad(quad(
         band,
@@ -1229,6 +1370,28 @@ mod tests {
     }
 
     #[test]
+    fn zoom_block_w_spreads_bytes_across_the_whole_width() {
+        // 319 px at a target of 4 px: 79 blocks fit, widened to 4.038 px each
+        // so the row spans the panel exactly instead of leaving a dead strip.
+        let bpr = zoom_bytes_per_row(319.0, 4.0);
+        assert_eq!(bpr, 79);
+        let block = zoom_block_w(319.0, bpr);
+        assert!(
+            block >= 4.0,
+            "block {block} must not shrink below the target"
+        );
+        assert!(
+            (bpr as f32 * block - 319.0).abs() < 1e-3,
+            "row must fill the width exactly, got {}",
+            bpr as f32 * block
+        );
+        // Degenerate inputs stay usable rather than dividing by zero.
+        assert_eq!(zoom_block_w(319.0, 0), 1.0);
+        assert_eq!(zoom_block_w(0.0, 8), 1.0);
+        assert_eq!(zoom_block_w(f32::NAN, 8), 1.0);
+    }
+
+    #[test]
     fn zoom_bytes_per_row_is_width_over_zoom() {
         assert_eq!(zoom_bytes_per_row(320.0, 4.0), 80);
         assert_eq!(zoom_bytes_per_row(320.0, 8.0), 40);
@@ -1237,6 +1400,47 @@ mod tests {
         assert_eq!(zoom_bytes_per_row(0.0, 8.0), 1);
         assert_eq!(zoom_bytes_per_row(320.0, 0.0), 1); // degenerate zoom
         assert_eq!(zoom_bytes_per_row(f32::NAN, 8.0), 1);
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_the_anchor() {
+        let (len, visible, last) = (1000usize, 100usize, 900usize);
+        // At the top, the thumb sits at the top and is 1/10th of the track.
+        let (top, h) = scrollbar_thumb(400.0, 0, last, visible, len);
+        assert_eq!(top, 0.0);
+        assert!((h - 40.0).abs() < 1e-3, "h={h}");
+        // At the last anchor it bottoms out exactly.
+        let (top, h) = scrollbar_thumb(400.0, last, last, visible, len);
+        assert!((top + h - 400.0).abs() < 1e-3, "top={top} h={h}");
+        // Halfway.
+        let (top, _) = scrollbar_thumb(400.0, last / 2, last, visible, len);
+        assert!((top - 180.0).abs() < 1.0, "top={top}");
+        // A tiny visible fraction still leaves a grabbable thumb.
+        let (_, h) = scrollbar_thumb(400.0, 0, 9_999_999, 1, 10_000_000);
+        assert!(h >= 24.0, "h={h}");
+        // Whole file visible, no file, or nowhere to scroll: full-height thumb.
+        assert_eq!(scrollbar_thumb(400.0, 0, last, 1000, 1000), (0.0, 400.0));
+        assert_eq!(scrollbar_thumb(400.0, 0, last, 10, 0), (0.0, 400.0));
+        assert_eq!(scrollbar_thumb(400.0, 0, 0, 10, 100), (0.0, 400.0));
+        assert_eq!(scrollbar_thumb(0.0, 0, last, 10, 100), (0.0, 0.0));
+    }
+
+    #[test]
+    fn scrollbar_anchor_round_trips_with_the_thumb() {
+        let (track, visible, len, last) = (400.0, 100usize, 1000usize, 900usize);
+        // Dragging to the top and bottom saturates.
+        assert_eq!(scrollbar_anchor_at(-10.0, track, last, visible, len), 0);
+        assert_eq!(scrollbar_anchor_at(0.0, track, last, visible, len), 0);
+        assert_eq!(scrollbar_anchor_at(500.0, track, last, visible, len), last);
+        // Grabbing the thumb centre puts the thumb back where it was.
+        for anchor in [0usize, 200, 450, 900] {
+            let (top, h) = scrollbar_thumb(track, anchor, last, visible, len);
+            let back = scrollbar_anchor_at(top + h / 2.0, track, last, visible, len);
+            assert!(back.abs_diff(anchor) <= 4, "anchor {anchor} -> {back}");
+        }
+        // Degenerate inputs.
+        assert_eq!(scrollbar_anchor_at(10.0, track, last, 1000, 1000), 0);
+        assert_eq!(scrollbar_anchor_at(10.0, 0.0, last, 10, 100), 0);
     }
 
     #[test]
@@ -1249,6 +1453,28 @@ mod tests {
         assert_eq!(row_start_for(100, 40), 80);
         assert_eq!(row_start_for(100, 1), 100);
         assert_eq!(row_start_for(100, 0), 100); // degenerate bpr is a no-op
+    }
+
+    #[test]
+    fn first_row_centred_puts_the_anchor_in_the_middle() {
+        // 10 rows of 16 bytes: half a screen is 5 rows = 80 bytes.
+        assert_eq!(first_row_centred(800, 16, 10), 720);
+        // The anchor byte lands on row 5 of the 10 shown.
+        assert_eq!((800 - first_row_centred(800, 16, 10)) / 16, 5);
+        // Near the start of the file it saturates so row 0 stays reachable.
+        assert_eq!(first_row_centred(0, 16, 10), 0);
+        assert_eq!(first_row_centred(50, 16, 10), 0);
+        // Two panels showing very different amounts of data start at very
+        // different rows for the same anchor — which is exactly why they align
+        // on their middle line and not their top.
+        let hex_first = first_row_centred(8000, 16, 10); // 160 bytes visible
+        let zoom_first = first_row_centred(8000, 80, 100); // 8000 bytes visible
+        assert_eq!(hex_first, 7920);
+        assert_eq!(zoom_first, 4000);
+        // ...yet the anchor sits at the centre of both.
+        assert_eq!(hex_first + 5 * 16, 8000);
+        assert_eq!(zoom_first + 50 * 80, 8000);
+        assert_eq!(first_row_centred(100, 0, 10), 100); // degenerate bpr
     }
 
     #[test]

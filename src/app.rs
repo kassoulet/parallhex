@@ -157,11 +157,16 @@ pub struct ParallHexApp {
     pub pixels_bounds: Bounds<Pixels>,
     pub overview_bounds: Bounds<Pixels>,
     pub strip_bounds: Bounds<Pixels>,
+    pub scrollbar_bounds: Bounds<Pixels>,
 
-    // Visible fraction of the file in the central view, for the overview
-    // markers.
+    // Each panel's currently visible byte range, recorded in its prepaint. A
+    // panel draws the *next* panel's range as a band, so the overview shows
+    // where the zoom column is looking and the zoom column shows where the hex
+    // column is (SPECS §4.1).
+    pub zoom_view: Range<usize>,
+    pub hex_view: Range<usize>,
+    // Anchor as a fraction of the file, for the status bar percentage.
     pub view_frac: f32,
-    pub view_frac_h: f32,
     pub view_height: f32,
 
     // Selection & hover state (shared by all panes).
@@ -176,6 +181,8 @@ pub struct ParallHexApp {
     pub pixels_dragging: bool,
     pub last_pixels_y: Option<f32>,
     pub overview_dragging: bool,
+    // True while the hex column's scrollbar thumb is being dragged.
+    pub scrollbar_dragging: bool,
 
     // Offset under the pointer while hovering the overview previews
     // (top-bar strip / left overview).
@@ -210,10 +217,11 @@ pub struct ParallHexApp {
 
     // Colormap selector dropdown in the pixels-column header.
     pub open_colormap_menu: Option<Panel>,
-    // True while a mouse-down that began on the dropdown toggle is in
-    // flight, so the root's outside-click handler doesn't immediately close
-    // the menu that the toggle's click is about to open or toggle closed.
-    pub colormap_toggle_down: bool,
+    // True while a mouse-down that landed anywhere inside a colormap picker is
+    // in flight, so the root's outside-click handler doesn't close the menu on
+    // mouse-*down* — which would destroy the option pill before its click
+    // completes, making the picker look dead.
+    pub colormap_click_inside: bool,
 
     pub mono_family: SharedString,
     pub message: Option<String>,
@@ -255,8 +263,10 @@ impl ParallHexApp {
             pixels_bounds: Bounds::default(),
             overview_bounds: Bounds::default(),
             strip_bounds: Bounds::default(),
+            scrollbar_bounds: Bounds::default(),
+            zoom_view: 0..0,
+            hex_view: 0..0,
             view_frac: 0.0,
-            view_frac_h: 1.0,
             view_height: 600.0,
             hovered_offset: None,
             selected_offset: None,
@@ -267,6 +277,7 @@ impl ParallHexApp {
             pixels_dragging: false,
             last_pixels_y: None,
             overview_dragging: false,
+            scrollbar_dragging: false,
             overview_hover_offset: None,
             show_jump_dialog: false,
             jump_error: None,
@@ -284,7 +295,7 @@ impl ParallHexApp {
             entropy_slider_bounds: Bounds::default(),
             dragging_slider: None,
             open_colormap_menu: None,
-            colormap_toggle_down: false,
+            colormap_click_inside: false,
             mono_family,
             message: None,
             focus_handle,
@@ -338,10 +349,42 @@ impl ParallHexApp {
         }
     }
 
-    /// Row height of the zoom column: rows are flush, so it is the zoom itself.
-    fn zoom_row_h(&self) -> f32 {
+    /// Recompute the zoom column's layout from its measured canvas: how many
+    /// bytes fit per row at the target block size, and which byte range that
+    /// makes visible (the overview draws this as its band).
+    fn measure_zoom(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        self.pixels_bounds = bounds;
+        // Redistribute the bytes so a row spans the panel exactly: as many
+        // target-sized blocks as fit, then widened to fill the width.
+        let w = bounds.size.width.to_f64() as f32;
+        let bpr = panes::zoom_bytes_per_row(w, self.zoom_target());
+        let changed = bpr != self.zoom_bpr;
+        self.zoom_bpr = bpr;
+        let block = panes::zoom_block_w(w, bpr);
+        let rows = panes::visible_rows(bounds.size.height.to_f64() as f32, block);
+        let first = panes::first_row_centred(self.scroll_offset, bpr, rows);
+        self.zoom_view = first..(first + rows * bpr).min(self.file_size);
+        if changed {
+            // The paint closure captured the old row length; ask for a frame
+            // with the new one.
+            cx.notify();
+        }
+    }
+
+    /// The zoom column's *target* block size, as set by the slider.
+    fn zoom_target(&self) -> f32 {
         self.pixel_zoom
             .clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX)
+    }
+
+    /// Actual size of one byte's block. The bytes are redistributed across the
+    /// panel so a row spans its full width, so this is the target widened to
+    /// divide the width exactly. Blocks are square, so it is the row height too.
+    fn zoom_row_h(&self) -> f32 {
+        panes::zoom_block_w(
+            self.pixels_bounds.size.width.to_f64() as f32,
+            self.zoom_bpr.max(1),
+        )
     }
 
     /// Clamp the shared anchor to the hex column's last row (SPECS §4.2).
@@ -782,12 +825,7 @@ impl ParallHexApp {
         let font = font(self.mono_family.clone());
         let char_w = panes::hex_char_width(window, &font, px(panes::HEX_FONT_SIZE));
         let geo = panes::RowGeo::new(char_w, bpr);
-        panes::hex_offset_at(
-            local,
-            &geo,
-            panes::row_start_for(self.scroll_offset, bpr),
-            self.file_size,
-        )
+        panes::hex_offset_at(local, &geo, self.hex_view.start, self.file_size)
     }
 
     fn on_hex_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window) {
@@ -882,7 +920,7 @@ impl ParallHexApp {
         panes::zoom_offset_at(
             local,
             bpr,
-            panes::row_start_for(self.scroll_offset, bpr),
+            self.zoom_view.start,
             self.zoom_row_h(),
             self.file_size,
         )
@@ -1049,6 +1087,78 @@ impl ParallHexApp {
         self.hovered_offset = Some(off);
     }
 
+    // ----- hex column scrollbar -----
+
+    /// Move the anchor to the position a pointer at `pos` selects on the hex
+    /// column's scrollbar.
+    fn on_scrollbar_drag(&mut self, pos: Point<Pixels>) {
+        let track = self.scrollbar_bounds;
+        let track_h = track.size.height.to_f64() as f32;
+        if track_h <= 0.0 {
+            return;
+        }
+        let y = (pos.y - track.top()).to_f64() as f32;
+        let visible = self.hex_view.len().max(1);
+        let last = panes::max_anchor(self.file_size, self.hex_bpr.max(8));
+        self.scroll_offset = panes::scrollbar_anchor_at(y, track_h, last, visible, self.file_size);
+        self.clamp_anchor();
+    }
+
+    /// The hex column's scrollbar: the whole file as a track, the visible rows
+    /// as a thumb. The hex column is the scroll reference, so this drives the
+    /// shared anchor and the other panels follow.
+    fn hex_scrollbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let anchor = self.scroll_offset;
+        let visible = self.hex_view.len();
+        let len = self.file_size;
+        let last = panes::max_anchor(len, self.hex_bpr.max(8));
+        div()
+            .w(px(panes::SCROLLBAR_W))
+            .h_full()
+            .flex_shrink_0()
+            .cursor(CursorStyle::Arrow)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    this.scrollbar_dragging = true;
+                    this.on_scrollbar_drag(ev.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                if this.scrollbar_dragging && ev.dragging() {
+                    this.on_scrollbar_drag(ev.position);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                    this.scrollbar_dragging = false;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                    this.scrollbar_dragging = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        entity.update(cx, |this, _| this.scrollbar_bounds = bounds);
+                    },
+                    move |bounds, (), window, _cx| {
+                        panes::paint_scrollbar(window, bounds, anchor, last, visible, len);
+                    },
+                )
+                .size_full(),
+            )
+    }
+
     // ----- column divider drag -----
 
     /// Begin dragging a column divider: remember the pointer x and the width
@@ -1095,6 +1205,33 @@ impl ParallHexApp {
     }
 
     // ----- bottom status bar -----
+
+    /// The central area: the no-file placeholder, or the three columns with
+    /// their drag dividers. It must be a dedicated child of the column root —
+    /// mutating the root itself with `.when(...).flex_row()` would flatten the
+    /// columns next to the top and status bars.
+    fn central_area(&mut self, cx: &mut Context<Self>, no_file: bool) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_h_0()
+            .when(no_file, |d| {
+                d.flex().items_center().justify_center().child(
+                    div()
+                        .text_color(rgb(0x565f89))
+                        .child("No file loaded.\n\nOpen a binary file to explore its bytes."),
+                )
+            })
+            .when(!no_file, |d| {
+                d.flex()
+                    .flex_row()
+                    .min_h_0()
+                    .child(self.overview_column(cx))
+                    .child(Self::column_divider(cx, DividerKind::OverviewZoom))
+                    .child(self.pixels_column(cx))
+                    .child(Self::column_divider(cx, DividerKind::ZoomHex))
+                    .child(self.hex_column(cx))
+            })
+    }
 
     /// Bottom status bar: the live offset/byte/entropy readout, selection
     /// and scroll summaries, the zoom state, the jump preview while typing
@@ -1182,7 +1319,7 @@ impl ParallHexApp {
         }
         let bpr = self.hex_bpr.max(8);
         let total_rows = self.file_size.div_ceil(bpr);
-        let first = panes::row_start_for(self.scroll_offset, bpr) / bpr;
+        let first = self.hex_view.start / bpr;
         let vis = panes::visible_rows(self.view_height, panes::BLOCK_H);
         let last = (first + vis).min(total_rows);
         let pct = (self.view_frac * 100.0).round() as u32;
@@ -1334,8 +1471,8 @@ impl ParallHexApp {
         let entity = cx.entity();
         let strip_image = self.strip_image.clone();
         let file_size = self.file_size;
-        let view_frac = self.view_frac;
-        let view_frac_h = self.view_frac_h;
+        // The strip is a second whole-file map, so it marks the same range.
+        let mark = self.zoom_view.clone();
         div()
             // `on_hover` below needs a stateful element, hence the id.
             .id("preview-strip")
@@ -1388,8 +1525,7 @@ impl ParallHexApp {
                                 bounds,
                                 img,
                                 file_size,
-                                view_frac,
-                                view_frac_h,
+                                (!mark.is_empty()).then_some(&mark),
                             );
                         } else {
                             window.paint_quad(quad_dark(bounds));
@@ -1455,8 +1591,8 @@ impl ParallHexApp {
         let entropies = self.entropies.clone();
         let entropy_window = self.entropy_window;
         let file_size = self.file_size;
-        let view_frac = self.view_frac;
-        let view_frac_h = self.view_frac_h;
+        // The overview marks the range the zoom column is showing.
+        let mark = self.zoom_view.clone();
         let overview_colormap = self.overview_colormap;
 
         let overview_width = self.overview_width;
@@ -1566,8 +1702,7 @@ impl ParallHexApp {
                                             bounds,
                                             &img,
                                             file_size,
-                                            view_frac,
-                                            view_frac_h,
+                                            (!mark.is_empty()).then_some(&mark),
                                         ),
                                         None => {
                                             window.paint_quad(quad_dark(bounds));
@@ -1590,8 +1725,10 @@ impl ParallHexApp {
         let entropy_window = self.entropy_window;
         let bpr = self.zoom_bpr.max(1);
         let len = self.file_size;
-        let first_row_start = panes::row_start_for(self.scroll_offset, bpr);
-        let pixel_zoom = self.zoom_row_h();
+        let first_row_start = self.zoom_view.start;
+        let block = self.zoom_row_h();
+        // The zoom column marks the range the hex column is showing.
+        let mark = self.hex_view.clone();
         let hovered = self.hovered_offset;
         let sel = self.selection_range.clone();
         let colormap = self.zoom_colormap;
@@ -1646,9 +1783,7 @@ impl ParallHexApp {
                     .child(
                         canvas(
                             move |bounds, _window, cx| {
-                                entity.update(cx, |this, _| {
-                                    this.pixels_bounds = bounds;
-                                });
+                                entity.update(cx, |this, cx| this.measure_zoom(bounds, cx));
                             },
                             move |bounds, (), window, _cx| {
                                 if let Some(d) = &data {
@@ -1658,12 +1793,13 @@ impl ParallHexApp {
                                         d,
                                         bpr,
                                         first_row_start,
-                                        pixel_zoom,
+                                        block,
                                         hovered,
                                         sel.as_ref(),
                                         &entropies,
                                         entropy_window,
                                         colormap,
+                                        (!mark.is_empty()).then_some(&mark),
                                     );
                                 }
                             },
@@ -1714,11 +1850,6 @@ impl ParallHexApp {
             .cursor_pointer()
             .active(|s| s.opacity(0.7))
             .hover(|s| s.bg(rgb(0x3b4261)))
-            .on_any_mouse_down(
-                cx.listener(move |this, _: &MouseDownEvent, _: &mut Window, _cx| {
-                    this.colormap_toggle_down = true;
-                }),
-            )
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, _: &mut Window, cx| {
                     this.open_colormap_menu = if this.open_colormap_menu == Some(panel) {
@@ -1737,6 +1868,13 @@ impl ParallHexApp {
             .flex()
             .items_center()
             .gap_1()
+            // Any press inside the picker (toggle or option pill) counts as
+            // "inside", so the root's outside-click handler leaves it alone.
+            .on_any_mouse_down(
+                cx.listener(move |this, _: &MouseDownEvent, _: &mut Window, _cx| {
+                    this.colormap_click_inside = true;
+                }),
+            )
             .child(toggle)
             .when(open, |d| {
                 d.children(Colormap::ALL.into_iter().enumerate().map(|(idx, cm)| {
@@ -1774,7 +1912,9 @@ impl ParallHexApp {
         let data = self.mmap.clone();
         let bpr = self.hex_bpr.max(8);
         let len = self.file_size;
-        let first_row_start = panes::row_start_for(self.scroll_offset, bpr);
+        // The anchor is the byte in the middle of the viewport, so panels align
+        // on their centre line (SPECS §4.2); the prepaint recorded the row.
+        let first_row_start = self.hex_view.start;
         let hovered = self.hovered_offset;
         let sel = self.selection_range.clone();
         let font = panes::mono_font(&self.mono_family);
@@ -1803,117 +1943,137 @@ impl ParallHexApp {
                 div()
                     .flex_1()
                     .min_h_0()
-                    // `on_any_mouse_down` covers left, middle and right (the
-                    // handler dispatches on the button itself); adding a
-                    // separate left binding would run it twice per click.
-                    .on_any_mouse_down(cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                        this.on_hex_mouse_down(ev, window);
-                        if let Some(copy) = this.pending_copy.take() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy));
-                        }
-                        cx.notify();
-                    }))
-                    .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
-                        this.on_hex_mouse_move(ev, window);
-                        cx.notify();
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                            this.on_hex_mouse_up(ev);
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                            this.on_hex_mouse_up(ev);
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Middle,
-                        cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                            this.on_hex_mouse_up(ev);
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Middle,
-                        cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                            this.on_hex_mouse_up(ev);
-                            cx.notify();
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
-                        this.on_hex_scroll(ev, cx);
-                        cx.notify();
-                    }))
+                    .flex()
+                    .flex_row()
                     .child(
-                        canvas(
-                            move |bounds, window, cx| {
-                                let char_w = panes::hex_char_width(
-                                    window,
-                                    &hex_font,
-                                    px(panes::HEX_FONT_SIZE),
-                                );
-                                entity.update(cx, |this, cx| {
-                                    this.hex_bounds = bounds;
-                                    this.view_height = bounds.size.height.to_f64() as f32;
-                                    // Content fits the panel: as many whole
-                                    // 8-byte groups as the width allows.
-                                    this.hex_bpr = panes::hex_bytes_per_row(
-                                        bounds.size.width.to_f64() as f32,
-                                        char_w,
-                                    );
-                                    let bpr = this.hex_bpr.max(8);
-                                    let before = this.scroll_offset;
-                                    // Centre a pending jump on this column, the
-                                    // scroll reference for the whole window.
-                                    if let Some(off) = this.scroll_to_offset.take() {
-                                        let rows =
-                                            panes::visible_rows(this.view_height, panes::BLOCK_H);
-                                        this.scroll_offset = off.saturating_sub(rows / 2 * bpr);
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            // `on_any_mouse_down` covers left, middle and right (the
+                            // handler dispatches on the button itself); adding a
+                            // separate left binding would run it twice per click.
+                            .on_any_mouse_down(cx.listener(
+                                move |this, ev: &MouseDownEvent, window, cx| {
+                                    this.on_hex_mouse_down(ev, window);
+                                    if let Some(copy) = this.pending_copy.take() {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(copy));
                                     }
-                                    this.clamp_anchor();
-                                    if this.file_size > 0 {
-                                        let visible =
-                                            panes::visible_rows(this.view_height, panes::BLOCK_H)
-                                                * bpr;
-                                        let len = this.file_size as f32;
-                                        this.view_frac =
-                                            (this.scroll_offset as f32 / len).clamp(0.0, 1.0);
-                                        this.view_frac_h = (visible as f32 / len).clamp(0.0, 1.0);
-                                    }
-                                    if this.scroll_offset != before {
-                                        cx.notify();
-                                    }
-                                });
-                            },
-                            move |bounds, (), window, cx| {
-                                if let Some(d) = &data {
-                                    panes::paint_hex(
-                                        window,
-                                        cx,
-                                        bounds,
-                                        d,
-                                        &font,
-                                        bpr,
-                                        first_row_start,
-                                        hovered,
-                                        sel.as_ref(),
-                                        &hex_entropies,
-                                        entropy_window,
-                                        hex_colormap,
-                                    );
-                                } else {
-                                    window.paint_quad(quad_dark(bounds));
-                                }
-                            },
-                        )
-                        .size_full(),
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_move(cx.listener(
+                                move |this, ev: &MouseMoveEvent, window, cx| {
+                                    this.on_hex_mouse_move(ev, window);
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
+                                    this.on_hex_mouse_up(ev);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
+                                    this.on_hex_mouse_up(ev);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Middle,
+                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
+                                    this.on_hex_mouse_up(ev);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Middle,
+                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
+                                    this.on_hex_mouse_up(ev);
+                                    cx.notify();
+                                }),
+                            )
+                            .on_scroll_wheel(cx.listener(
+                                move |this, ev: &ScrollWheelEvent, _, cx| {
+                                    this.on_hex_scroll(ev, cx);
+                                    cx.notify();
+                                },
+                            ))
+                            .child(
+                                canvas(
+                                    move |bounds, window, cx| {
+                                        let char_w = panes::hex_char_width(
+                                            window,
+                                            &hex_font,
+                                            px(panes::HEX_FONT_SIZE),
+                                        );
+                                        entity.update(cx, |this, cx| {
+                                            this.hex_bounds = bounds;
+                                            this.view_height = bounds.size.height.to_f64() as f32;
+                                            // Content fits the panel: as many whole
+                                            // 8-byte groups as the width allows.
+                                            let new_bpr = panes::hex_bytes_per_row(
+                                                bounds.size.width.to_f64() as f32,
+                                                char_w,
+                                            );
+                                            let bpr_changed = new_bpr != this.hex_bpr;
+                                            this.hex_bpr = new_bpr;
+                                            let bpr = this.hex_bpr.max(8);
+                                            let before = this.scroll_offset;
+                                            // The anchor *is* the centre, so a jump is just an assignment.
+                                            if let Some(off) = this.scroll_to_offset.take() {
+                                                this.scroll_offset = off;
+                                            }
+                                            this.clamp_anchor();
+                                            let rows = panes::visible_rows(
+                                                this.view_height,
+                                                panes::BLOCK_H,
+                                            );
+                                            let first = panes::first_row_centred(
+                                                this.scroll_offset,
+                                                bpr,
+                                                rows,
+                                            );
+                                            this.hex_view =
+                                                first..(first + rows * bpr).min(this.file_size);
+                                            if this.file_size > 0 {
+                                                this.view_frac = (this.scroll_offset as f32
+                                                    / this.file_size as f32)
+                                                    .clamp(0.0, 1.0);
+                                            }
+                                            if this.scroll_offset != before || bpr_changed {
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                    move |bounds, (), window, cx| {
+                                        if let Some(d) = &data {
+                                            panes::paint_hex(
+                                                window,
+                                                cx,
+                                                bounds,
+                                                d,
+                                                &font,
+                                                bpr,
+                                                first_row_start,
+                                                hovered,
+                                                sel.as_ref(),
+                                                &hex_entropies,
+                                                entropy_window,
+                                                hex_colormap,
+                                            );
+                                        } else {
+                                            window.paint_quad(quad_dark(bounds));
+                                        }
+                                    },
+                                )
+                                .size_full(),
+                            )
+                            .size_full(),
                     )
-                    .size_full(),
+                    .child(self.hex_scrollbar(cx)),
             )
     }
 
@@ -2177,9 +2337,9 @@ impl Render for ParallHexApp {
                     // Clicking anywhere outside the dropdown toggle collapses the
                     // colormap menu. The toggle flags itself on mouse-down so its
                     // own click (handled next) can toggle the menu instead.
-                    let on_toggle = this.colormap_toggle_down;
-                    this.colormap_toggle_down = false;
-                    if this.open_colormap_menu.is_some() && !on_toggle {
+                    let inside = this.colormap_click_inside;
+                    this.colormap_click_inside = false;
+                    if this.open_colormap_menu.is_some() && !inside {
                         this.open_colormap_menu = None;
                         cx.notify();
                     }
@@ -2205,32 +2365,7 @@ impl Render for ParallHexApp {
                 }
             }))
             .child(self.top_bar(cx, client_side))
-            // The central area (no-file placeholder or the three-column
-            // row) must be a dedicated child of the column root: mutating
-            // the root itself with `.when(...).flex_row()` would flatten
-            // the columns next to the top/status bars.
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .when(no_file, |d| {
-                        d.flex().items_center().justify_center().child(
-                            div().text_color(rgb(0x565f89)).child(
-                                "No file loaded.\n\nOpen a binary file to explore its bytes.",
-                            ),
-                        )
-                    })
-                    .when(!no_file, |d| {
-                        d.flex()
-                            .flex_row()
-                            .min_h_0()
-                            .child(self.overview_column(cx))
-                            .child(Self::column_divider(cx, DividerKind::OverviewZoom))
-                            .child(self.pixels_column(cx))
-                            .child(Self::column_divider(cx, DividerKind::ZoomHex))
-                            .child(self.hex_column(cx))
-                    }),
-            )
+            .child(self.central_area(cx, no_file))
             .child(self.status_bar(cx))
             .when(show_jump, |d| d.child(self.jump_dialog(cx)))
             // Last children so they sit above everything and win hit-testing
