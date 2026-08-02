@@ -1,40 +1,32 @@
-Here is a complete, production-ready specification designed to be fed directly into an AI coding agent (e.g., Claude Code, Cursor, Aider) to build a native `binvis.io`-inspired binary viewer in Rust using `egui`.
+# Architecture Specification: `parallhex` — Three-Column Binary Explorer
 
----
+A native `binvis.io`-inspired binary viewer in Rust using `gpui`. The file is
+memory-mapped and presented in **one wide window** as three columns that show
+the same region of the file at three levels of detail: a whole-file
+**overview**, a zoomable per-byte **zoom view**, and a **hex/ASCII** dump.
 
-# Architecture Specification: `binvis-rs` — Wide Hex-Viewer Edition
+Each column derives its own row length from its own width, so nothing ever
+scrolls horizontally, and each column can be colored independently.
 
-## 1. Project Overview & Dependencies
-
-Build a cross-platform desktop application in Rust using `eframe`/`egui` for interactive exploration of raw binary files. The app presents **one wide window** styled like a hex viewer: the file is laid out as a linear (row-major) sequence of rows, and four **synchronized panes** render the same byte window in four different ways:
-
-1. **Hex view** — classic hex dump. Each byte cell is drawn with its **`Class` color-mode palette as the background** (see §3.C) and a high-contrast foreground for the two hex digits.
-2. **ASCII view** — printable representation of the same bytes (`'.'` for non-printable), rendered inline with the hex cells per row.
-3. **Direct greyscale** — one pixel per byte, `Color32::from_gray(byte)` (byte value → brightness).
-4. **Entropy** — one pixel per byte, colored by the Shannon entropy of the sliding window centered on that byte (see §3.B).
-
-The **Hilbert curve layout is explicitly removed**: only linear scan data is displayed. There is no `LayoutMode` enum; every view is row-major with a configurable bytes-per-row width.
-
-### `Cargo.toml`
+## 1. Dependencies
 
 ```toml
 [package]
-name = "binvis-rs"
+name = "parallhex"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-eframe = "0.28" # Or latest stable
-egui = "0.28"
-egui_extras = "0.28"
-memmap2 = "0.9"
-rfd = "0.14" # Native file dialogs
-rayon = "1.10" # Parallel processing for entropy computation
+gpui = "0.2.2"         # UI framework (retained-mode, GPU-accelerated)
+image = "0.25"         # RGBA frames for the overview / strip thumbnails
+memmap2 = "0.9"        # Zero-copy mapping of multi-gigabyte files
+rfd = "0.14"           # Native file dialogs
+rayon = "1.10"         # Parallel entropy computation
 ```
 
----
+There is no Hilbert-curve layout: every view is row-major.
 
-## 2. Application State & Data Architecture
+## 2. Application State
 
 ```rust
 pub struct AppState {
@@ -42,188 +34,266 @@ pub struct AppState {
     pub mmap: Option<Arc<Mmap>>,
     pub file_size: usize,
 
-    // Hex-viewer parameters
-    pub bytes_per_row: usize,   // Bytes per row: 16, 32, or 64 (fills the wide window)
-    pub entropy_window: usize,  // Sliding entropy window size (e.g., 256)
+    // Shared byte anchor: the offset the panels are scrolled to (§4.2).
+    pub scroll_offset: usize,
 
-    // Shared scroll & selection state (drives all four panes)
-    pub scroll_row: f32,                    // Vertical scroll position, in rows
+    // Per-panel appearance.
+    pub overview_colormap: Colormap,
+    pub zoom_colormap: Colormap,
+    pub hex_colormap: Colormap,
+    pub pixel_zoom: f32,        // zoom view only, 1..=24 px per byte
+    pub entropy_window: usize,  // 16..=4096, default 256
+
+    // Shared selection state, always in byte offsets.
     pub hovered_offset: Option<usize>,
     pub selected_offset: Option<usize>,
     pub selection_range: Option<Range<usize>>,
-    pub drag_start: Option<usize>,
 }
 ```
 
+The snippet covers the model only; the view also holds layout state (the two
+resizable column widths, per-panel canvas bounds for hit-testing, window
+geometry) and transient interaction state (drag/menu/dialog flags).
+
 Notes:
 
-- **No `LayoutMode`.** Hilbert is gone; data is always displayed linearly, `bytes_per_row` bytes per row.
-- There is no color-mode switcher: the four panes are shown simultaneously and each has a fixed mapping (hex = class palette backgrounds, greyscale = byte value, entropy = entropy gradient).
-- `scroll_row` is expressed in *rows* so that the hex/ASCII strip, greyscale map, and entropy map always show the same byte range (they are scrolled together by one shared virtualized scroll area — see §4).
+- **No `bytes_per_row` field.** Each panel computes its own row length from its
+  own width every frame (§3.A). Nothing is persisted about it.
+- **No `hex_zoom` field.** The hex text size is fixed; only the zoom view zooms.
+- The scroll position is a **byte offset**, not a row index, because the panels
+  no longer share a row length.
 
----
+## 3. Core Algorithms
 
-## 3. Core Algorithms & Math Specifications
+### A. Row length per panel
 
-### A. Linear Row Layout
+Every panel lays bytes out row-major, but each computes its own row length from
+its own width. All three are pure functions and unit-tested.
 
-Given a file of `L` bytes and `B = bytes_per_row` bytes per row:
+**Hex/ASCII column.** A row of `n` bytes occupies, in monospace glyph widths
+`char_w` plus the gutter padding `ADDR_X`:
 
-- Total rows: `R = ceil(L / B)`.
-- Byte index `d` lives in row `row = d / B`, column `col = d % B`.
-- Row `r` spans offsets `[r*B, min((r+1)*B, L))`.
+```
+width_for(n) = ADDR_X + char_w * (10 + 3n + (n-1)/8 + 2 + n)
+                                  ^^   ^^^  ^^^^^^^   ^   ^
+                                  |    |    |         |   ASCII glyphs
+                                  |    |    |         gap before ASCII
+                                  |    |    extra space after every 8 bytes
+                                  |    "HH " per byte
+                                  "%08X" + two spaces
+```
 
-This mapping is used identically by all four panes, which is what keeps them synchronized.
+`hex_bytes_per_row` returns the largest multiple of 8 with
+`width_for(n) <= panel_width`, floored at 8.
 
-### B. Shannon Entropy Calculation
+**Zoom view.** `zoom_bytes_per_row = max(1, floor(panel_width / pixel_zoom))`.
 
-For a byte window of length `W` (e.g., `W = 256`):
+**Overview.** The whole file is fitted to the panel as a `w × h` cell grid
+(`w`, `h` clamped to the panel size); cell `k` covers
+`[k*len/cells, (k+1)*len/cells)`.
 
-$$H = -\sum_{i=0}^{255} p_i \log_2(p_i) \quad \text{where } p_i = \frac{\text{count}(i)}{W}$$
+### B. Shannon entropy
 
-Standardized output range: `[0.0, 8.0]` bits per byte.
+For a window of `W` bytes:
 
-**Per-pixel entropy (sliding window):** for byte at offset `d`, use the entropy of the `W`-byte block that contains `d` — i.e., block `floor(d / W)` over `[floor(d/W)*W, floor(d/W)*W + W)`, clamped at file boundaries (matching the classic hex-viewer convention where each block is labeled by its first byte). To keep this fast for large files:
+$$H = -\sum_{i=0}^{255} p_i \log_2(p_i) \quad p_i = \frac{\text{count}(i)}{W}$$
 
-- Compute block entropies over contiguous `W`-byte blocks in parallel with `rayon`, then index per pixel (`entropies[d / W]`).
-- Optionally smooth between adjacent blocks by linearly interpolating the two block entropies around `d`; this is a visual nicety, not a requirement.
+Output range `[0.0, 8.0]` bits per byte. Entropy is computed once per file over
+contiguous `W`-byte blocks, in parallel with `rayon`, and cached. Per-byte
+entropy is not stored: it is interpolated between the two blocks around the
+offset on demand.
 
-### C. Color Mapping Rules
+### C. Color mapping
 
-1. **Hex/ASCII view — Class palette (cell backgrounds):**
-   Each byte cell's **background** is colored by byte class:
+A single `Colormap` enum is selected independently per panel:
 
-   * `0x00` (Null): `#000000` (Black)
-   * `0x20..=0x7E` (Printable ASCII): `#1f77b4` (Blue)
-   * `0x01..=0x1F`, `0x7F` (Control characters): `#17becf` (Cyan)
-   * `0x80..=0xFE` (High/Non-ASCII): `#ff7f0e` (Orange)
-   * `0xFF` (Fill/Padded): `#ffffff` (White)
+| Mode | Meaning |
+|---|---|
+| `None` | No per-byte color at all. |
+| `Value` | Byte value → greyscale brightness (`0x00` black, `0xFF` white). |
+| `Class` | Byte class palette (below). |
+| `Entropy` | Sliding-window entropy → gradient (below). |
 
-   Foreground text is chosen for contrast against the class background (white text on dark cells, black text on `0xFF` white cells), so hex digits and ASCII glyphs stay legible.
+**Class palette:** `0x00` black · `0x01..=0x1F`, `0x7F` cyan `#17becf` ·
+`0x20..=0x7E` blue `#1f77b4` · `0x80..=0xFE` orange `#ff7f0e` · `0xFF` white.
 
-2. **Greyscale view — direct byte value:**
-   * `Color32::from_gray(byte)` — byte value maps linearly to brightness (`0x00` → black, `0xFF` → white).
+**Entropy gradient:** `0.0` deep purple → `4.0` green/cyan → `8.0` red/yellow.
 
-3. **Entropy view — gradient:**
-   Map entropy `H ∈ [0.0, 8.0]` to a gradient:
-   * `0.0` → Deep Purple/Black (low entropy / uniform)
-   * `4.0` → Green/Cyan (structured data / text)
-   * `8.0` → Bright Red/Yellow (high entropy / compressed / encrypted)
+In the hex/ASCII column the mode colors each cell's **background**, and the
+glyph color is chosen for contrast against it (light text on dark cells, dark
+text on light ones). Under `None` no background is drawn and glyphs use the
+default foreground.
 
----
+`None` is a legitimate choice for the pixel panels too, and it renders them
+empty: the overview, the zoom view and the top-bar strip paint only their panel
+background. They stay interactive — the viewport band, hover preview and
+click-to-navigate all still work — so `None` reads as "mute this panel" rather
+than "disable it". Selection and hover highlights are drawn in every mode.
 
-## 4. UI Layout Specs (`gpui`)
+## 4. UI Layout
 
-Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) with a top info bar, three synchronized columns, and a bottom status bar:
+Wide window, default `1600×900`, minimum `1000×600`.
 
 ```
 +-----------------------------------------------------------------------+
-|  Top Info Bar: Title · File name/size · Controls                      |
-|  (Open File, Bytes/Row, Entropy Win, Reset view, Jump, Reset all)     |
-|  + horizontal preview strip (right)                                   |
-+------------------------+------------------------+---------------------+
-|  Overview column       |  Pixels column         |  Hex column         |
-|  (left, resizable)     |  (middle, resizable)   |  (right, central)   |
-|  vertical whole-file   |  per-byte greyscale +  |  class-colored hex  |
-|  overview — greyscale  |  entropy bands         |  + ASCII cells      |
-|  / entropy per cell,   |  drag to pan,          |  drag to select,    |
-|  viewport region,      |  Ctrl+wheel zoom       |  Ctrl+wheel zoom    |
-|  click/drag navigates  |                       |                     |
-+------------------------+------------------------+---------------------+
-|  Status Bar: offset/byte/entropy readout · selection · zoom · rows ·  |
-|  jump preview · transient messages                                    |
+|  ParallHex · file/size · [whole-file strip] · – □ ✕                    |
+|  (Open File…, Entropy win, Reset view, Jump, Reset columns/all)        |
++------------------+---------------------+------------------------------+
+|  Overview        |  Zoom view          |  Hex / ASCII                 |
+|  Map: Entropy ▾  |  Map: Value ▾       |  Map: Class ▾                |
+|  whole file      |  1 px  [──●──] Reset|  0x0000 – 0x047F             |
+|                  |                     |                              |
+|  one cell per    |  one band per byte  |  ADDR  HH HH … · ASCII       |
+|  N bytes,        |  at pixel_zoom,     |  fixed text size, rows       |
+|  viewport band,  |  rows flush,        |  fit the width, selection    |
+|  click/drag      |  drag to pan        |  + hover highlight           |
+|  navigates       |                     |                              |
++------------------+---------------------+------------------------------+
+|  Status: offset · byte · H=… · selection · zoom · rows · messages      |
 +-----------------------------------------------------------------------+
 ```
 
-Each column has a header showing its **visible byte range** (e.g. `0x00000000 – 0x000000FF`; the overview column always shows the whole-file range) and — for the zoomable pixels/hex columns — a live zoom readout (`×1.00`, `4 px`), a **zoom slider** and a **Reset zoom** button that restores that column's default zoom.
+Every column header shows the panel's **visible byte range** (the overview
+always shows the whole file) and a **`Map: … ▾` dropdown** selecting that
+panel's colormap. Only the zoom view's header carries zoom controls: a `N px`
+readout, a slider, and **Reset**.
 
-### Three Synchronized Columns
+Default colormaps: overview `Entropy`, zoom view `Value`, hex `Class`.
 
-All three columns share one scroll position (`scroll_rows`, in rows). The **hex column is the master** (it owns the scrollbar); the pixels and overview columns follow it, and dragging any column pans it: primary drag pans the pixels and overview columns, while the hex column pans with a **middle-mouse drag** or a **Ctrl/Alt + primary drag** (its plain primary drag selects bytes instead). A `Ctrl+wheel` / pinch over a column adjusts that column's zoom (hex text/row size ×0.5–4, pixel size 1–24 px); each header also has a zoom slider.
+### 4.1 Columns
 
-1. **Hex column (right, central panel):**
-   * Rows of `bytes_per_row` cells. Each cell shows `"%02X"` in a monospace font, **background filled with the Class palette color** (§3.C.1), high-contrast foreground text.
-   * An ASCII column follows the hex cells on each row, showing `printable(b)` per byte (`'.'` for non-printable), same class-colored backgrounds.
-   * Row headers show the starting offset `r*B` in `%08X`.
-   * Selection range is highlighted (semi-transparent overlay across the selected cells); hovered cell gets a bright outline.
-   * Primary click + drag sets `selection_range`; right-click offers **Copy Hex / Copy ASCII / Clear selection**. Middle-mouse or Ctrl/Alt + primary drag pans the column (the same shared-scroll pan gesture as the pixels column).
-   * Zoom scales the **text size** (and thus the cell widths and row height): Ctrl+wheel / `+`/`-` / the header slider all adjust it from ×0.5 to ×4.
+1. **Overview (left, resizable).** The whole file downsampled to one band per
+   cell in its own colormap, regenerated on load, on colormap change and on
+   resize. A translucent band marks the visible region. Hover previews the
+   offset under the cursor; click and drag navigate.
 
-2. **Pixels column (middle):**
-   * One `Color32::from_gray(byte)` pixel per byte on the top half of each row, one entropy-colored pixel (sliding-window entropy §3.B, gradient §3.C.3) on the bottom half.
-   * Renders only the visible rows for `scroll_rows`; drag pans the shared scroll (all columns follow), click selects a byte, hover outlines the byte.
+2. **Zoom view (middle, resizable).** **One** band per byte — a single row of
+   `pixel_zoom`-sized blocks, rows flush with no separator, so the panel reads
+   as a true pixel image. `Ctrl+wheel`, `+`/`-` and the header slider set the
+   zoom (1–24 px), which also changes how many bytes fit per row. Drag pans the
+   shared anchor; click selects a byte; hover outlines it. Positions right of
+   the last byte in a row resolve to no byte.
 
-3. **Overview column (left):** a vertical whole-file view in the same style as the pixels column — each downsampled cell is a greyscale band over an entropy band, with the entire file fitted into the panel (regenerated on load / resize).
-   * A translucent region marks the currently visible range.
-   * Hover previews the offset under the cursor in the top bar; click / drag jumps the view (centered, selects/hovers the byte).
+3. **Hex/ASCII (right, fills the remaining width).** Rows of `n` byte cells
+   (§3.A) at a fixed text size: `%08X` address gutter, `HH` per byte with an
+   extra space every 8, then the ASCII block (`.` for non-printable). Cell
+   backgrounds follow the panel's colormap. The selection range is tinted and
+   the hovered cell outlined. Primary drag selects; middle-drag or
+   Ctrl/Alt+primary drag pans; right-click copies the selection as hex and
+   Alt+right-click clears it.
 
-4. **Keyboard navigation:** arrow keys move the selection by one byte / one row; PageUp / PageDown move by a page (visible rows); Home / End jump to the file start / end. The view auto-scrolls to keep the selection centered. Page size scales with the hex zoom. `+` / `=` and `-` zoom the column under the pointer (hex row height or pixel size), clamped to its range; the overview has no zoom.
+### 4.2 Scroll model
 
-5. **Jump to offset (Ctrl/Cmd+G):** a centered dialog accepts a hex offset (`0x…` prefix optional, underscores allowed), prefilled with the current selection; Enter or **Jump** navigates to that byte (scrolls, selects, and hovers it), with a live preview of the parsed offset in the top bar. Out-of-range or invalid input shows an error and keeps the dialog open. Also reachable via the **Jump to offset… (Ctrl+G)** button in the top panel.
+All three columns share one **byte anchor**, `scroll_offset`. Each panel paints
+from its own row-aligned start, `scroll_offset - (scroll_offset % bpr_panel)`,
+so the panels stay anchored to the same region of the file even though their
+rows do not line up.
 
-### Command Line
+- **Vertical only.** No panel ever scrolls horizontally; §3.A guarantees rows
+  fit.
+- The wheel scrolls by whole rows *of the panel under the pointer*, converted to
+  bytes.
+- The **hex column is the scroll reference**: it owns the visible height used to
+  clamp the anchor, to size a page, and to center a jump target.
+- The anchor is clamped to `[0, last_hex_row_start]`, where `last_hex_row_start`
+  is the start of the row containing the final byte *in the hex column's* row
+  length. A panel whose rows are longer runs out of file sooner; it simply paints
+  what exists and stops rather than scrolling independently.
 
-* **`parallhex <file>`** — opens the file on startup (optional positional argument; errors are shown in the status bar).
-* **`parallhex --help`** (or `-h`) — prints usage and exits. Unknown `-`-prefixed options print an error and exit instead of being treated as files. `--` ends option parsing, so a file whose name starts with `-` can be opened (e.g. `parallhex -- -foo.bin`).
+### 4.3 Keyboard
 
-### Top Bar (Title + Info + Controls)
+Arrow keys move the selection by one byte / one hex row; PageUp/PageDown by one
+hex page; Home/End jump to the first/last byte. The view auto-scrolls to keep
+the selection centered. `+`/`-` zoom the zoom view when the pointer is over it.
+**Jump to offset (Ctrl/Cmd+G)** opens a centered dialog accepting a hex offset
+(`0x` optional, underscores allowed), prefilled with the current selection, with
+a live preview and an inline error for out-of-range input.
 
-* **Title** `ParallHex`, **file name** and size (`human_size`).
-* **Hovered / selected byte** readout: `0x… · 0x… 'c' · H=…` (live; the overview hover preview takes precedence while hovering it).
-* **Open File…** (and Ctrl/Cmd+O) — `rfd` native dialog.
-* **Bytes/Row** combo: `16 / 32 / 64` (default 32; wider rows fill the wide window).
-* **Entropy window** slider: `16..=4096`, logarithmic (default 256).
-* **Reset view** — jump scroll back to row 0.
-* **Reset columns** (Shift+Ctrl/Cmd+L) — restore the overview and pixels column widths to their defaults.
-* **Reset all settings** — restore defaults for bytes-per-row, the entropy window, both zooms and the panel widths (the config file is written immediately).
-* **Jump to offset… (Ctrl+G)** — open the jump-to-offset dialog (live preview while typing).
-* **Zoom readout** — `hex ×… · px …` (Ctrl+wheel over the hex/pixels columns, or `+`/`=`/`-` with the pointer over a zoomable column, to zoom); each zoomable column header also has a **zoom slider** and a **Reset zoom** button.
-* **Horizontal preview strip** — a whole-file greyscale/entropy strip at the right of the top bar with a viewport band; hover previews the offset, click / drag navigates.
-* Error messages (yellow) are shown here too.
+Accelerators use gpui's portable `secondary-` modifier: **Cmd on macOS, Ctrl
+elsewhere.** Open `secondary-o`, Quit `secondary-q`, Jump `secondary-g`, Reset
+view `secondary-0`, Reset columns `shift-secondary-l`, Copy hex `secondary-c`,
+Copy ASCII `shift-secondary-c`.
 
-The **top info bar** holds the app title, the file name/size and the action controls; the **bottom status bar** holds the live readouts (hovered/selected offset · byte · entropy, selection range, zoom, visible rows + file percentage), the jump-dialog preview and transient messages (open errors, "Settings reset…"). Selection copy actions are available from the hex column's right-click context menu (Copy Hex / Copy ASCII / Clear selection).
+### 4.4 Command line
 
-### Preferences (persisted layout)
+- `parallhex <file>` — open a file on startup; errors appear in the status bar.
+- `parallhex --help` / `-h` — print usage and exit. Unknown `-`-prefixed options
+  are rejected; `--` ends option parsing so dash-prefixed names can be opened.
 
-The following UI settings are saved to a small `key = value` text file in the platform config directory (`$XDG_CONFIG_HOME` on Linux, `$APPDATA` on Windows, `~/Library/Application Support` on macOS — otherwise `~/.config/parallhex/config.txt`) and restored on the next launch:
+### 4.5 Top bar and window chrome
 
-* `bytes_per_row` — bytes-per-row (16 / 32 / 64).
-* `entropy_window` — the entropy window size (16–4096).
-* `hex_zoom`, `pixel_zoom` — the two per-column zooms.
-* `pixel_colormap` — the pixels-column colormap (`greyscale` / `entropy` / `byte_class`), chosen from the header dropdown.
-* `overview_width`, `pixels_width` — the resizable side-panel widths.
-* `window_x`, `window_y`, `window_width`, `window_height` — the last window position and size, restored on launch (a saved position that no longer intersects any connected display falls back to a centered default).
-* `window_maximized` — whether the window was maximized when it last closed; on restore the window opens maximized with the saved `window_*` geometry as its un-maximize size.
+The top bar holds the title, file name and size, the horizontal whole-file
+**strip** (256×1, following the overview's colormap; hover previews an offset,
+click/drag navigates), the window buttons, and the controls: Open File…, the
+logarithmic **entropy-window** slider (16–4096), Reset view, Jump to offset…,
+Reset columns, Reset all settings.
 
-Settings are written a couple of seconds after the last change (and on exit). Window geometry is captured live, so moving/resizing the window persists it the same way. The file tolerates hand-edits: unknown keys, malformed lines and non-finite values are ignored, and out-of-range values are clamped on load.
+Linux compositors need not implement `xdg-decoration` and GNOME's Mutter does
+not, so the app requests **client-side decorations** on Linux and supplies its
+own chrome: the title/file-name area is the drag handle (double-click maximizes,
+right-click opens the window menu), the window buttons minimize / maximize /
+close, and an invisible 6 px border along the edges and corners starts a
+compositor resize. All of it is gated on `Decorations::Client`, so macOS and
+Windows keep native titlebars.
 
----
+### 4.6 Preferences
 
-## 5. Parallel Pipeline Requirements
+A small `key = value` file in the platform config directory
+(`$XDG_CONFIG_HOME`, `$APPDATA`, `~/Library/Application Support`, else
+`~/.config/parallhex/config.txt`), written a couple of seconds after the last
+change and on exit:
 
-* Use `memmap2::Mmap` for zero-copy mapping of multi-gigabyte files.
-* Use `rayon` to compute block entropies in parallel (`par_chunks` over `W`-byte blocks).
-* **Virtualized rendering:** rows are only drawn when inside the visible viewport (compute `first_row..last_row` from the shared scroll offset, exactly like a virtual list). This keeps memory flat and scrolling smooth for arbitrarily large files — no full-file texture is generated.
-* Greyscale and entropy pixels for visible rows can be produced in parallel with `rayon::par_iter` over the visible row range.
+| Key | Meaning |
+|---|---|
+| `entropy_window` | 16–4096 |
+| `pixel_zoom` | zoom view zoom, 1–24 |
+| `overview_colormap`, `zoom_colormap`, `hex_colormap` | `none` / `value` / `class` / `entropy` |
+| `overview_width`, `zoom_width` | resizable column widths |
+| `window_x`, `window_y`, `window_width`, `window_height` | last geometry |
+| `window_maximized` | restore maximized |
 
----
+Loading is tolerant: unknown keys, malformed lines and non-finite values are
+ignored and out-of-range values are clamped. **Retired keys** —
+`bytes_per_row`, `hex_zoom`, `pixel_colormap`, `pixels_width` — are simply
+unknown keys to the new parser, so older config files load without error and are
+rewritten in the new form.
 
-## Step-by-Step Implementation Instructions for Agent
+## 5. Rendering Pipeline
 
-1. **Scaffold Project**: Create `Cargo.toml` with `eframe`, `egui`, `egui_extras`, `memmap2`, `rfd`, and `rayon`. Remove any Hilbert-related files; the project is linear-only.
-2. **Implement Data Models**: Define `AppState` (with `bytes_per_row`, `entropy_window`, shared `scroll_row`, selection state). **Do not** define a `LayoutMode`; there is no Hilbert mode.
-3. **Implement Math Utilities**:
-   * Write the Shannon entropy block function (§3.B).
-   * Write the byte-to-class-color mapping for hex backgrounds (§3.C.1).
-   * Write the entropy gradient mapping (§3.C.3).
-   * Write `printable(b)` for the ASCII view.
-4. **Build UI Framework**:
-   * Set up `eframe::App` shell with a wide default viewport (`1600×900`).
-   * Add the top bar with title, file info, hovered/selected byte readout, and controls (Open File, Bytes/Row, Entropy window, Reset view, Jump).
-5. **Implement the Three Columns**:
-   * Hex column: one virtualized `ScrollArea` computing `first_row..last_row` from the shared `scroll_rows`; class-colored hex+ASCII cells with selection/hover overlays; master scrollbar; drag to select; right-click context menu (Copy Hex / Copy ASCII / Clear); Ctrl+wheel zoom.
-   * Pixels column: per-byte greyscale + entropy bands for the visible rows; drag to pan (writes `scroll_rows`), wheel scroll, Ctrl+wheel zoom, click selects.
-   * Overview column (left): whole-file greyscale/entropy thumbnail with a viewport band; click/drag navigates.
-   * Wire hover/click/drag so all three columns update the shared hover/selection/scroll state.
-6. **Wire Data Loading**: memory-map the file on Open; reset scroll/selection; compute entropy blocks in parallel (recompute only when the file or entropy window changes).
-7. **Polish**: contrast-aware hex text, hover outlines, selection copy via context menu, top-bar readout.
+- `memmap2::Mmap` for zero-copy mapping; the file is never read into memory.
+- `rayon` computes block entropies in parallel, once per file / window size.
+- **Virtualized:** every panel paints only the rows intersecting its viewport,
+  computed from the shared anchor, so memory and frame cost stay flat for
+  arbitrarily large files. No full-file texture is ever built; the overview and
+  strip are small downsampled thumbnails.
+- gpui canvases have no intrinsic size and must be sized explicitly
+  (`canvas(..).size_full()`), or they lay out zero-height and paint nothing.
+
+## 6. Layout Invariant: glyphs and cells must agree
+
+The hex column derives cell rectangles and hit-testing from `RowGeo`, and glyph
+positions from the character offsets in the row's text. **These two must resolve
+to the same x for every byte**, or backgrounds drift away from the digits they
+belong to. Two rules keep them in step:
+
+- The row text is painted at `origin.x + ADDR_X` — the same gutter padding
+  `RowGeo` builds into `hex_start`.
+- `RowGeo` counts `(n-1)/8` group gaps in a row of `n` bytes, matching the text
+  builder, which emits a space *between* groups only.
+
+A regression test asserts, for every byte in a row and across group boundaries,
+that the glyph x derived from the text offsets equals the rect x from `RowGeo`,
+for both the hex and the ASCII block.
+
+## 7. Testing
+
+The pixel and geometry math lives in pure functions so it is testable without a
+window:
+
+- The §6 glyph/rect alignment identity.
+- `hex_bytes_per_row`, `zoom_bytes_per_row`: fit, snapping, and minimum.
+- Anchor → per-panel first row, including end-of-file clamping.
+- Hit-testing: hex gaps and the gutter reject; the zoom view rejects positions
+  past the last byte of a row and past end-of-file.
+- Entropy: uniform data is 0, full-range is 8, block coverage, interpolation.
+- Config round-trip for all keys including every colormap value and `none`.
