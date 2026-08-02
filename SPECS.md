@@ -174,6 +174,7 @@ All three columns share one scroll position (`scroll_rows`, in rows). The **hex 
 * **Bytes/Row** combo: `16 / 32 / 64` (default 32; wider rows fill the wide window).
 * **Entropy window** slider: `16..=4096`, logarithmic (default 256).
 * **Reset view** — jump scroll back to row 0.
+* **Reset columns** (Shift+Ctrl/Cmd+L) — restore the overview and pixels column widths to their defaults.
 * **Reset all settings** — restore defaults for bytes-per-row, the entropy window, both zooms and the panel widths (the config file is written immediately).
 * **Jump to offset… (Ctrl+G)** — open the jump-to-offset dialog (live preview while typing).
 * **Zoom readout** — `hex ×… · px …` (Ctrl+wheel over the hex/pixels columns, or `+`/`=`/`-` with the pointer over a zoomable column, to zoom); each zoomable column header also has a **zoom slider** and a **Reset zoom** button.
@@ -191,8 +192,10 @@ The following UI settings are saved to a small `key = value` text file in the pl
 * `hex_zoom`, `pixel_zoom` — the two per-column zooms.
 * `pixel_colormap` — the pixels-column colormap (`greyscale` / `entropy` / `byte_class`), chosen from the header dropdown.
 * `overview_width`, `pixels_width` — the resizable side-panel widths.
+* `window_x`, `window_y`, `window_width`, `window_height` — the last window position and size, restored on launch (a saved position that no longer intersects any connected display falls back to a centered default).
+* `window_maximized` — whether the window was maximized when it last closed; on restore the window opens maximized with the saved `window_*` geometry as its un-maximize size.
 
-Settings are written a couple of seconds after the last change (and on exit). The file tolerates hand-edits: unknown keys, malformed lines and non-finite values are ignored, and out-of-range values are clamped on load.
+Settings are written a couple of seconds after the last change (and on exit). Window geometry is captured live, so moving/resizing the window persists it the same way. The file tolerates hand-edits: unknown keys, malformed lines and non-finite values are ignored, and out-of-range values are clamped on load.
 
 ---
 

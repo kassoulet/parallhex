@@ -21,6 +21,13 @@ pub struct Config {
     pub pixel_colormap: Colormap,
     pub overview_width: f32,
     pub pixels_width: f32,
+    /// Last window geometry `(x, y, width, height)` in screen pixels,
+    /// restored on the next launch. `None` before the first save.
+    pub window_bounds: Option<(f32, f32, f32, f32)>,
+    /// Whether the window was maximized when it was last saved; on restore
+    /// the window opens maximized with `window_bounds` as its un-maximize
+    /// size.
+    pub window_maximized: bool,
 }
 
 impl Default for Config {
@@ -33,6 +40,8 @@ impl Default for Config {
             pixel_colormap: Colormap::Greyscale,
             overview_width: 200.0,
             pixels_width: 320.0,
+            window_bounds: None,
+            window_maximized: false,
         }
     }
 }
@@ -75,6 +84,10 @@ pub fn path() -> Option<PathBuf> {
 /// compatible and corrupt entries can't break rendering.
 pub fn parse(text: &str) -> Config {
     let mut cfg = Config::default();
+    let mut window_x: Option<f32> = None;
+    let mut window_y: Option<f32> = None;
+    let mut window_w: Option<f32> = None;
+    let mut window_h: Option<f32> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -128,32 +141,56 @@ pub fn parse(text: &str) -> Config {
                     cfg.pixels_width = f;
                 }
             }
+            "window_x" => window_x = parse_finite(value),
+            "window_y" => window_y = parse_finite(value),
+            "window_width" => window_w = parse_finite(value),
+            "window_height" => window_h = parse_finite(value),
+            "window_maximized" => {
+                cfg.window_maximized = matches!(value, "true" | "1");
+            }
             _ => {} // unknown key: ignore
         }
+    }
+    // Restore the geometry only when the whole tuple is present and sane;
+    // a partial or degenerate set keeps the default (centered) placement.
+    if let (Some(x), Some(y), Some(w), Some(h)) = (window_x, window_y, window_w, window_h)
+        && w > 0.0
+        && h > 0.0
+    {
+        cfg.window_bounds = Some((x, y, w, h));
     }
     cfg
 }
 
-/// Serialize to the `key = value` file format. Widths are rounded to whole
-/// pixels so an unchanged layout doesn't keep rewriting the file.
+/// Parse a finite `f32`, or `None` when the value is missing, malformed or
+/// non-finite (NaN, inf) — such lines are skipped like the other keys.
+fn parse_finite(value: &str) -> Option<f32> {
+    value.parse::<f32>().ok().filter(|f| f.is_finite())
+}
+
+/// Serialize to the `key = value` file format. Sizes are rounded to whole
+/// pixels so an unchanged layout doesn't keep rewriting the file. The window
+/// geometry lines are only written once a window has actually been placed.
 pub fn serialize(cfg: &Config) -> String {
-    format!(
-        "# ParallHex preferences\n\
-         bytes_per_row = {}\n\
-         entropy_window = {}\n\
-         hex_zoom = {}\n\
-         pixel_zoom = {}\n\
-         pixel_colormap = {}\n\
-         overview_width = {}\n\
-         pixels_width = {}\n",
-        cfg.bytes_per_row,
-        cfg.entropy_window,
-        cfg.hex_zoom,
-        cfg.pixel_zoom,
-        cfg.pixel_colormap.key(),
-        cfg.overview_width.round(),
-        cfg.pixels_width.round(),
-    )
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    // `write!` into a `String` cannot fail; discard the `Result` it returns.
+    let _ = writeln!(out, "# ParallHex preferences");
+    let _ = writeln!(out, "bytes_per_row = {}", cfg.bytes_per_row);
+    let _ = writeln!(out, "entropy_window = {}", cfg.entropy_window);
+    let _ = writeln!(out, "hex_zoom = {}", cfg.hex_zoom);
+    let _ = writeln!(out, "pixel_zoom = {}", cfg.pixel_zoom);
+    let _ = writeln!(out, "pixel_colormap = {}", cfg.pixel_colormap.key());
+    let _ = writeln!(out, "overview_width = {}", cfg.overview_width.round());
+    let _ = writeln!(out, "pixels_width = {}", cfg.pixels_width.round());
+    if let Some((left, top, width, height)) = cfg.window_bounds {
+        let _ = writeln!(out, "window_x = {}", left.round());
+        let _ = writeln!(out, "window_y = {}", top.round());
+        let _ = writeln!(out, "window_width = {}", width.round());
+        let _ = writeln!(out, "window_height = {}", height.round());
+    }
+    let _ = writeln!(out, "window_maximized = {}", cfg.window_maximized);
+    out
 }
 
 /// Load preferences from disk, falling back to defaults on any error.
@@ -190,8 +227,52 @@ mod tests {
             pixel_colormap: Colormap::Entropy,
             overview_width: 250.0,
             pixels_width: 400.0,
+            window_bounds: Some((120.0, 80.0, 1600.0, 900.0)),
+            window_maximized: true,
         };
         assert_eq!(parse(&serialize(&cfg)), cfg);
+    }
+
+    #[test]
+    fn round_trip_without_window_geometry() {
+        let cfg = Config::default();
+        assert_eq!(parse(&serialize(&cfg)), cfg);
+    }
+
+    #[test]
+    fn parse_restores_window_geometry() {
+        let cfg = parse(
+            "window_x = 320\n\
+             window_y = 240\n\
+             window_width = 1280\n\
+             window_height = 720\n\
+             window_maximized = true\n",
+        );
+        assert_eq!(cfg.window_bounds, Some((320.0, 240.0, 1280.0, 720.0)));
+        assert!(cfg.window_maximized);
+    }
+
+    #[test]
+    fn parse_rejects_partial_or_degenerate_geometry() {
+        // Only some of the four keys: geometry stays `None`.
+        let partial = parse("window_x = 320\nwindow_width = 1280\n");
+        assert_eq!(partial.window_bounds, None);
+        // Zero / negative size is degenerate.
+        let zero = parse(
+            "window_x = 0\n\
+             window_y = 0\n\
+             window_width = 0\n\
+             window_height = 0\n",
+        );
+        assert_eq!(zero.window_bounds, None);
+        // Non-finite values are skipped like the other keys.
+        let nan = parse(
+            "window_x = nan\n\
+             window_y = 0\n\
+             window_width = 1280\n\
+             window_height = 720\n",
+        );
+        assert_eq!(nan.window_bounds, None);
     }
 
     #[test]

@@ -25,8 +25,8 @@ mod panes;
 use std::path::PathBuf;
 
 use gpui::{
-    AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
-    actions, px, size,
+    AppContext, Application, Bounds, KeyBinding, Pixels, TitlebarOptions, WindowBounds,
+    WindowOptions, actions, point, px, size,
 };
 
 // All keyboard actions. App-level (root view) bindings dispatch navigation,
@@ -39,6 +39,7 @@ actions!(
         OpenFile,
         JumpToOffset,
         ResetView,
+        ResetColumns,
         ResetSettings,
         ZoomIn,
         ZoomOut,
@@ -62,6 +63,11 @@ actions!(
         JumpCancel,
     ]
 );
+
+/// Minimum window size, shared by the launch options and the restore clamp
+/// in `restored_bounds` so the two can't diverge.
+const MIN_WINDOW_W: f32 = 1000.0;
+const MIN_WINDOW_H: f32 = 600.0;
 
 /// Result of parsing the command line.
 enum Cli {
@@ -126,6 +132,7 @@ fn main() {
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-g", JumpToOffset, None),
             KeyBinding::new("cmd-0", ResetView, None),
+            KeyBinding::new("shift-cmd-l", ResetColumns, None),
             KeyBinding::new("=", ZoomIn, None),
             KeyBinding::new("-", ZoomOut, None),
             KeyBinding::new("left", NavigateLeft, None),
@@ -145,11 +152,22 @@ fn main() {
             KeyBinding::new("escape", JumpCancel, None),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(1600.), px(900.)), cx);
+        let prefs = config::load();
+        let displays: Vec<Bounds<Pixels>> = cx.displays().iter().map(|d| d.bounds()).collect();
+        let bounds = restored_bounds(
+            &prefs,
+            &displays,
+            Bounds::centered(None, size(px(1600.), px(900.)), cx),
+        );
+        let window_bounds = Some(if prefs.window_maximized {
+            WindowBounds::Maximized(bounds)
+        } else {
+            WindowBounds::Windowed(bounds)
+        });
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(1000.), px(600.))),
+                window_bounds,
+                window_min_size: Some(size(px(MIN_WINDOW_W), px(MIN_WINDOW_H))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("ParallHex".into()),
                     ..Default::default()
@@ -165,10 +183,43 @@ fn main() {
     });
 }
 
+/// Choose the window bounds to open with. The persisted geometry is used
+/// when it intersects at least one connected display; otherwise (first run,
+/// monitor unplugged, resolution shrunk) a centered default keeps the window
+/// on-screen. The restored size is never smaller than the window minimum.
+fn restored_bounds(
+    prefs: &config::Config,
+    displays: &[Bounds<Pixels>],
+    fallback: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let Some((left, top, width, height)) = prefs.window_bounds else {
+        return fallback;
+    };
+    let candidate = Bounds::new(
+        point(px(left), px(top)),
+        size(px(width.max(MIN_WINDOW_W)), px(height.max(MIN_WINDOW_H))),
+    );
+    if displays
+        .iter()
+        .any(|display| display.intersects(&candidate))
+    {
+        candidate
+    } else {
+        fallback
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, parse_args};
+    use super::{Cli, parse_args, restored_bounds};
     use std::path::PathBuf;
+
+    use crate::config;
+    use gpui::{Bounds, Pixels, point, px, size};
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    }
 
     fn launch(args: &[&str]) -> Option<PathBuf> {
         match parse_args(args.iter().map(std::string::ToString::to_string)) {
@@ -230,5 +281,52 @@ mod tests {
     fn double_dash_makes_help_a_file() {
         // After `--`, even `--help` is a file path, not a flag.
         assert_eq!(launch(&["--", "--help"]), Some(PathBuf::from("--help")));
+    }
+
+    #[test]
+    fn restored_geometry_used_when_on_screen() {
+        let prefs = config::Config {
+            window_bounds: Some((100.0, 120.0, 1400.0, 800.0)),
+            window_maximized: false,
+            ..Default::default()
+        };
+        let displays = vec![bounds(0.0, 0.0, 1920.0, 1080.0)];
+        let fallback = bounds(50.0, 50.0, 1600.0, 900.0);
+        assert_eq!(
+            restored_bounds(&prefs, &displays, fallback),
+            bounds(100.0, 120.0, 1400.0, 800.0)
+        );
+    }
+
+    #[test]
+    fn restored_geometry_recenters_when_off_screen() {
+        let prefs = config::Config {
+            window_bounds: Some((5000.0, 5000.0, 1400.0, 800.0)),
+            ..Default::default()
+        };
+        let displays = vec![bounds(0.0, 0.0, 1920.0, 1080.0)];
+        let fallback = bounds(50.0, 50.0, 1600.0, 900.0);
+        assert_eq!(restored_bounds(&prefs, &displays, fallback), fallback);
+    }
+
+    #[test]
+    fn restored_geometry_falls_back_without_saved_position() {
+        let prefs = config::Config::default();
+        let fallback = bounds(50.0, 50.0, 1600.0, 900.0);
+        assert_eq!(restored_bounds(&prefs, &[], fallback), fallback);
+    }
+
+    #[test]
+    fn restored_geometry_enforces_minimum_size() {
+        let prefs = config::Config {
+            window_bounds: Some((10.0, 10.0, 200.0, 150.0)),
+            ..Default::default()
+        };
+        let displays = vec![bounds(0.0, 0.0, 1920.0, 1080.0)];
+        let fallback = bounds(50.0, 50.0, 1600.0, 900.0);
+        assert_eq!(
+            restored_bounds(&prefs, &displays, fallback),
+            bounds(10.0, 10.0, 1000.0, 600.0)
+        );
     }
 }

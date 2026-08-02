@@ -24,8 +24,8 @@ use crate::panes;
 use crate::{
     Backspace, ClearSelection, CopySelectionAscii, CopySelectionHex, Delete, JumpCancel,
     JumpSubmit, JumpToOffset, NavigateDown, NavigateEnd, NavigateHome, NavigateLeft,
-    NavigatePageDown, NavigatePageUp, NavigateRight, NavigateUp, OpenFile, Paste, ResetSettings,
-    ResetView, ZoomIn, ZoomOut,
+    NavigatePageDown, NavigatePageUp, NavigateRight, NavigateUp, OpenFile, Paste, ResetColumns,
+    ResetSettings, ResetView, ZoomIn, ZoomOut,
 };
 
 /// Size of the horizontal whole-file preview strip in the top bar.
@@ -626,6 +626,12 @@ pub struct ParallHexApp {
     pub saved_cfg: config::Config,
     pub last_save: Instant,
 
+    // Last captured window geometry, persisted so position/size can be
+    // restored on the next launch. Captured live each frame (rounded to
+    // whole pixels) so a move/resize lands in the config file.
+    pub window_bounds: Option<(f32, f32, f32, f32)>,
+    pub window_maximized: bool,
+
     // Drag state for the column divider resize handles.
     pub resizing_divider: Option<DividerKind>,
     pub divider_start_x: f32,
@@ -706,6 +712,8 @@ impl ParallHexApp {
             jump_field,
             overview_width: prefs.overview_width.clamp(OVERVIEW_W_MIN, OVERVIEW_W_MAX),
             pixels_width: prefs.pixels_width.clamp(PIXELS_W_MIN, PIXELS_W_MAX),
+            window_bounds: prefs.window_bounds,
+            window_maximized: prefs.window_maximized,
             saved_cfg: prefs,
             last_save: Instant::now(),
             resizing_divider: None,
@@ -776,12 +784,42 @@ impl ParallHexApp {
             pixel_colormap: self.pixel_colormap,
             overview_width: self.overview_width.round(),
             pixels_width: self.pixels_width.round(),
+            window_bounds: self.window_bounds,
+            window_maximized: self.window_maximized,
         }
     }
 
-    /// Restore every persisted setting to its default.
+    /// Remember the window's position/size so it can be persisted and
+    /// restored next launch. While maximized, the last *windowed* bounds are
+    /// kept as the restore size (gpui's `WindowBounds::Maximized` treats the
+    /// given bounds as the un-maximize geometry). Values are rounded to
+    /// whole pixels so an unchanged window doesn't keep rewriting the file.
+    fn capture_window_geometry(&mut self, window: &Window) {
+        self.window_maximized = window.is_maximized();
+        // While maximized or fullscreen the window bounds are the screen
+        // size, not a restore geometry — keep the last windowed bounds.
+        if self.window_maximized || window.is_fullscreen() {
+            return;
+        }
+        let bounds = window.bounds();
+        let (left, top, width, height) = (
+            bounds.origin.x.to_f64() as f32,
+            bounds.origin.y.to_f64() as f32,
+            bounds.size.width.to_f64() as f32,
+            bounds.size.height.to_f64() as f32,
+        );
+        self.window_bounds = Some((left.round(), top.round(), width.round(), height.round()));
+    }
+
+    /// Restore every persisted setting to its default. The window geometry
+    /// is captured live each frame and kept across the reset (it's a window
+    /// manager concern, not a UI preference).
     fn reset_all_settings(&mut self, cx: &mut Context<Self>) {
-        let defaults = config::Config::default();
+        let defaults = config::Config {
+            window_bounds: self.window_bounds,
+            window_maximized: self.window_maximized,
+            ..config::Config::default()
+        };
         self.bytes_per_row = defaults.bytes_per_row;
         self.entropy_window = defaults.entropy_window;
         self.hex_zoom = defaults.hex_zoom;
@@ -868,6 +906,15 @@ impl ParallHexApp {
 
     fn on_reset_view(&mut self, _: &ResetView, _: &mut Window, cx: &mut Context<Self>) {
         self.scroll_reset = true;
+        cx.notify();
+    }
+
+    /// Reset the two drag-resizable column widths to their defaults (the
+    /// debounced config save persists them a couple of seconds later).
+    fn on_reset_columns(&mut self, _: &ResetColumns, _: &mut Window, cx: &mut Context<Self>) {
+        let defaults = config::Config::default();
+        self.overview_width = defaults.overview_width;
+        self.pixels_width = defaults.pixels_width;
         cx.notify();
     }
 
@@ -2519,6 +2566,7 @@ impl Focusable for ParallHexApp {
 
 impl Render for ParallHexApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.capture_window_geometry(window);
         // Debounced config save.
         let current = self.current_config();
         if current != self.saved_cfg && self.last_save.elapsed() >= Duration::from_secs(2) {
@@ -2550,6 +2598,7 @@ impl Render for ParallHexApp {
             .on_action(cx.listener(Self::on_open_file))
             .on_action(cx.listener(Self::on_jump_to_offset))
             .on_action(cx.listener(Self::on_reset_view))
+            .on_action(cx.listener(Self::on_reset_columns))
             .on_action(cx.listener(Self::on_reset_settings))
             .on_action(cx.listener(Self::on_zoom_in))
             .on_action(cx.listener(Self::on_zoom_out))
@@ -2788,7 +2837,10 @@ fn pick_monospace_family(window: &Window) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use super::{NavigationAction, ParallHexApp, divider_width};
+    use super::{
+        NavigationAction, OVERVIEW_W_MAX, OVERVIEW_W_MIN, PIXELS_W_MAX, PIXELS_W_MIN, ParallHexApp,
+        divider_width,
+    };
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum NavKey {
@@ -2928,5 +2980,21 @@ mod tests {
         assert_eq!(divider_width(300.0, -100_000.0, 140.0, 2000.0), 140.0);
         // The pixels column has a wider range.
         assert_eq!(divider_width(320.0, 4000.0, 200.0, 3000.0), 3000.0);
+    }
+
+    /// The "Reset columns" shortcut assigns the config defaults directly, so
+    /// those defaults must always be widths the divider-drag clamp accepts —
+    /// otherwise a reset could produce an out-of-range width.
+    #[test]
+    fn reset_column_defaults_are_within_drag_clamps() {
+        let defaults = crate::config::Config::default();
+        assert!(
+            (OVERVIEW_W_MIN..=OVERVIEW_W_MAX).contains(&defaults.overview_width),
+            "overview default must be within the drag clamp range"
+        );
+        assert!(
+            (PIXELS_W_MIN..=PIXELS_W_MAX).contains(&defaults.pixels_width),
+            "pixels default must be within the drag clamp range"
+        );
     }
 }
