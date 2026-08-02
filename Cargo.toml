@@ -1,12 +1,26 @@
 [package]
-name = "entropymap"
+name = "parallhex"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-eframe = "0.28"
-egui = "0.28"
-egui_extras = "0.28"
+gpui = "0.2.2"
+image = "0.25"
 memmap2 = "0.9"
-rfd = "0.14"
 rayon = "1.10"
+rfd = "0.14"
+
+# Warnings-as-errors for both the compiler and clippy's pedantic group.
+#
+# A small set of pedantic lints is deliberately allowed crate-wide (see the
+# `#![allow(...)]` at the top of `src/main.rs`): packed RGB/RGBA color
+# literals, the f32/f64/usize casts used in pixel/scroll math, and float
+# equality against exactly-representable constants. They are enabled there
+# rather than here because Cargo's emission order of `--allow` / `--deny`
+# flags is not under our control, and the last flag wins for each lint, so
+# crate attributes are the reliable place for the curated overrides.
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+pedantic = "deny"

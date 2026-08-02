@@ -112,14 +112,14 @@ Standardized output range: `[0.0, 8.0]` bits per byte.
 
 ---
 
-## 4. UI Layout Specs (`egui`)
+## 4. UI Layout Specs (`gpui`)
 
-Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) and a three-column layout, with all info in the top bar:
+Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) with a top info bar, three synchronized columns, and a bottom status bar:
 
 ```
 +-----------------------------------------------------------------------+
-|  Top Bar: Title · File name/size · Hovered/Selected byte · Controls   |
-|  (Open File, Bytes/Row, Entropy Win, Reset, Jump, zoom readout)       |
+|  Top Info Bar: Title · File name/size · Controls                      |
+|  (Open File, Bytes/Row, Entropy Win, Reset view, Jump, Reset all)     |
 |  + horizontal preview strip (right)                                   |
 +------------------------+------------------------+---------------------+
 |  Overview column       |  Pixels column         |  Hex column         |
@@ -130,6 +130,9 @@ Use a **wide** window (default inner size `[1600, 900]`, minimum `[1000, 600]`) 
 |  viewport region,      |  Ctrl+wheel zoom       |  Ctrl+wheel zoom    |
 |  click/drag navigates  |                       |                     |
 +------------------------+------------------------+---------------------+
+|  Status Bar: offset/byte/entropy readout · selection · zoom · rows ·  |
+|  jump preview · transient messages                                    |
++-----------------------------------------------------------------------+
 ```
 
 Each column has a header showing its **visible byte range** (e.g. `0x00000000 – 0x000000FF`; the overview column always shows the whole-file range) and — for the zoomable pixels/hex columns — a live zoom readout (`×1.00`, `4 px`), a **zoom slider** and a **Reset zoom** button that restores that column's default zoom.
@@ -160,12 +163,12 @@ All three columns share one scroll position (`scroll_rows`, in rows). The **hex 
 
 ### Command Line
 
-* **`entropymap <file>`** — opens the file on startup (optional positional argument; errors are shown in the status bar).
-* **`entropymap --help`** (or `-h`) — prints usage and exits. Unknown `-`-prefixed options print an error and exit instead of being treated as files. `--` ends option parsing, so a file whose name starts with `-` can be opened (e.g. `entropymap -- -foo.bin`).
+* **`parallhex <file>`** — opens the file on startup (optional positional argument; errors are shown in the status bar).
+* **`parallhex --help`** (or `-h`) — prints usage and exits. Unknown `-`-prefixed options print an error and exit instead of being treated as files. `--` ends option parsing, so a file whose name starts with `-` can be opened (e.g. `parallhex -- -foo.bin`).
 
 ### Top Bar (Title + Info + Controls)
 
-* **Title** `EntropyMap`, **file name** and size (`human_size`).
+* **Title** `ParallHex`, **file name** and size (`human_size`).
 * **Hovered / selected byte** readout: `0x… · 0x… 'c' · H=…` (live; the overview hover preview takes precedence while hovering it).
 * **Open File…** (and Ctrl/Cmd+O) — `rfd` native dialog.
 * **Bytes/Row** combo: `16 / 32 / 64` (default 32; wider rows fill the wide window).
@@ -177,15 +180,16 @@ All three columns share one scroll position (`scroll_rows`, in rows). The **hex 
 * **Horizontal preview strip** — a whole-file greyscale/entropy strip at the right of the top bar with a viewport band; hover previews the offset, click / drag navigates.
 * Error messages (yellow) are shown here too.
 
-There is **no side panel and no bottom status bar**: file info, hovered/selected byte readout, zoom state and error messages all live in the top bar. Selection copy actions are available from the hex column's right-click context menu (Copy Hex / Copy ASCII / Clear selection).
+The **top info bar** holds the app title, the file name/size and the action controls; the **bottom status bar** holds the live readouts (hovered/selected offset · byte · entropy, selection range, zoom, visible rows + file percentage), the jump-dialog preview and transient messages (open errors, "Settings reset…"). Selection copy actions are available from the hex column's right-click context menu (Copy Hex / Copy ASCII / Clear selection).
 
 ### Preferences (persisted layout)
 
-The following UI settings are saved to a small `key = value` text file in the platform config directory (`$XDG_CONFIG_HOME` on Linux, `$APPDATA` on Windows, `~/Library/Application Support` on macOS — otherwise `~/.config/entropymap/config.txt`) and restored on the next launch:
+The following UI settings are saved to a small `key = value` text file in the platform config directory (`$XDG_CONFIG_HOME` on Linux, `$APPDATA` on Windows, `~/Library/Application Support` on macOS — otherwise `~/.config/parallhex/config.txt`) and restored on the next launch:
 
 * `bytes_per_row` — bytes-per-row (16 / 32 / 64).
 * `entropy_window` — the entropy window size (16–4096).
 * `hex_zoom`, `pixel_zoom` — the two per-column zooms.
+* `pixel_colormap` — the pixels-column colormap (`greyscale` / `entropy` / `byte_class`), chosen from the header dropdown.
 * `overview_width`, `pixels_width` — the resizable side-panel widths.
 
 Settings are written a couple of seconds after the last change (and on exit). The file tolerates hand-edits: unknown keys, malformed lines and non-finite values are ignored, and out-of-range values are clamped on load.

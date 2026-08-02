@@ -1,4 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Curated `clippy::pedantic` allows (see Cargo.toml `[lints.clippy]`):
+// - Packed RGB/RGBA color literals (`rgb(0x7aa2f7)`) are the idiomatic form
+//   for a hex viewer's palette; forcing digit separators hurts readability.
+// - UI/scroll math converts between f32, f64 and usize (pixel sizes, row
+//   offsets, viewport heights); the values are bounded and the casts are
+//   deliberate, so the flagged precision loss/truncation cannot occur.
+// - Float equality is used only against exactly-representable constants
+//   (0.0, 1.0) and in test assertions.
+#![allow(
+    clippy::unreadable_literal,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
 
 mod app;
 mod color;
@@ -8,7 +24,44 @@ mod panes;
 
 use std::path::PathBuf;
 
-use eframe::egui;
+use gpui::{
+    AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
+    actions, px, size,
+};
+
+// All keyboard actions. App-level (root view) bindings dispatch navigation,
+// zoom, open/jump and copy; the jump dialog's text field additionally
+// handles `Backspace` / `Delete` / `MoveLeft` / `MoveRight` / `Paste` and
+// `JumpSubmit` / `JumpCancel`.
+actions!(
+    parallhex,
+    [
+        OpenFile,
+        JumpToOffset,
+        ResetView,
+        ResetSettings,
+        ZoomIn,
+        ZoomOut,
+        NavigateLeft,
+        NavigateRight,
+        NavigateUp,
+        NavigateDown,
+        NavigatePageUp,
+        NavigatePageDown,
+        NavigateHome,
+        NavigateEnd,
+        CopySelectionHex,
+        CopySelectionAscii,
+        ClearSelection,
+        // Jump dialog text field. Cursor movement reuses NavigateLeft /
+        // NavigateRight so only one keybinding is needed per key.
+        Backspace,
+        Delete,
+        Paste,
+        JumpSubmit,
+        JumpCancel,
+    ]
+);
 
 /// Result of parsing the command line.
 enum Cli {
@@ -39,7 +92,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Cli {
                 return Cli::Exit(0);
             }
             _ if arg.starts_with('-') => {
-                eprintln!("entropymap: unknown option '{arg}'");
+                eprintln!("parallhex: unknown option '{arg}'");
                 print_usage();
                 return Cli::Exit(2);
             }
@@ -51,8 +104,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Cli {
 }
 
 fn print_usage() {
-    println!("Usage: entropymap [OPTIONS] [FILE]");
-    println!("       entropymap --help");
+    println!("Usage: parallhex [OPTIONS] [FILE]");
+    println!("       parallhex --help");
     println!();
     println!("Wide hex-viewer binary explorer.");
     println!();
@@ -63,39 +116,69 @@ fn print_usage() {
     println!("  -h, --help    print this help and exit");
 }
 
-fn main() -> eframe::Result {
+fn main() {
     let initial_file = match parse_args(std::env::args().skip(1)) {
         Cli::Exit(code) => std::process::exit(code),
         Cli::Launch(file) => file,
     };
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("EntropyMap")
-            .with_inner_size([1600.0, 900.0])
-            .with_min_inner_size([1000.0, 600.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "EntropyMap",
-        options,
-        Box::new(move |cc| Ok(Box::new(app::EntropyMapApp::new(cc, initial_file)))),
-    )
+    Application::new().run(move |cx: &mut gpui::App| {
+        cx.bind_keys([
+            KeyBinding::new("cmd-o", OpenFile, None),
+            KeyBinding::new("cmd-g", JumpToOffset, None),
+            KeyBinding::new("cmd-0", ResetView, None),
+            KeyBinding::new("=", ZoomIn, None),
+            KeyBinding::new("-", ZoomOut, None),
+            KeyBinding::new("left", NavigateLeft, None),
+            KeyBinding::new("right", NavigateRight, None),
+            KeyBinding::new("up", NavigateUp, None),
+            KeyBinding::new("down", NavigateDown, None),
+            KeyBinding::new("pageup", NavigatePageUp, None),
+            KeyBinding::new("pagedown", NavigatePageDown, None),
+            KeyBinding::new("home", NavigateHome, None),
+            KeyBinding::new("end", NavigateEnd, None),
+            KeyBinding::new("cmd-c", CopySelectionHex, None),
+            KeyBinding::new("shift-cmd-c", CopySelectionAscii, None),
+            KeyBinding::new("backspace", Backspace, None),
+            KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("cmd-v", Paste, None),
+            KeyBinding::new("enter", JumpSubmit, None),
+            KeyBinding::new("escape", JumpCancel, None),
+        ]);
+
+        let bounds = Bounds::centered(None, size(px(1600.), px(900.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(1000.), px(600.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("ParallHex".into()),
+                    ..Default::default()
+                }),
+                focus: true,
+                ..Default::default()
+            },
+            move |window, cx| cx.new(|cx| app::ParallHexApp::new(window, cx, initial_file)),
+        )
+        .unwrap();
+        cx.on_window_closed(|cx| cx.quit()).detach();
+        cx.activate(true);
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, Cli};
+    use super::{Cli, parse_args};
     use std::path::PathBuf;
 
     fn launch(args: &[&str]) -> Option<PathBuf> {
-        match parse_args(args.iter().map(|s| s.to_string())) {
+        match parse_args(args.iter().map(std::string::ToString::to_string)) {
             Cli::Launch(file) => file,
             Cli::Exit(_) => panic!("expected launch, got exit"),
         }
     }
 
     fn exit_code(args: &[&str]) -> i32 {
-        match parse_args(args.iter().map(|s| s.to_string())) {
+        match parse_args(args.iter().map(std::string::ToString::to_string)) {
             Cli::Exit(code) => code,
             Cli::Launch(_) => panic!("expected exit, got launch"),
         }
@@ -113,10 +196,7 @@ mod tests {
 
     #[test]
     fn first_positional_wins() {
-        assert_eq!(
-            launch(&["a.bin", "b.bin"]),
-            Some(PathBuf::from("a.bin"))
-        );
+        assert_eq!(launch(&["a.bin", "b.bin"]), Some(PathBuf::from("a.bin")));
     }
 
     #[test]

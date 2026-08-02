@@ -1,0 +1,21 @@
+# Configuration file for `prek`, the git hook framework used for this repo.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+#
+# Run the unit tests, the pedantic-clippy lint gate and the rustfmt gate
+# before every commit.
+#
+# `cargo clippy --all-targets` already fails on any pedantic violation, because
+# Cargo.toml sets `[lints.clippy] pedantic = "deny"` and `[lints.rust]
+# warnings = "deny"`.
+#
+# `cargo fmt --check` rejects any diff from `cargo fmt`; run `cargo fmt` before
+# committing.
+
+[[repos]]
+repo = "local"
+hooks = [
+    { id = "cargo-test", name = "cargo test --all-targets", entry = "cargo test --all-targets", language = "system", pass_filenames = false },
+    { id = "cargo-fmt", name = "cargo fmt --check", entry = "cargo fmt --check", language = "system", pass_filenames = false },
+    { id = "cargo-clippy", name = "cargo clippy --all-targets (pedantic, deny warnings)", entry = "cargo clippy --all-targets", language = "system", pass_filenames = false },
+]
