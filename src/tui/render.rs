@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Block;
 
-use crate::core::color::{self, Rgb};
+use crate::core::color::{self, Colormap, Rgb};
 use crate::core::geom::{self, RowGeo};
 use crate::core::thumb;
 use crate::tui::app::{Focus, PanelLayout, TuiApp};
@@ -29,8 +29,12 @@ const SELECTED_BG: Color = Color::Rgb(0x44, 0x49, 0x6b);
 
 /// Draw a frame and record the measured layout for the input layer.
 pub(crate) fn draw(frame: &mut Frame, app: &mut TuiApp) {
-    let [body, status] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.size());
+    let [body, status, hints] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.size());
     // Proportions mirror the gpui frontend's defaults; hex takes the remainder
     // because it is the widest and the scroll reference.
     let [overview, zoom, hex] = Layout::horizontal([
@@ -57,6 +61,47 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut TuiApp) {
     draw_zoom(frame, app, zoom_inner);
     draw_hex(frame, app, hex_inner);
     draw_status(frame, app, status);
+    draw_hints(frame, app, hints);
+}
+
+/// The key-hint row. Its main job is the colormap keys: `1`–`4` are otherwise
+/// undiscoverable, and showing them numbered with the focused panel's current
+/// choice highlighted makes the row double as state rather than just a legend.
+fn draw_hints(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let mut x = area.x;
+    let end = area.x + area.width;
+    let mut put = |s: &str, style: Style| {
+        if x >= end {
+            return;
+        }
+        let room = (end - x) as usize;
+        frame.buffer_mut().set_stringn(x, area.y, s, room, style);
+        // Width in cells, not bytes: the labels are ASCII, but `·` is not.
+        x = x.saturating_add(u16::try_from(s.chars().count()).unwrap_or(u16::MAX));
+    };
+
+    put(
+        &format!(" {} colormap:", app.focus.title()),
+        Style::new().fg(MUTED),
+    );
+    let current = app.colormap(app.focus);
+    for (i, cm) in Colormap::ALL.iter().enumerate() {
+        let style = if *cm == current {
+            // Highlighted rather than merely listed, so the row shows which
+            // colormap is active as well as how to change it.
+            Style::new().fg(Color::Black).bg(FOCUSED)
+        } else {
+            Style::new().fg(MUTED)
+        };
+        put(&format!(" {} {} ", i + 1, cm.label()), style);
+    }
+    put(
+        "  Tab panel · g jump · y copy · -/+ window · q quit",
+        Style::new().fg(MUTED),
+    );
 }
 
 /// Draw a column's border and header, returning the area left for content.
@@ -294,7 +339,7 @@ mod tests {
         let mut app = TuiApp::for_test(4096);
         app.cursor = 0x20;
         let buf = render(&mut app, 120, 10);
-        let status = row_text(&buf, 9, 120);
+        let status = row_text(&buf, 8, 120);
         assert!(status.contains("0x00000020"), "{status:?}");
     }
 
@@ -303,8 +348,44 @@ mod tests {
         let mut app = TuiApp::for_test(4096);
         app.jump = Some("0xFF".to_owned());
         let buf = render(&mut app, 120, 10);
-        let status = row_text(&buf, 9, 120);
+        let status = row_text(&buf, 8, 120);
         assert!(status.contains("jump to offset: 0xFF"), "{status:?}");
+    }
+
+    #[test]
+    fn the_hint_row_teaches_the_colormap_keys_and_marks_the_active_one() {
+        let mut app = TuiApp::for_test(4096);
+        app.focus = Focus::Hex; // default Class
+        let buf = render(&mut app, 140, 12);
+        let hints = row_text(&buf, 11, 140);
+        // Every colormap must be listed with its number, or the binding stays
+        // undiscoverable.
+        for (i, cm) in Colormap::ALL.iter().enumerate() {
+            let want = format!("{} {}", i + 1, cm.label());
+            assert!(hints.contains(&want), "hint row lacks {want:?}: {hints:?}");
+        }
+        assert!(hints.contains("Hex colormap:"), "{hints:?}");
+
+        // The active one is highlighted, so the row shows state too. Class is 3rd.
+        let x = hints.find("3 Class").expect("3 Class present");
+        let cell = buf.get(u16::try_from(x).unwrap(), 11);
+        assert_eq!(
+            cell.bg, FOCUSED,
+            "the active colormap should be highlighted"
+        );
+        let other = hints.find("2 Value").expect("2 Value present");
+        assert_ne!(buf.get(u16::try_from(other).unwrap(), 11).bg, FOCUSED);
+    }
+
+    #[test]
+    fn the_hint_row_follows_the_focused_panel() {
+        let mut app = TuiApp::for_test(4096);
+        app.focus = Focus::Overview; // default Entropy
+        let buf = render(&mut app, 140, 12);
+        let hints = row_text(&buf, 11, 140);
+        assert!(hints.contains("Overview colormap:"), "{hints:?}");
+        let x = hints.find("4 Entropy").expect("4 Entropy present");
+        assert_eq!(buf.get(u16::try_from(x).unwrap(), 11).bg, FOCUSED);
     }
 
     #[test]

@@ -97,6 +97,14 @@ lower one. This needs a terminal with 24-bit or 256-colour support.
 | `-` / `+` (or `=`) | Halve / double the entropy window |
 | `q`, `Esc`, `Ctrl+C` | Save preferences and quit |
 
+A hint row along the bottom lists the colormap keys for whichever column has
+focus and highlights the one in use, so `1`–`4` are discoverable without reading
+this table:
+
+```
+ Hex colormap: 1 None  2 Value  3 Class  4 Entropy   Tab panel · g jump · y copy · -/+ window · q quit
+```
+
 `↑`/`↓` follow the focused column's idea of a row, which differs per column: the
 hex column's byte row, the zoom column's width in bytes, or — in the overview —
 the slice of the file one half-row stands for, making it a coarse whole-file seek.
