@@ -279,6 +279,45 @@ pub(crate) fn entropy_for(
     }
 }
 
+/// The bytes a pane shows and how it colors them.
+///
+/// These four values travel together through every painter and thumbnail
+/// generator — a colormap is meaningless without the entropy cache and window it
+/// may need to consult — so they move as one argument rather than four, and the
+/// per-byte lookup lives here instead of being rebuilt at each site.
+pub(crate) struct ByteSource<'a> {
+    pub data: &'a [u8],
+    pub entropies: &'a [f32],
+    pub entropy_window: usize,
+    pub colormap: Colormap,
+}
+
+impl ByteSource<'_> {
+    /// Color for `byte`, sampling entropy at `offset`. The two are separate
+    /// because the thumbnails color a *sampled average* of a cell's bytes while
+    /// reading entropy at the cell's midpoint.
+    pub fn color_of(&self, byte: u8, offset: usize) -> Option<Rgba> {
+        self.colormap.color_for(
+            byte,
+            entropy_for(self.colormap, self.entropies, self.entropy_window, offset),
+        )
+    }
+
+    /// Color for the byte at `offset`. Panics if `offset` is out of bounds —
+    /// callers already clamp to the visible range.
+    pub fn color_at(&self, offset: usize) -> Option<Rgba> {
+        self.color_of(self.data[offset], offset)
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
 /// Per-row horizontal geometry for one bytes-per-row layout. All offsets are
 /// derived from the monospace glyph width so the text, the background cells
 /// and the hit-testing always agree.
@@ -449,7 +488,6 @@ fn cell_glyph_color(cell: Option<Rgba>) -> Hsla {
 /// byte's color is computed once and reused for both cells and both glyphs
 /// rather than four times per byte. Runs are written into the caller-owned
 /// `runs` buffer.
-#[allow(clippy::too_many_arguments)]
 fn build_row_runs(
     n: usize,
     hex_offsets: &[usize],
@@ -610,18 +648,15 @@ pub(crate) fn paint_hex(
     window: &mut Window,
     cx: &mut App,
     bounds: Bounds<Pixels>,
-    data: &[u8],
+    src: &ByteSource,
     font: &Font,
     char_w: f32,
     bpr: usize,
     first_row_start: usize,
     hovered: Option<usize>,
     sel: Option<&Range<usize>>,
-    entropies: &[f32],
-    entropy_window: usize,
-    colormap: Colormap,
 ) {
-    let len = data.len();
+    let len = src.len();
     if len == 0 || bpr == 0 {
         return;
     }
@@ -651,13 +686,7 @@ pub(crate) fn paint_hex(
         // Each byte's cell color is computed once and reused for the hex cell,
         // the ASCII cell and both glyphs, not recomputed for each of the four.
         colors.clear();
-        colors.extend((0..n).map(|i| {
-            let off = row_start + i;
-            colormap.color_for(
-                data[off],
-                entropy_for(colormap, entropies, entropy_window, off),
-            )
-        }));
+        colors.extend((0..n).map(|i| src.color_at(row_start + i)));
         for (i, s) in selected.iter_mut().enumerate().take(n) {
             *s = sel.is_some_and(|r| r.contains(&(row_start + i)));
         }
@@ -707,7 +736,7 @@ pub(crate) fn paint_hex(
 
         // Text.
         build_row_text_into(
-            data,
+            src.data,
             row_start,
             n,
             &mut text,
@@ -966,34 +995,25 @@ pub(crate) fn render_image_from_rgba(
 /// Under `Colormap::None` every cell is left transparent, so the panel
 /// background shows through — `None` mutes a panel rather than disabling it, and
 /// the viewport band, hover preview and click-to-navigate all stay live.
-pub(crate) fn build_overview_rgba(
-    data: &[u8],
-    entropies: &[f32],
-    entropy_window: usize,
-    w: usize,
-    h: usize,
-    colormap: Colormap,
-) -> Vec<u8> {
+pub(crate) fn build_overview_rgba(src: &ByteSource, w: usize, h: usize) -> Vec<u8> {
     // `sample_average` needs at least one byte (it indexes `len - 1`); an
     // empty buffer is the safe placeholder for a missing file. Zero dimensions
     // would divide by zero below (`k % w`), so floor them at 1.
     let w = w.max(1);
     let h = h.max(1);
-    if data.is_empty() {
+    if src.is_empty() {
         return vec![0u8; w * h * 4];
     }
-    let len = data.len();
+    let len = src.len();
     let cells = (w * h).max(1);
     let mut pixels = vec![0u8; w * h * 4];
     for k in 0..cells {
         let start = k * len / cells;
         let end = ((k + 1) * len / cells).max(start + 1);
         let mid = (start + (end - start) / 2).min(len - 1);
-        let avg = sample_average(data, start, end);
+        let avg = sample_average(src.data, start, end);
         // Cell k sits at grid (col = k % w, row = k / w).
-        if let Some(c) =
-            colormap.color_for(avg, entropy_for(colormap, entropies, entropy_window, mid))
-        {
+        if let Some(c) = src.color_of(avg, mid) {
             set_pixel(&mut pixels, w, k % w, k / w, c);
         }
     }
@@ -1010,13 +1030,8 @@ pub(crate) const STRIP_CELLS: usize = 256;
 /// cells out row-major, so at `h = 1` every cell is one column and the two
 /// generators agree by construction rather than by keeping two copies of the
 /// downsampling math in step.
-pub(crate) fn build_strip_image(
-    data: &[u8],
-    entropies: &[f32],
-    entropy_window: usize,
-    colormap: Colormap,
-) -> Arc<RenderImage> {
-    let pixels = build_overview_rgba(data, entropies, entropy_window, STRIP_CELLS, 1, colormap);
+pub(crate) fn build_strip_image(src: &ByteSource) -> Arc<RenderImage> {
+    let pixels = build_overview_rgba(src, STRIP_CELLS, 1);
     render_image_from_rgba(STRIP_CELLS, 1, pixels)
 }
 
@@ -1029,18 +1044,14 @@ pub(crate) fn build_strip_image(
 ///
 /// Under `Colormap::None` every pixel stays transparent, so the panel
 /// background shows through; the panel stays interactive either way.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_zoom_rgba(
-    data: &[u8],
-    entropies: &[f32],
-    entropy_window: usize,
+    src: &ByteSource,
     bpr: usize,
     first_row_start: usize,
     rows: usize,
     block: f32,
-    colormap: Colormap,
 ) -> (Vec<u8>, usize, usize) {
-    let len = data.len();
+    let len = src.len();
     if len == 0 || bpr == 0 || rows == 0 || !block.is_finite() || block <= 0.0 {
         return (Vec::new(), 0, 0);
     }
@@ -1066,7 +1077,6 @@ pub(crate) fn build_zoom_rgba(
         rest = tail;
     }
 
-    let use_entropy = colormap.uses_entropy();
     slices.into_par_iter().for_each(|(r, buf)| {
         let row_start = first_row_start + r * bpr;
         if row_start >= len {
@@ -1079,12 +1089,7 @@ pub(crate) fn build_zoom_rgba(
         let h = y1 - y0;
         for i in 0..n {
             let off = row_start + i;
-            let e = if use_entropy {
-                entropy_at(entropies, entropy_window, off)
-            } else {
-                0.0
-            };
-            let Some(c) = colormap.color_for(data[off], e) else {
+            let Some(c) = src.color_at(off) else {
                 continue;
             };
             let x0 = (i as f32 * block).round() as usize;
@@ -1111,27 +1116,14 @@ pub(crate) fn build_zoom_rgba(
 
 /// Build the zoom column's visible-region texture. Wraps `build_zoom_rgba`
 /// so the pixel math is unit-testable without a gpui window.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_zoom_image(
-    data: &[u8],
-    entropies: &[f32],
-    entropy_window: usize,
+    src: &ByteSource,
     bpr: usize,
     first_row_start: usize,
     rows: usize,
     block: f32,
-    colormap: Colormap,
 ) -> Option<Arc<RenderImage>> {
-    let (pixels, iw, ih) = build_zoom_rgba(
-        data,
-        entropies,
-        entropy_window,
-        bpr,
-        first_row_start,
-        rows,
-        block,
-        colormap,
-    );
+    let (pixels, iw, ih) = build_zoom_rgba(src, bpr, first_row_start, rows, block);
     (iw > 0 && ih > 0).then(|| render_image_from_rgba(iw, ih, pixels))
 }
 
@@ -1158,14 +1150,33 @@ mod tests {
         entropy_window: usize,
         colormap: Colormap,
     ) -> Vec<u8> {
-        build_overview_rgba(data, entropies, entropy_window, STRIP_CELLS, 1, colormap)
+        build_overview_rgba(
+            &src(data, entropies, entropy_window, colormap),
+            STRIP_CELLS,
+            1,
+        )
+    }
+
+    /// A `ByteSource` over `data`, the shape every generator now takes.
+    fn src<'a>(
+        data: &'a [u8],
+        entropies: &'a [f32],
+        entropy_window: usize,
+        colormap: Colormap,
+    ) -> ByteSource<'a> {
+        ByteSource {
+            data,
+            entropies,
+            entropy_window,
+            colormap,
+        }
     }
 
     #[test]
     fn overview_buffer_is_w_by_h_and_opaque() {
         let data = [0x41u8; 4096];
         let e = entropies(&data);
-        let buf = build_overview_rgba(&data, &e, 256, 8, 4, Colormap::Value);
+        let buf = build_overview_rgba(&src(&data, &e, 256, Colormap::Value), 8, 4);
         assert_eq!(buf.len(), 8 * 4 * 4); // w × h × 4 channels, one band per cell
         for (i, &b) in buf.iter().enumerate() {
             if i % 4 == 3 {
@@ -1178,7 +1189,7 @@ mod tests {
     fn overview_value_colormap_is_byte_brightness() {
         let data = [0xAAu8; 512];
         let e = entropies(&data);
-        let buf = build_overview_rgba(&data, &e, 256, 2, 2, Colormap::Value);
+        let buf = build_overview_rgba(&src(&data, &e, 256, Colormap::Value), 2, 2);
         for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             assert_eq!(px(&buf, 2, x, y), (170, 170, 170, 255), "cell ({x},{y})");
         }
@@ -1188,7 +1199,7 @@ mod tests {
     fn overview_none_colormap_leaves_cells_transparent() {
         let data = [0xAAu8; 512];
         let e = entropies(&data);
-        let buf = build_overview_rgba(&data, &e, 256, 2, 2, Colormap::None);
+        let buf = build_overview_rgba(&src(&data, &e, 256, Colormap::None), 2, 2);
         assert!(buf.iter().all(|&b| b == 0), "None must paint nothing");
     }
 
@@ -1198,7 +1209,7 @@ mod tests {
         // directly visible in the buffer.
         let data = vec![0x00u8, 0x40, 0x80, 0xC0];
         let e = entropies(&data);
-        let buf = build_overview_rgba(&data, &e, 256, 2, 2, Colormap::Value);
+        let buf = build_overview_rgba(&src(&data, &e, 256, Colormap::Value), 2, 2);
         assert_eq!(px(&buf, 2, 0, 0).0, 0x00);
         assert_eq!(px(&buf, 2, 1, 0).0, 0x40);
         assert_eq!(px(&buf, 2, 0, 1).0, 0x80);
@@ -1211,7 +1222,7 @@ mod tests {
         let data: Vec<u8> = (0..=255u8).cycle().take(256).collect();
         let e = entropies(&data);
         assert!((e[0] - 8.0).abs() < 0.01, "e={}", e[0]);
-        let buf = build_overview_rgba(&data, &e, 256, 1, 1, Colormap::Entropy);
+        let buf = build_overview_rgba(&src(&data, &e, 256, Colormap::Entropy), 1, 1);
         assert_eq!(px(&buf, 1, 0, 0), (255, 60, 40, 255)); // entropy_color(8.0)
     }
 
@@ -1256,7 +1267,7 @@ mod tests {
         // The app never builds thumbnails without a file, but the generators
         // should not panic (sample_average indexes len - 1) if handed one.
         assert!(
-            build_overview_rgba(&[], &[], 256, 4, 2, Colormap::Value)
+            build_overview_rgba(&src(&[], &[], 256, Colormap::Value), 4, 2)
                 .iter()
                 .all(|&b| b == 0)
         );
@@ -1274,14 +1285,14 @@ mod tests {
         let data = [0x41u8; 64];
         // w → 1, so 1 × 4 × 4 channels = 16 bytes; h → 1, so 3 × 1 × 4 = 12.
         assert_eq!(
-            build_overview_rgba(&data, &[], 256, 0, 4, Colormap::Value).len(),
+            build_overview_rgba(&src(&data, &[], 256, Colormap::Value), 0, 4).len(),
             16
         );
         assert_eq!(
-            build_overview_rgba(&data, &[], 256, 3, 0, Colormap::Value).len(),
+            build_overview_rgba(&src(&data, &[], 256, Colormap::Value), 3, 0).len(),
             12
         );
-        let buf = build_overview_rgba(&data, &[], 256, 0, 2, Colormap::Value);
+        let buf = build_overview_rgba(&src(&data, &[], 256, Colormap::Value), 0, 2);
         assert_eq!(buf.len(), 2 * 4);
         let _img = render_image_from_rgba(1, 2, buf);
     }
@@ -1293,10 +1304,10 @@ mod tests {
         // Routing the RGBA buffer through the image crate panics on a
         // buffer-size mismatch — so simply constructing the image here
         // verifies the pixel-buffer invariants end to end.
-        let buf = build_overview_rgba(&data, &e, 256, 3, 2, Colormap::Value);
+        let buf = build_overview_rgba(&src(&data, &e, 256, Colormap::Value), 3, 2);
         assert_eq!(buf.len(), 3 * 2 * 4);
         let _img = render_image_from_rgba(3, 2, buf);
-        let _strip = build_strip_image(&data, &e, 256, Colormap::Value);
+        let _strip = build_strip_image(&src(&data, &e, 256, Colormap::Value));
     }
 
     /// The test harness binary is itself an ELF. Feed a genuine ELF through
@@ -1344,11 +1355,11 @@ mod tests {
         // Overview: valid buffer for a small grid; the image wrapper builds
         // (it runs the buffer through the image crate's size checks).
         let (w, h) = (16usize, 8usize);
-        let overview = build_overview_rgba(&data, &e, 256, w, h, Colormap::Value);
+        let overview = build_overview_rgba(&src(&data, &e, 256, Colormap::Value), w, h);
         assert_eq!(overview.len(), w * h * 4);
         assert!(overview.iter().skip(3).step_by(4).all(|&a| a == 255));
         let _img = render_image_from_rgba(w, h, overview);
-        let _strip = build_strip_image(&data, &e, 256, Colormap::Value);
+        let _strip = build_strip_image(&src(&data, &e, 256, Colormap::Value));
     }
 
     #[test]
@@ -1670,7 +1681,7 @@ mod tests {
     fn zoom_buffer_is_a_per_byte_pixel_grid() {
         let data = vec![0x00u8, 0x40, 0x80, 0xC0, 0x20, 0x60, 0xA0, 0xE0];
         let e = entropies(&data);
-        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 4, 0, 2, 4.0, Colormap::Value);
+        let (buf, iw, ih) = build_zoom_rgba(&src(&data, &e, 256, Colormap::Value), 4, 0, 2, 4.0);
         assert_eq!((iw, ih), (16, 8)); // ceil(4·4) × ceil(2·4)
         assert_eq!(buf.len(), 16 * 8 * 4);
         // Each byte is a solid 4×4 block at (row, col) = (k / 4, k % 4).
@@ -1694,7 +1705,7 @@ mod tests {
         // 10,11 — not bytes 0..4.
         let data: Vec<u8> = (0..12).map(|i| i * 8).collect();
         let e = entropies(&data);
-        let (buf, iw, _ih) = build_zoom_rgba(&data, &e, 256, 2, 8, 2, 4.0, Colormap::Value);
+        let (buf, iw, _ih) = build_zoom_rgba(&src(&data, &e, 256, Colormap::Value), 2, 8, 2, 4.0);
         assert_eq!((buf[0], buf[1]), (8 * 8, 8 * 8)); // byte 8
         assert_eq!((buf[4 * 4], buf[4 * 4 + 1]), (9 * 8, 9 * 8)); // byte 9
         // Block row 1 spans pixel rows 4..8; it starts at byte 10.
@@ -1705,7 +1716,7 @@ mod tests {
     fn zoom_none_colormap_leaves_the_texture_transparent() {
         let data = [0xAAu8; 16];
         let e = entropies(&data);
-        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 4, 0, 2, 4.0, Colormap::None);
+        let (buf, iw, ih) = build_zoom_rgba(&src(&data, &e, 256, Colormap::None), 4, 0, 2, 4.0);
         assert_eq!(buf.len(), iw * ih * 4);
         assert!(buf.iter().all(|&b| b == 0), "None must paint nothing");
     }
@@ -1716,7 +1727,7 @@ mod tests {
         // still resolves to a byte and the buffer spans the full panel width.
         let data = [0x00u8, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF];
         let e = entropies(&data);
-        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 5, 0, 2, 3.8, Colormap::Value);
+        let (buf, iw, ih) = build_zoom_rgba(&src(&data, &e, 256, Colormap::Value), 5, 0, 2, 3.8);
         assert_eq!((iw, ih), (19, 8)); // ceil(5·3.8) × ceil(2·3.8)
         // No pixel is transparent: every column is covered by a byte block.
         for y in 0..ih {
@@ -1732,18 +1743,18 @@ mod tests {
         // that row stay transparent (paint_image leaves them as panel bg).
         let data: Vec<u8> = (0..8).map(|i| i * 16).collect();
         let e = entropies(&data);
-        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 6, 0, 2, 4.0, Colormap::Value);
+        let (buf, iw, ih) = build_zoom_rgba(&src(&data, &e, 256, Colormap::Value), 6, 0, 2, 4.0);
         assert_eq!((iw, ih), (24, 8));
         // Block row 1 spans pixel rows 4..8 and holds bytes 6 and 7.
         assert_eq!(px(&buf, iw, 0, 4).0, 96); // byte 6 (0x60)
         assert_eq!(px(&buf, iw, 4, 4).0, 112); // byte 7 (0x70)
         assert_eq!(px(&buf, iw, 12, 4).3, 0); // past the last byte: transparent
         // Degenerate inputs never panic and yield an empty buffer.
-        let (buf, iw, ih) = build_zoom_rgba(&[], &[], 256, 4, 0, 2, 4.0, Colormap::Value);
+        let (buf, iw, ih) = build_zoom_rgba(&src(&[], &[], 256, Colormap::Value), 4, 0, 2, 4.0);
         assert_eq!((buf.len(), iw, ih), (0, 0, 0));
-        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 0, 0, 2, 4.0, Colormap::Value);
+        let (buf, iw, ih) = build_zoom_rgba(&src(&data, &e, 256, Colormap::Value), 0, 0, 2, 4.0);
         assert_eq!((buf.len(), iw, ih), (0, 0, 0));
-        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 6, 0, 0, 4.0, Colormap::Value);
+        let (buf, iw, ih) = build_zoom_rgba(&src(&data, &e, 256, Colormap::Value), 6, 0, 0, 4.0);
         assert_eq!((buf.len(), iw, ih), (0, 0, 0));
     }
 
@@ -1751,9 +1762,9 @@ mod tests {
     fn zoom_image_wrapper_builds_a_valid_texture() {
         let data: Vec<u8> = (0..32).map(|i| i as u8).collect();
         let e = entropies(&data);
-        let img = build_zoom_image(&data, &e, 256, 8, 0, 2, 4.0, Colormap::Class);
+        let img = build_zoom_image(&src(&data, &e, 256, Colormap::Class), 8, 0, 2, 4.0);
         assert!(img.is_some());
-        let img = build_zoom_image(&[], &e, 256, 8, 0, 2, 4.0, Colormap::Class);
+        let img = build_zoom_image(&src(&[], &e, 256, Colormap::Class), 8, 0, 2, 4.0);
         assert!(img.is_none());
     }
 }

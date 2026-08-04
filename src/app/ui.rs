@@ -538,12 +538,14 @@ impl ParallHexApp {
                                                 .spawn(async move {
                                                     data.as_deref().map(|d| {
                                                         panes::build_overview_rgba(
-                                                            d,
-                                                            &entropies,
-                                                            key.entropy_window,
+                                                            &panes::ByteSource {
+                                                                data: d,
+                                                                entropies: &entropies,
+                                                                entropy_window: key.entropy_window,
+                                                                colormap: key.colormap,
+                                                            },
                                                             key.w,
                                                             key.h,
-                                                            key.colormap,
                                                         )
                                                     })
                                                 })
@@ -938,16 +940,18 @@ impl ParallHexApp {
                                             window,
                                             cx,
                                             bounds,
-                                            d,
+                                            &panes::ByteSource {
+                                                data: d,
+                                                entropies: &hex_entropies,
+                                                entropy_window,
+                                                colormap: hex_colormap,
+                                            },
                                             &font,
                                             char_w,
                                             bpr,
                                             first_row_start,
                                             hovered,
                                             sel.as_ref(),
-                                            &hex_entropies,
-                                            entropy_window,
-                                            hex_colormap,
                                         );
                                     } else {
                                         window.paint_quad(quad_dark(bounds));

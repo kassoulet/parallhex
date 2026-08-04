@@ -495,16 +495,13 @@ impl ParallHexApp {
                     .background_executor()
                     .spawn(async move {
                         data.as_deref().and_then(|d| {
-                            panes::build_zoom_image(
-                                d,
-                                &entropies,
-                                key.entropy_window,
-                                key.bpr,
-                                key.first_row_start,
-                                rows,
-                                block,
-                                key.colormap,
-                            )
+                            let src = panes::ByteSource {
+                                data: d,
+                                entropies: &entropies,
+                                entropy_window: key.entropy_window,
+                                colormap: key.colormap,
+                            };
+                            panes::build_zoom_image(&src, key.bpr, key.first_row_start, rows, block)
                         })
                     })
                     .await;
@@ -635,11 +632,16 @@ impl ParallHexApp {
         }
         self.strip_dirty = false;
         let entropies = self.entropies.clone();
-        let window = self.entropy_window;
+        let entropy_window = self.entropy_window;
         let colormap = self.overview_colormap;
-        self.strip_image = self
-            .data()
-            .map(|d| panes::build_strip_image(d, &entropies, window, colormap));
+        self.strip_image = self.data().map(|d| {
+            panes::build_strip_image(&panes::ByteSource {
+                data: d,
+                entropies: &entropies,
+                entropy_window,
+                colormap,
+            })
+        });
     }
 
     fn file_name_str(&self) -> String {
