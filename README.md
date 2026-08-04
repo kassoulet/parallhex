@@ -5,6 +5,16 @@
 A native binary/hex explorer: one wide window showing the same region of a file
 through three synchronized columns.
 
+![ParallHex showing libc.so.6: an entropy overview of the whole file, a
+byte-class pixel map, and class-coloured hex with a selection](docs/screenshot.png)
+
+*`libc.so.6` at offset 0. The overview (left) maps entropy over the whole 2 MiB —
+the green body is compiled code, the red bands at each end are the tables. The
+zoom column (middle) switches to the byte-class palette, where the section
+boundaries become visible as texture changes: high bytes in orange, a block of
+printable strings in blue. On the right, 78 selected bytes are tinted across
+the hex and ASCII cells.*
+
 | Column | Shows |
 |---|---|
 | **Overview** (left) | The whole file downsampled to one band per cell, with a marker for the region the zoom column is showing. |

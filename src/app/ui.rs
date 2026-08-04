@@ -730,7 +730,7 @@ impl ParallHexApp {
                 }),
             )
             .child(swatch(current))
-            .child(div().child(format!("Map: {}", current.label())))
+            .child(div().child(format!("Color: {}", current.label())))
             .child(div().child("▾"));
 
         div()
