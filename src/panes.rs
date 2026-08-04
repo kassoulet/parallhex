@@ -23,7 +23,7 @@ use gpui::{
     transparent_black,
 };
 
-use crate::color::{self, Colormap, Rgb};
+use crate::core::color::{self, Colormap, Rgb};
 
 pub(crate) const PIXEL_ZOOM_DEFAULT: f32 = 4.0;
 pub(crate) const PIXEL_ZOOM_MIN: f32 = 1.0;
@@ -1198,7 +1198,7 @@ mod tests {
 
     /// Per-window Shannon entropies for `data`, as handed to the generators.
     fn entropies(data: &[u8]) -> Vec<f32> {
-        crate::entropy::block_entropies(data, 256)
+        crate::core::entropy::block_entropies(data, 256)
     }
 
     /// The strip's raw pixels: one row of the overview, exactly as

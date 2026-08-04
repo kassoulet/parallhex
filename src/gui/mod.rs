@@ -2,7 +2,8 @@
 //! view dispatches. The view itself lives in `app`, its tree builder in
 //! `app::ui`, and the painters in `paint`.
 
-use crate::{app, config};
+use crate::app;
+use crate::core::config;
 
 use std::path::PathBuf;
 
@@ -235,7 +236,7 @@ mod tests {
     use super::{Cli, key_bindings, parse_args, restored_bounds};
     use std::path::PathBuf;
 
-    use crate::config;
+    use crate::core::config;
     use gpui::{Bounds, Pixels, point, px, size};
 
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {

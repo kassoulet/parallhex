@@ -33,9 +33,7 @@
 )]
 
 pub(crate) mod app;
-pub(crate) mod color;
-pub(crate) mod config;
-pub(crate) mod entropy;
+pub(crate) mod core;
 pub(crate) mod jump;
 pub(crate) mod panes;
 

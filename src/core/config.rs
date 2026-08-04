@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::color::Colormap;
+use crate::core::color::Colormap;
 use crate::panes::PIXEL_ZOOM_DEFAULT;
 
 /// UI preferences that survive across sessions.

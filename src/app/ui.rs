@@ -10,7 +10,7 @@ use gpui::{
     rgba, size, transparent_black,
 };
 
-use crate::color::Colormap;
+use crate::core::color::Colormap;
 use crate::panes;
 
 use super::*;

@@ -17,9 +17,9 @@ use gpui::AsyncApp;
 
 use memmap2::{Mmap, MmapOptions};
 
-use crate::color::{self, Colormap};
-use crate::config;
-use crate::entropy;
+use crate::core::color::{self, Colormap};
+use crate::core::config;
+use crate::core::entropy;
 use crate::gui::{
     ClearSelection, CopySelectionAscii, CopySelectionHex, JumpCancel, JumpSubmit, JumpToOffset,
     NavigateDown, NavigateEnd, NavigateHome, NavigateLeft, NavigatePageDown, NavigatePageUp,
@@ -1868,7 +1868,7 @@ mod tests {
     /// otherwise a reset could produce an out-of-range width.
     #[test]
     fn reset_column_defaults_are_within_drag_clamps() {
-        let defaults = crate::config::Config::default();
+        let defaults = crate::core::config::Config::default();
         assert!(
             (OVERVIEW_W_MIN..=OVERVIEW_W_MAX).contains(&defaults.overview_width),
             "overview default must be within the drag clamp range"
