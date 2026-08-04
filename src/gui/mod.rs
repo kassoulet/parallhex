@@ -1,27 +1,8 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-// Curated `clippy::pedantic` allows (see Cargo.toml `[lints.clippy]`):
-// - Packed RGB/RGBA color literals (`rgb(0x7aa2f7)`) are the idiomatic form
-//   for a hex viewer's palette; forcing digit separators hurts readability.
-// - UI/scroll math converts between f32, f64 and usize (pixel sizes, row
-//   offsets, viewport heights); the values are bounded and the casts are
-//   deliberate, so the flagged precision loss/truncation cannot occur.
-// - Float equality is used only against exactly-representable constants
-//   (0.0, 1.0) and in test assertions.
-#![allow(
-    clippy::unreadable_literal,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::float_cmp
-)]
+//! The gpui frontend: window creation, key bindings, and the actions the root
+//! view dispatches. The view itself lives in `app`, its tree builder in
+//! `app::ui`, and the painters in `paint`.
 
-mod app;
-mod color;
-mod config;
-mod entropy;
-mod jump;
-mod panes;
+use crate::{app, config};
 
 use std::path::PathBuf;
 
@@ -91,7 +72,7 @@ const MIN_WINDOW_W: f32 = 1000.0;
 const MIN_WINDOW_H: f32 = 600.0;
 
 /// Result of parsing the command line.
-enum Cli {
+pub enum Cli {
     /// Launch the app, optionally opening a file.
     Launch(Option<PathBuf>),
     /// Print usage / an error and exit with this status code.
@@ -102,7 +83,7 @@ enum Cli {
 /// first is opened on startup); `-h`/`--help` prints usage; `--` ends option
 /// parsing (everything after is a file path); any other `-`-prefixed option
 /// is rejected instead of being treated as a file.
-fn parse_args(args: impl Iterator<Item = String>) -> Cli {
+pub fn parse_args(args: impl Iterator<Item = String>) -> Cli {
     let mut file: Option<PathBuf> = None;
     let mut positional_only = false;
     for arg in args {
@@ -179,11 +160,15 @@ fn key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-fn main() {
-    let initial_file = match parse_args(std::env::args().skip(1)) {
-        Cli::Exit(code) => std::process::exit(code),
-        Cli::Launch(file) => file,
-    };
+/// Open the window and run the gpui application loop. `initial_file` has
+/// already been parsed from the command line by the binary shim.
+///
+/// # Panics
+///
+/// Panics if the window cannot be opened — there is no usable fallback for a
+/// GUI whose window the platform refused to create, and the error text is more
+/// useful than a silent exit.
+pub fn run(initial_file: Option<PathBuf>) {
     Application::new().run(move |cx: &mut gpui::App| {
         cx.bind_keys(key_bindings());
 

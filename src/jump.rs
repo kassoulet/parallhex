@@ -13,7 +13,7 @@ use gpui::{
     relative, rgb, rgba, size,
 };
 
-use crate::{Backspace, Delete, JumpCancel, JumpSubmit, NavigateLeft, NavigateRight, Paste};
+use crate::gui::{Backspace, Delete, JumpCancel, JumpSubmit, NavigateLeft, NavigateRight, Paste};
 
 /// Events emitted by the jump field to its parent view.
 #[derive(Clone, Debug)]

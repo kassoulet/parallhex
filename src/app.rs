@@ -20,14 +20,14 @@ use memmap2::{Mmap, MmapOptions};
 use crate::color::{self, Colormap};
 use crate::config;
 use crate::entropy;
-use crate::jump::{JumpField, JumpFieldEvent};
-use crate::panes;
-use crate::{
+use crate::gui::{
     ClearSelection, CopySelectionAscii, CopySelectionHex, JumpCancel, JumpSubmit, JumpToOffset,
     NavigateDown, NavigateEnd, NavigateHome, NavigateLeft, NavigatePageDown, NavigatePageUp,
     NavigateRight, NavigateUp, OpenFile, Quit, ResetColumns, ResetSettings, ResetView, ZoomIn,
     ZoomOut,
 };
+use crate::jump::{JumpField, JumpFieldEvent};
+use crate::panes;
 
 // The view-construction methods (columns, bars, dialog, sliders) and their
 // shared chrome helpers live in `ui`; this module keeps the state, the

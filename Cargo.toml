@@ -8,9 +8,13 @@ license = "MIT OR Apache-2.0"
 # another parallhex binary without clashing. Only the *binary* is renamed: the
 # package, the `actions!` namespace and the config directory stay `parallhex`, so
 # an existing preferences file is still found.
+[lib]
+name = "parallhex"
+path = "src/lib.rs"
+
 [[bin]]
 name = "parallhex-gpui"
-path = "src/main.rs"
+path = "src/bin/parallhex-gpui.rs"
 
 [dependencies]
 gpui = "0.2.2"
