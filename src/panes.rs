@@ -15,9 +15,12 @@ use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use gpui::{
-    App, Background, BorderStyle, Bounds, Corners, Font, Hsla, Pixels, Point, RenderImage, Rgba,
-    ShapedLine, TextRun, Window, font, point, px, quad, rgb, rgba, size, transparent_black,
+    App, Background, BorderStyle, Bounds, Corners, Font, Hsla, PaintQuad, Pixels, Point,
+    RenderImage, Rgba, ShapedLine, TextRun, Window, font, point, px, quad, rgb, rgba, size,
+    transparent_black,
 };
 
 use crate::color::{self, Colormap};
@@ -130,6 +133,19 @@ pub(crate) fn visible_rows(panel_height: f32, row_h: f32) -> usize {
 pub(crate) const SCROLLBAR_W: f32 = 10.0;
 const MIN_THUMB_H: f32 = 24.0;
 
+/// A solid background quad: the common case of `quad` with no corner radius
+/// and no border. Replaces the repeated five-argument `quad(...)` call sites.
+pub(crate) fn filled_quad(bounds: Bounds<Pixels>, color: impl Into<Background>) -> PaintQuad {
+    quad(
+        bounds,
+        px(0.),
+        color.into(),
+        px(0.),
+        transparent_black(),
+        BorderStyle::default(),
+    )
+}
+
 /// Thumb `(top, height)` for a vertical scrollbar `track_h` tall, showing
 /// `visible` bytes of `len` anchored at `anchor`.
 pub(crate) fn scrollbar_thumb(
@@ -178,14 +194,7 @@ pub(crate) fn paint_scrollbar(
     visible: usize,
     len: usize,
 ) {
-    window.paint_quad(quad(
-        bounds,
-        px(0.),
-        rgba(0x00000033),
-        px(0.),
-        transparent_black(),
-        BorderStyle::default(),
-    ));
+    window.paint_quad(filled_quad(bounds, rgba(0x00000033)));
     let track_h = bounds.size.height.to_f64() as f32;
     let (top, height) = scrollbar_thumb(track_h, anchor, last_anchor, visible, len);
     if height <= 0.0 {
@@ -241,12 +250,19 @@ fn to_hsla(c: Rgba) -> Hsla {
     Hsla::from(c)
 }
 
-/// Glyph color for a byte: contrasting against its cell background when the
-/// panel's colormap paints one, otherwise the default foreground.
-fn glyph_color(b: u8, entropy: f32, colormap: Colormap) -> Hsla {
-    match colormap.color_for(b, entropy) {
-        Some(bg) => to_hsla(color::fg_for_bg(bg)),
-        None => to_hsla(rgb(DEFAULT_FG)),
+/// Entropy at `offset` for a byte lookup under `colormap`. Only the `Entropy`
+/// colormap consumes it, so the other three skip the interpolating lookup
+/// entirely (PERF.md item 3).
+pub(crate) fn entropy_for(
+    colormap: Colormap,
+    entropies: &[f32],
+    window: usize,
+    offset: usize,
+) -> f32 {
+    if colormap.uses_entropy() {
+        entropy_at(entropies, window, offset)
+    } else {
+        0.0
     }
 }
 
@@ -372,20 +388,22 @@ pub(crate) fn zoom_offset_at(
 // Text building for a hex row
 // ---------------------------------------------------------------------------
 
-/// The assembled row line plus the char offsets of each byte's hex digits and
-/// ASCII glyph. Offsets are UTF-8 byte indices into `text`.
-pub(crate) struct RowText {
-    pub text: String,
-    pub hex_offsets: Vec<usize>,
-    pub ascii_offsets: Vec<usize>,
-}
-
 /// Build the display text of one hex row:
-/// `ADDR  HH HH …  AAAA` with an extra space every 8 hex bytes.
-pub(crate) fn build_row_text(data: &[u8], row_start: usize, n: usize) -> RowText {
-    let mut text = format!("{row_start:08X}  ");
-    let mut hex_offsets = Vec::with_capacity(n);
-    let mut ascii_offsets = Vec::with_capacity(n);
+/// `ADDR  HH HH …  AAAA` with an extra space every 8 hex bytes. Writes into
+/// caller-owned buffers that are cleared and refilled — `paint_hex` reuses one
+/// set across every row instead of allocating per row (PERF.md item 5).
+pub(crate) fn build_row_text_into(
+    data: &[u8],
+    row_start: usize,
+    n: usize,
+    text: &mut String,
+    hex_offsets: &mut Vec<usize>,
+    ascii_offsets: &mut Vec<usize>,
+) {
+    text.clear();
+    hex_offsets.clear();
+    ascii_offsets.clear();
+    let _ = write!(text, "{row_start:08X}  ");
     for i in 0..n {
         if i > 0 && i % 8 == 0 {
             text.push(' ');
@@ -401,31 +419,35 @@ pub(crate) fn build_row_text(data: &[u8], row_start: usize, n: usize) -> RowText
         text.push(color::printable(data[row_start + i]));
         ascii_offsets.push(off);
     }
-    RowText {
-        text,
-        hex_offsets,
-        ascii_offsets,
+}
+
+/// Glyph color for a cell: contrast text against its background, or the
+/// default foreground when the colormap paints no background.
+fn cell_glyph_color(cell: Option<Rgba>) -> Hsla {
+    match cell {
+        Some(bg) => to_hsla(color::fg_for_bg(bg)),
+        None => to_hsla(rgb(DEFAULT_FG)),
     }
 }
 
 /// Build the color runs for a row line: gray address, contrast-colored hex
-/// digits and ASCII glyphs per byte, neutral (invisible) spaces.
+/// digits and ASCII glyphs per byte, neutral (invisible) spaces. Glyph colors
+/// come from the row's precomputed per-byte cell colors (`colors[i]`), so each
+/// byte's color is computed once and reused for both cells and both glyphs
+/// (PERF.md item 2). Runs are written into the caller-owned `runs` buffer.
 #[allow(clippy::too_many_arguments)]
 fn build_row_runs(
-    data: &[u8],
-    row_start: usize,
     n: usize,
     hex_offsets: &[usize],
     ascii_offsets: &[usize],
     font: &Font,
     total_len: usize,
-    entropies: &[f32],
-    entropy_window: usize,
-    colormap: Colormap,
-) -> Vec<TextRun> {
+    colors: &[Option<Rgba>],
+    runs: &mut Vec<TextRun>,
+) {
+    runs.clear();
     let neutral = to_hsla(rgba(0x00000000));
     let addr_color = to_hsla(rgb(0x9a9a9a));
-    let mut runs = Vec::new();
     let mut cur = 10usize;
 
     let gap = |from: usize, to: usize, runs: &mut Vec<TextRun>| {
@@ -453,13 +475,9 @@ fn build_row_runs(
 
     // Hex cells.
     for i in 0..n {
-        gap(cur, hex_offsets[i], &mut runs);
+        gap(cur, hex_offsets[i], runs);
         cur = hex_offsets[i];
-        let fg = glyph_color(
-            data[row_start + i],
-            entropy_at(entropies, entropy_window, row_start + i),
-            colormap,
-        );
+        let fg = cell_glyph_color(colors[i]);
         runs.push(TextRun {
             len: 2,
             font: font.clone(),
@@ -482,21 +500,16 @@ fn build_row_runs(
 
     // Gap to the ASCII section.
     if n > 0 {
-        gap(cur, ascii_offsets[0], &mut runs);
+        gap(cur, ascii_offsets[0], runs);
         cur = ascii_offsets[0];
     }
 
     // ASCII cells.
-    for i in 0..n {
-        let fg = glyph_color(
-            data[row_start + i],
-            entropy_at(entropies, entropy_window, row_start + i),
-            colormap,
-        );
+    for &cell in colors.iter().take(n) {
         runs.push(TextRun {
             len: 1,
             font: font.clone(),
-            color: fg,
+            color: cell_glyph_color(cell),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -504,8 +517,7 @@ fn build_row_runs(
         cur += 1;
     }
 
-    gap(cur, total_len, &mut runs);
-    runs
+    gap(cur, total_len, runs);
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +545,51 @@ pub(crate) fn hex_char_width(window: &mut Window, font: &Font, font_size: Pixels
     (line.x_for_index(64).to_f64() as f32 / 64.0).max(1.0)
 }
 
+/// Paint merged quads for a run of cell backgrounds. A run extends while the
+/// (color, selection) state is unchanged and stays within one group of
+/// `split_every` cells (the hex side splits at 8 so a merged quad never covers
+/// the group gap, which shows the panel background; `usize::MAX` merges the
+/// whole row). Cell x comes from `x_of`.
+#[allow(clippy::too_many_arguments)]
+fn paint_cell_runs(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    y0: f32,
+    colors: &[Option<Rgba>],
+    selected: &[bool],
+    x_of: impl Fn(usize) -> f32,
+    cell_w: f32,
+    split_every: usize,
+) {
+    let n = colors.len();
+    let mut i = 0;
+    while i < n {
+        let bg = colors[i];
+        let s = selected[i];
+        let mut j = i + 1;
+        while j < n && colors[j] == bg && selected[j] == s && j % split_every != 0 {
+            j += 1;
+        }
+        let x0 = x_of(i);
+        let rect = Bounds::new(
+            point(origin.x + px(x0), origin.y + px(y0)),
+            size(px(x_of(j - 1) + cell_w - x0), px(ROW_H)),
+        );
+        if let Some(bg) = bg {
+            window.paint_quad(filled_quad(rect, bg));
+        }
+        if s {
+            window.paint_quad(filled_quad(rect, rgba(0xffffff3d)));
+        }
+        i = j;
+    }
+}
+
 /// Paint the hex column into `bounds`: class-colored hex + ASCII cells with
-/// selection/hover overlays, one virtualized row at a time.
+/// selection/hover overlays, one virtualized row at a time. Cell-background
+/// quads are merged into runs of identical (color, selection) state — binary
+/// data is repetitive, so the 2·bpr quads per row typically collapse to a
+/// handful (PERF.md item 2).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn paint_hex(
     window: &mut Window,
@@ -542,6 +597,7 @@ pub(crate) fn paint_hex(
     bounds: Bounds<Pixels>,
     data: &[u8],
     font: &Font,
+    char_w: f32,
     bpr: usize,
     first_row_start: usize,
     hovered: Option<usize>,
@@ -556,12 +612,19 @@ pub(crate) fn paint_hex(
     }
     let row_h = ROW_H;
     let font_size = px(HEX_FONT_SIZE);
-    let char_w = hex_char_width(window, font, font_size);
     let geo = RowGeo::new(char_w, bpr);
 
     let rows = visible_rows(bounds.size.height.to_f64() as f32, BLOCK_H);
 
     let origin = bounds.origin;
+    // Reusable per-row buffers (PERF.md item 5): cleared and refilled for each
+    // row instead of reallocated.
+    let mut text = String::with_capacity(128);
+    let mut hex_offsets = Vec::with_capacity(bpr);
+    let mut ascii_offsets = Vec::with_capacity(bpr);
+    let mut colors: Vec<Option<Rgba>> = Vec::with_capacity(bpr);
+    let mut selected = vec![false; bpr];
+    let mut runs: Vec<TextRun> = Vec::new();
     for r in 0..rows {
         let row_start = first_row_start + r * bpr;
         if row_start >= len {
@@ -570,71 +633,51 @@ pub(crate) fn paint_hex(
         let y0 = r as f32 * BLOCK_H;
         let n = (len - row_start).min(bpr);
 
-        // Cell backgrounds (+ selection overlay).
-        for i in 0..n {
+        // Each byte's cell color is computed once and reused for the hex cell,
+        // the ASCII cell and both glyphs (PERF.md item 2).
+        colors.clear();
+        colors.extend((0..n).map(|i| {
             let off = row_start + i;
-            let cell_bg = colormap.color_for(data[off], entropy_at(entropies, entropy_window, off));
-            let hex_x = geo.cell_x(i);
-            let hex_rect = Bounds::new(
-                point(origin.x + px(hex_x), origin.y + px(y0)),
-                size(px(geo.cell_w), px(row_h)),
-            );
-            if let Some(bg) = cell_bg {
-                let class: Background = bg.into();
-                window.paint_quad(quad(
-                    hex_rect,
-                    px(0.),
-                    class,
-                    px(0.),
-                    transparent_black(),
-                    BorderStyle::default(),
-                ));
-            }
-            let ascii_x = geo.ascii_x(i);
-            let ascii_rect = Bounds::new(
-                point(origin.x + px(ascii_x), origin.y + px(y0)),
-                size(px(geo.char_w), px(row_h)),
-            );
-            if let Some(bg) = cell_bg {
-                let class: Background = bg.into();
-                window.paint_quad(quad(
-                    ascii_rect,
-                    px(0.),
-                    class,
-                    px(0.),
-                    transparent_black(),
-                    BorderStyle::default(),
-                ));
-            }
-            if sel.is_some_and(|r| r.contains(&off)) {
-                let tint: Background = rgba(0xffffff3d).into();
-                window.paint_quad(quad(
-                    hex_rect,
-                    px(0.),
-                    tint,
-                    px(0.),
-                    transparent_black(),
-                    BorderStyle::default(),
-                ));
-                window.paint_quad(quad(
-                    ascii_rect,
-                    px(0.),
-                    tint,
-                    px(0.),
-                    transparent_black(),
-                    BorderStyle::default(),
-                ));
-            }
+            colormap.color_for(
+                data[off],
+                entropy_for(colormap, entropies, entropy_window, off),
+            )
+        }));
+        for (i, s) in selected.iter_mut().enumerate().take(n) {
+            *s = sel.is_some_and(|r| r.contains(&(row_start + i)));
         }
+
+        // Merged background + selection quads. Hex cells split at every 8-byte
+        // group boundary so merged quads never cover the group gap; ASCII
+        // cells are contiguous and merge across the whole row.
+        paint_cell_runs(
+            window,
+            origin,
+            y0,
+            &colors[..n],
+            &selected[..n],
+            |i| geo.cell_x(i),
+            geo.cell_w,
+            8,
+        );
+        paint_cell_runs(
+            window,
+            origin,
+            y0,
+            &colors[..n],
+            &selected[..n],
+            |i| geo.ascii_x(i),
+            geo.char_w,
+            usize::MAX,
+        );
 
         // Hover outline across hex + ascii cells.
         if let Some(o) = hovered
             && (row_start..row_start + n).contains(&o)
         {
             let i = o - row_start;
-            let x0 = geo.cell_x(i);
             let rect = Bounds::new(
-                point(origin.x + px(x0), origin.y + px(y0)),
+                point(origin.x + px(geo.cell_x(i)), origin.y + px(y0)),
                 size(px(geo.cell_w), px(row_h)),
             );
             window.paint_quad(quad(
@@ -648,22 +691,26 @@ pub(crate) fn paint_hex(
         }
 
         // Text.
-        let rt = build_row_text(data, row_start, n);
-        let runs = build_row_runs(
+        build_row_text_into(
             data,
             row_start,
             n,
-            &rt.hex_offsets,
-            &rt.ascii_offsets,
+            &mut text,
+            &mut hex_offsets,
+            &mut ascii_offsets,
+        );
+        build_row_runs(
+            n,
+            &hex_offsets,
+            &ascii_offsets,
             font,
-            rt.text.len(),
-            entropies,
-            entropy_window,
-            colormap,
+            text.len(),
+            &colors[..n],
+            &mut runs,
         );
         let line = window
             .text_system()
-            .shape_line(rt.text.into(), font_size, &runs, None);
+            .shape_line(text.clone().into(), font_size, &runs, None);
         // `RowGeo` builds ADDR_X into `hex_start`, so the glyphs need the same
         // gutter or every background sits half a byte right of its digits.
         let _ = line.paint(
@@ -675,82 +722,89 @@ pub(crate) fn paint_hex(
     }
 }
 
-/// Paint the zoom column into `bounds`: one `zoom`-sized band per byte in
-/// `colormap`, rows flush so the panel reads as a pixel image. Virtualized to
-/// the visible rows starting at the row-aligned `first_row_start`.
+/// Paint the zoom column into `bounds`: the visible bytes as a single
+/// `RenderImage` texture (built by `build_zoom_image`, cached across frames),
+/// with selection, hover and the hex-column mark as overlay quads on top.
+/// Rows are flush so the panel reads as a pixel image; the texture is built at
+/// one pixel per screen pixel so it needs no smoothing (PERF.md item 1).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_zoom(
     window: &mut Window,
     bounds: Bounds<Pixels>,
-    data: &[u8],
+    image: Option<&Arc<RenderImage>>,
     bpr: usize,
     first_row_start: usize,
     block: f32,
     hovered: Option<usize>,
     sel: Option<&Range<usize>>,
-    entropies: &[f32],
-    entropy_window: usize,
-    colormap: Colormap,
     mark: Option<&Range<usize>>,
+    len: usize,
 ) {
-    let len = data.len();
-    if len == 0 || bpr == 0 || !block.is_finite() || block <= 0.0 {
+    if bpr == 0 || !block.is_finite() || block <= 0.0 {
         return;
     }
-    let zoom = block;
-    let rows = visible_rows(bounds.size.height.to_f64() as f32, zoom);
-    for r in 0..rows {
-        let row_start = first_row_start + r * bpr;
-        if row_start >= len {
-            break;
-        }
-        let y = bounds.top().to_f64() as f32 + r as f32 * zoom;
-        let n = (len - row_start).min(bpr);
-        for i in 0..n {
-            let off = row_start + i;
+    if let Some(image) = image {
+        let _ = window.paint_image(bounds, Corners::all(px(0.)), image.clone(), 0, false);
+    }
+    let rows = visible_rows(bounds.size.height.to_f64() as f32, block);
+
+    // Overlays: merged selection-tint quads, then the hover outline. The
+    // selection is a single contiguous byte range, so its intersection with
+    // each row is one merged quad.
+    if let Some(sel) = sel
+        && !sel.is_empty()
+    {
+        let y0px = bounds.top().to_f64() as f32;
+        for r in 0..rows {
+            let row_start = first_row_start + r * bpr;
+            if row_start >= len {
+                break;
+            }
+            let n = (len - row_start).min(bpr);
+            let row_end = row_start + n;
+            if sel.start >= row_end || sel.end <= row_start {
+                continue;
+            }
+            let i0 = sel.start.saturating_sub(row_start);
+            let i1 = sel.end.min(row_end) - row_start;
             let rect = Bounds::new(
-                point(bounds.left() + px(i as f32 * zoom), px(y)),
-                size(px(zoom), px(zoom)),
+                point(
+                    bounds.left() + px(i0 as f32 * block),
+                    px(y0px + r as f32 * block),
+                ),
+                size(px((i1 - i0) as f32 * block), px(block)),
             );
-            if let Some(c) =
-                colormap.color_for(data[off], entropy_at(entropies, entropy_window, off))
-            {
-                let bg: Background = c.into();
-                window.paint_quad(quad(
-                    rect,
-                    px(0.),
-                    bg,
-                    px(0.),
-                    transparent_black(),
-                    BorderStyle::default(),
-                ));
-            }
-            if sel.is_some_and(|s| s.contains(&off)) {
-                let tint: Background = rgba(0xffffff30).into();
-                window.paint_quad(quad(
-                    rect,
-                    px(0.),
-                    tint,
-                    px(0.),
-                    transparent_black(),
-                    BorderStyle::default(),
-                ));
-            }
-            if hovered == Some(off) {
-                window.paint_quad(quad(
-                    rect,
-                    px(0.),
-                    transparent_black(),
-                    px(1.),
-                    gpui::white(),
-                    BorderStyle::default(),
-                ));
-            }
+            window.paint_quad(filled_quad(rect, rgba(0xffffff30)));
         }
     }
+    if let Some(off) = hovered
+        && off >= first_row_start
+    {
+        let rel = off - first_row_start;
+        let r = rel / bpr;
+        if r < rows {
+            let i = rel % bpr;
+            let rect = Bounds::new(
+                point(
+                    bounds.left() + px(i as f32 * block),
+                    px(bounds.top().to_f64() as f32 + r as f32 * block),
+                ),
+                size(px(block), px(block)),
+            );
+            window.paint_quad(quad(
+                rect,
+                px(0.),
+                transparent_black(),
+                px(1.),
+                gpui::white(),
+                BorderStyle::default(),
+            ));
+        }
+    }
+
     // The rows the next panel (hex) is showing.
     if let Some(mark) = mark {
-        paint_row_band(window, bounds, mark, first_row_start, bpr, zoom, rows);
+        paint_row_band(window, bounds, mark, first_row_start, bpr, block, rows);
     }
 }
 
@@ -849,14 +903,7 @@ pub(crate) fn paint_strip(
     let x0 = bounds.left().to_f64() as f32 + frac(mark.start) * w;
     let x1 = (bounds.left().to_f64() as f32 + frac(mark.end) * w).max(x0 + 2.0);
     let band = Bounds::from_corners(point(px(x0), bounds.top()), point(px(x1), bounds.bottom()));
-    window.paint_quad(quad(
-        band,
-        px(0.),
-        rgba(0xffffff2e),
-        px(0.),
-        transparent_black(),
-        BorderStyle::default(),
-    ));
+    window.paint_quad(filled_quad(band, rgba(0xffffff2e)));
 }
 
 // ---------------------------------------------------------------------------
@@ -897,12 +944,12 @@ pub(crate) fn render_image_from_rgba(
 }
 
 /// Compute the raw RGBA pixels (`w` × `h`) of the 2D whole-file overview: one
-/// band per cell in `colormap`. Extracted from `build_overview_image` so the
-/// pixel math is unit-testable without a gpui window.
+/// band per cell in `colormap`. The pixel math is unit-testable without a gpui
+/// window, and the app runs it on the background executor (PERF.md item 4).
 ///
 /// Under `Colormap::None` every cell is left transparent, so the panel
 /// background shows through (SPECS §3.C).
-fn build_overview_rgba(
+pub(crate) fn build_overview_rgba(
     data: &[u8],
     entropies: &[f32],
     entropy_window: usize,
@@ -927,28 +974,13 @@ fn build_overview_rgba(
         let mid = (start + (end - start) / 2).min(len - 1);
         let avg = sample_average(data, start, end);
         // Cell k sits at grid (col = k % w, row = k / w).
-        if let Some(c) = colormap.color_for(avg, entropy_at(entropies, entropy_window, mid)) {
+        if let Some(c) =
+            colormap.color_for(avg, entropy_for(colormap, entropies, entropy_window, mid))
+        {
             set_pixel(&mut pixels, w, k % w, k / w, c);
         }
     }
     pixels
-}
-
-/// Build the 2D whole-file overview: the file is downsampled into a `w × h`
-/// cell grid, each cell one band in `colormap`.
-pub(crate) fn build_overview_image(
-    data: &[u8],
-    entropies: &[f32],
-    entropy_window: usize,
-    w: usize,
-    h: usize,
-    colormap: Colormap,
-) -> (Arc<RenderImage>, (usize, usize)) {
-    // Keep the reported cell grid consistent with the guarded buffer dims.
-    let w = w.max(1);
-    let h = h.max(1);
-    let pixels = build_overview_rgba(data, entropies, entropy_window, w, h, colormap);
-    (render_image_from_rgba(w, h, pixels), (w, h))
 }
 
 /// Compute the raw RGBA pixels (256×1) of the horizontal whole-file preview
@@ -971,7 +1003,9 @@ fn build_strip_rgba(
         let end = ((x + 1) * len / W).max(start + 1);
         let mid = (start + (end - start) / 2).min(len - 1);
         let avg = sample_average(data, start, end);
-        if let Some(c) = colormap.color_for(avg, entropy_at(entropies, entropy_window, mid)) {
+        if let Some(c) =
+            colormap.color_for(avg, entropy_for(colormap, entropies, entropy_window, mid))
+        {
             set_pixel(&mut pixels, W, x, 0, c);
         }
     }
@@ -988,6 +1022,121 @@ pub(crate) fn build_strip_image(
 ) -> Arc<RenderImage> {
     let pixels = build_strip_rgba(data, entropies, entropy_window, colormap);
     render_image_from_rgba(256, 1, pixels)
+}
+
+/// Raw RGBA pixels of the zoom column's visible region: `rows` rows of `bpr`
+/// bytes starting at `first_row_start`, each byte a `block × block` pixel
+/// square quantized to the integer pixel grid (blocks need not divide
+/// evenly into pixels). Returns `(pixels, iw, ih)` — the buffer is `iw × ih`
+/// with `iw = ceil(bpr·block)`, `ih = ceil(rows·block)`, so `paint_image`
+/// scales it ~1:1 into the panel and no smoothing is needed.
+///
+/// Under `Colormap::None` every pixel stays transparent, so the panel
+/// background shows through (SPECS §3.C).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_zoom_rgba(
+    data: &[u8],
+    entropies: &[f32],
+    entropy_window: usize,
+    bpr: usize,
+    first_row_start: usize,
+    rows: usize,
+    block: f32,
+    colormap: Colormap,
+) -> (Vec<u8>, usize, usize) {
+    let len = data.len();
+    if len == 0 || bpr == 0 || rows == 0 || !block.is_finite() || block <= 0.0 {
+        return (Vec::new(), 0, 0);
+    }
+    let iw = ((bpr as f32 * block).ceil() as usize).max(1);
+    let ih = ((rows as f32 * block).ceil() as usize).max(1);
+    let mut pixels = vec![0u8; iw * ih * 4];
+
+    // Row y-ranges from the quantized grid, then disjoint mutable slices so
+    // the fill can run in parallel over rows (PERF.md item 1).
+    let row_ys: Vec<(usize, usize)> = (0..rows)
+        .map(|r| {
+            let y0 = (r as f32 * block).round() as usize;
+            let y1 = ((r + 1) as f32 * block).round() as usize;
+            (y0, y1)
+        })
+        .collect();
+    let mut slices: Vec<(usize, &mut [u8])> = Vec::with_capacity(rows);
+    let mut rest = pixels.as_mut_slice();
+    for (r, &(y0, y1)) in row_ys.iter().enumerate() {
+        let span = (y1.saturating_sub(y0)) * iw * 4;
+        let (head, tail) = rest.split_at_mut(span);
+        slices.push((r, head));
+        rest = tail;
+    }
+
+    let use_entropy = colormap.uses_entropy();
+    slices.into_par_iter().for_each(|(r, buf)| {
+        let row_start = first_row_start + r * bpr;
+        if row_start >= len {
+            return;
+        }
+        let n = (len - row_start).min(bpr);
+        // `buf` spans exactly this row's y-range, so columns index from 0 and
+        // its height (in pixel rows) is `y1 - y0`.
+        let (y0, y1) = row_ys[r];
+        let h = y1 - y0;
+        for i in 0..n {
+            let off = row_start + i;
+            let e = if use_entropy {
+                entropy_at(entropies, entropy_window, off)
+            } else {
+                0.0
+            };
+            let Some(c) = colormap.color_for(data[off], e) else {
+                continue;
+            };
+            let x0 = (i as f32 * block).round() as usize;
+            let x1 = ((i + 1) as f32 * block).round() as usize;
+            let (r8, g8, b8, a8) = (
+                (c.r * 255.0) as u8,
+                (c.g * 255.0) as u8,
+                (c.b * 255.0) as u8,
+                (c.a * 255.0) as u8,
+            );
+            // Fill every pixel row of the block's column span.
+            for row in buf.chunks_exact_mut(iw * 4).take(h) {
+                for px in row[x0 * 4..x1 * 4].chunks_exact_mut(4) {
+                    px[0] = r8;
+                    px[1] = g8;
+                    px[2] = b8;
+                    px[3] = a8;
+                }
+            }
+        }
+    });
+    (pixels, iw, ih)
+}
+
+/// Build the zoom column's visible-region texture. Wraps `build_zoom_rgba`
+/// so the pixel math is unit-testable without a gpui window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_zoom_image(
+    data: &[u8],
+    entropies: &[f32],
+    entropy_window: usize,
+    bpr: usize,
+    first_row_start: usize,
+    rows: usize,
+    block: f32,
+    colormap: Colormap,
+) -> Option<Arc<RenderImage>> {
+    let (pixels, iw, ih) = build_zoom_rgba(
+        data,
+        entropies,
+        entropy_window,
+        bpr,
+        first_row_start,
+        rows,
+        block,
+        colormap,
+    );
+    (iw > 0 && ih > 0).then(|| render_image_from_rgba(iw, ih, pixels))
 }
 
 #[cfg(test)]
@@ -1125,19 +1274,21 @@ mod tests {
             build_overview_rgba(&data, &[], 256, 3, 0, Colormap::Value).len(),
             12
         );
-        let (_image, cells) = build_overview_image(&data, &[], 256, 0, 2, Colormap::Value);
-        assert_eq!(cells, (1, 2));
+        let buf = build_overview_rgba(&data, &[], 256, 0, 2, Colormap::Value);
+        assert_eq!(buf.len(), 2 * 4);
+        let _img = render_image_from_rgba(1, 2, buf);
     }
 
     #[test]
     fn thumbnail_wrappers_build_valid_images() {
         let data = [0x41u8; 4096];
         let e = entropies(&data);
-        // Both wrappers route the RGBA buffer through the image crate, which
-        // panics on a buffer-size mismatch — so simply constructing them here
+        // Routing the RGBA buffer through the image crate panics on a
+        // buffer-size mismatch — so simply constructing the image here
         // verifies the pixel-buffer invariants end to end.
-        let (_image, cells) = build_overview_image(&data, &e, 256, 3, 2, Colormap::Value);
-        assert_eq!(cells, (3, 2));
+        let buf = build_overview_rgba(&data, &e, 256, 3, 2, Colormap::Value);
+        assert_eq!(buf.len(), 3 * 2 * 4);
+        let _img = render_image_from_rgba(3, 2, buf);
         let _strip = build_strip_image(&data, &e, 256, Colormap::Value);
     }
 
@@ -1183,14 +1334,13 @@ mod tests {
             distinct.len()
         );
 
-        // Overview: valid buffer for a small grid; both image wrappers build
-        // (they run the buffer through the image crate's size checks).
+        // Overview: valid buffer for a small grid; the image wrapper builds
+        // (it runs the buffer through the image crate's size checks).
         let (w, h) = (16usize, 8usize);
         let overview = build_overview_rgba(&data, &e, 256, w, h, Colormap::Value);
         assert_eq!(overview.len(), w * h * 4);
         assert!(overview.iter().skip(3).step_by(4).all(|&a| a == 255));
-        let (_image, cells) = build_overview_image(&data, &e, 256, w, h, Colormap::Value);
-        assert_eq!(cells, (w, h));
+        let _img = render_image_from_rgba(w, h, overview);
         let _strip = build_strip_image(&data, &e, 256, Colormap::Value);
     }
 
@@ -1223,15 +1373,25 @@ mod tests {
         for bpr in [8usize, 16, 32] {
             let geo = RowGeo::new(char_w, bpr);
             let data: Vec<u8> = (0..bpr).map(|i| i as u8).collect();
-            let rt = build_row_text(&data, 0, bpr);
+            let mut text = String::new();
+            let mut hex_offsets = Vec::new();
+            let mut ascii_offsets = Vec::new();
+            build_row_text_into(
+                &data,
+                0,
+                bpr,
+                &mut text,
+                &mut hex_offsets,
+                &mut ascii_offsets,
+            );
             for i in 0..bpr {
                 assert_eq!(
-                    glyph_x(rt.hex_offsets[i], char_w),
+                    glyph_x(hex_offsets[i], char_w),
                     geo.cell_x(i),
                     "hex byte {i} of {bpr} misaligned"
                 );
                 assert_eq!(
-                    glyph_x(rt.ascii_offsets[i], char_w),
+                    glyph_x(ascii_offsets[i], char_w),
                     geo.ascii_x(i),
                     "ascii byte {i} of {bpr} misaligned"
                 );
@@ -1495,5 +1655,98 @@ mod tests {
         assert_eq!(visible_rows(0.0, 20.0), 1);
         assert_eq!(visible_rows(100.0, 0.0), 1); // degenerate row height
         assert_eq!(visible_rows(f32::NAN, 20.0), 1);
+    }
+
+    /// The zoom texture with `block` whole pixels: 4 bytes/row × 2 rows of
+    /// distinct bytes -> a 16×8 buffer where byte k occupies a 4×4 block.
+    #[test]
+    fn zoom_buffer_is_a_per_byte_pixel_grid() {
+        let data = vec![0x00u8, 0x40, 0x80, 0xC0, 0x20, 0x60, 0xA0, 0xE0];
+        let e = entropies(&data);
+        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 4, 0, 2, 4.0, Colormap::Value);
+        assert_eq!((iw, ih), (16, 8)); // ceil(4·4) × ceil(2·4)
+        assert_eq!(buf.len(), 16 * 8 * 4);
+        // Each byte is a solid 4×4 block at (row, col) = (k / 4, k % 4).
+        for (k, &b) in data.iter().enumerate() {
+            let (row, col) = (k / 4, k % 4);
+            let expected = (b, b, b, 255);
+            // Corners and centre of the block all carry the byte's color.
+            for (dx, dy) in [(0, 0), (1, 1), (3, 0), (2, 3)] {
+                assert_eq!(
+                    px(&buf, iw, col * 4 + dx, row * 4 + dy),
+                    expected,
+                    "byte {k} at block corner ({dx},{dy})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_buffer_anchors_at_first_row_start() {
+        // 2 bytes/row anchored at byte 8: the texture shows bytes 8,9 then
+        // 10,11 — not bytes 0..4.
+        let data: Vec<u8> = (0..12).map(|i| i * 8).collect();
+        let e = entropies(&data);
+        let (buf, iw, _ih) = build_zoom_rgba(&data, &e, 256, 2, 8, 2, 4.0, Colormap::Value);
+        assert_eq!((buf[0], buf[1]), (8 * 8, 8 * 8)); // byte 8
+        assert_eq!((buf[4 * 4], buf[4 * 4 + 1]), (9 * 8, 9 * 8)); // byte 9
+        // Block row 1 spans pixel rows 4..8; it starts at byte 10.
+        assert_eq!(px(&buf, iw, 0, 4).0, 10 * 8);
+    }
+
+    #[test]
+    fn zoom_none_colormap_leaves_the_texture_transparent() {
+        let data = [0xAAu8; 16];
+        let e = entropies(&data);
+        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 4, 0, 2, 4.0, Colormap::None);
+        assert_eq!(buf.len(), iw * ih * 4);
+        assert!(buf.iter().all(|&b| b == 0), "None must paint nothing");
+    }
+
+    #[test]
+    fn zoom_quantizes_fractional_blocks_to_the_pixel_grid() {
+        // 5 bytes/row over a 19 px panel: block = 3.8 px. Every pixel column
+        // still resolves to a byte and the buffer spans the full panel width.
+        let data = [0x00u8, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF];
+        let e = entropies(&data);
+        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 5, 0, 2, 3.8, Colormap::Value);
+        assert_eq!((iw, ih), (19, 8)); // ceil(5·3.8) × ceil(2·3.8)
+        // No pixel is transparent: every column is covered by a byte block.
+        for y in 0..ih {
+            for x in 0..iw {
+                assert_eq!(px(&buf, iw, x, y).3, 255, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_buffer_handles_partial_last_row_and_empty_data() {
+        // 8 bytes, 6/row: the second row holds only 2 bytes; columns 2..6 of
+        // that row stay transparent (paint_image leaves them as panel bg).
+        let data: Vec<u8> = (0..8).map(|i| i * 16).collect();
+        let e = entropies(&data);
+        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 6, 0, 2, 4.0, Colormap::Value);
+        assert_eq!((iw, ih), (24, 8));
+        // Block row 1 spans pixel rows 4..8 and holds bytes 6 and 7.
+        assert_eq!(px(&buf, iw, 0, 4).0, 96); // byte 6 (0x60)
+        assert_eq!(px(&buf, iw, 4, 4).0, 112); // byte 7 (0x70)
+        assert_eq!(px(&buf, iw, 12, 4).3, 0); // past the last byte: transparent
+        // Degenerate inputs never panic and yield an empty buffer.
+        let (buf, iw, ih) = build_zoom_rgba(&[], &[], 256, 4, 0, 2, 4.0, Colormap::Value);
+        assert_eq!((buf.len(), iw, ih), (0, 0, 0));
+        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 0, 0, 2, 4.0, Colormap::Value);
+        assert_eq!((buf.len(), iw, ih), (0, 0, 0));
+        let (buf, iw, ih) = build_zoom_rgba(&data, &e, 256, 6, 0, 0, 4.0, Colormap::Value);
+        assert_eq!((buf.len(), iw, ih), (0, 0, 0));
+    }
+
+    #[test]
+    fn zoom_image_wrapper_builds_a_valid_texture() {
+        let data: Vec<u8> = (0..32).map(|i| i as u8).collect();
+        let e = entropies(&data);
+        let img = build_zoom_image(&data, &e, 256, 8, 0, 2, 4.0, Colormap::Class);
+        assert!(img.is_some());
+        let img = build_zoom_image(&[], &e, 256, 8, 0, 2, 4.0, Colormap::Class);
+        assert!(img.is_none());
     }
 }

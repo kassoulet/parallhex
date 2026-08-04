@@ -114,6 +114,13 @@ impl Colormap {
         Colormap::ALL.iter().copied().find(|c| c.key() == s)
     }
 
+    /// Whether this colormap's output depends on the per-byte entropy value.
+    /// Only `Entropy` does; callers can skip the (per-byte, interpolating)
+    /// `entropy_at` lookup entirely for the others (PERF.md item 3).
+    pub fn uses_entropy(self) -> bool {
+        matches!(self, Colormap::Entropy)
+    }
+
     /// Color a single byte under this colormap, or `None` when this colormap
     /// paints nothing — callers skip drawing entirely rather than filling.
     pub fn color_for(self, b: u8, entropy: f32) -> Option<Rgba> {
