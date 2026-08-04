@@ -6,6 +6,7 @@
 //! terminal-specific arithmetic.
 
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -60,8 +61,84 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut TuiApp) {
     draw_overview(frame, app, ov_inner);
     draw_zoom(frame, app, zoom_inner);
     draw_hex(frame, app, hex_inner);
+
+    // Each column marks where the *next* one is looking, so the overview tracks
+    // your position even though it cannot scroll -- it always shows the whole
+    // file. Same relationship the gpui frontend draws as a translucent band.
+    let len = app.file_size;
+    let zoom_view = visible_range(app, Focus::Zoom, zoom_inner);
+    let hex_view = visible_range(app, Focus::Hex, hex_inner);
+    draw_band(frame, overview, ov_inner, &(0..len), &zoom_view);
+    draw_band(frame, zoom, zoom_inner, &zoom_view, &hex_view);
+
     draw_status(frame, app, status);
     draw_hints(frame, app, hints);
+}
+
+/// The byte range a column is currently showing.
+fn visible_range(app: &TuiApp, focus: Focus, inner: Rect) -> Range<usize> {
+    let len = app.file_size;
+    match focus {
+        Focus::Overview => 0..len,
+        Focus::Zoom => {
+            let cols = (inner.width as usize).max(1);
+            // Two byte rows per text row, because of the half-block packing.
+            let rows = inner.height as usize * 2;
+            let first = geom::first_row_centred(app.anchor, cols, rows);
+            first..(first + rows * cols).min(len)
+        }
+        Focus::Hex => {
+            let bpr = app.bpr_for(Focus::Hex).max(8);
+            let rows = inner.height as usize;
+            let first = geom::first_row_centred(app.anchor, bpr, rows);
+            first..(first + rows * bpr).min(len)
+        }
+    }
+}
+
+/// Mark `mark`'s share of `panel`'s range on the block's right-hand border.
+///
+/// The border rather than the interior: a terminal cannot overlay a translucent
+/// band the way gpui does, and tinting data cells would destroy the very colours
+/// the column exists to show.
+fn draw_band(
+    frame: &mut Frame,
+    block: Rect,
+    inner: Rect,
+    panel: &Range<usize>,
+    mark: &Range<usize>,
+) {
+    let Some(rows) = band_rows(inner.height, panel, mark) else {
+        return;
+    };
+    // The right border column of the block.
+    let x = block.x + block.width.saturating_sub(1);
+    for y in rows {
+        let cell = frame.buffer_mut().get_mut(x, inner.y + y);
+        cell.set_char('┃');
+        cell.set_fg(FOCUSED);
+    }
+}
+
+/// Which of `height` text rows `mark` covers, as a fraction of `panel`'s range.
+///
+/// Returns `None` when there is nothing to draw. Always at least one row when the
+/// mark is non-empty, so a small range still shows.
+fn band_rows(height: u16, panel: &Range<usize>, mark: &Range<usize>) -> Option<Range<u16>> {
+    if height == 0 || mark.is_empty() || panel.is_empty() {
+        return None;
+    }
+    // A mark entirely outside the panel's range has nothing to mark.
+    if mark.end <= panel.start || mark.start >= panel.end {
+        return None;
+    }
+    let span = (panel.end - panel.start) as f32;
+    let frac = |off: usize| {
+        (off.saturating_sub(panel.start) as f32 / span).clamp(0.0, 1.0) * f32::from(height)
+    };
+    let top = frac(mark.start) as u16;
+    let bottom = (frac(mark.end).ceil() as u16).min(height);
+    Some(top..bottom.max(top + 1).min(height))
 }
 
 /// The key-hint row. Its main job is the colormap keys: `1`–`4` are otherwise
@@ -386,6 +463,45 @@ mod tests {
         assert!(hints.contains("Overview colormap:"), "{hints:?}");
         let x = hints.find("4 Entropy").expect("4 Entropy present");
         assert_eq!(buf.get(u16::try_from(x).unwrap(), 11).bg, FOCUSED);
+    }
+
+    #[test]
+    fn band_rows_maps_a_range_onto_text_rows() {
+        // The whole panel covers every row.
+        assert_eq!(band_rows(10, &(0..1000), &(0..1000)), Some(0..10));
+        // The first tenth covers the first row.
+        assert_eq!(band_rows(10, &(0..1000), &(0..100)), Some(0..1));
+        // The middle fifth lands in the middle.
+        assert_eq!(band_rows(10, &(0..1000), &(400..600)), Some(4..6));
+        // A tiny mark still shows as one row rather than vanishing.
+        assert_eq!(band_rows(10, &(0..1000), &(500..501)), Some(5..6));
+        // Nothing to draw.
+        assert_eq!(band_rows(0, &(0..1000), &(0..10)), None);
+        assert_eq!(band_rows(10, &(0..1000), &(5..5)), None);
+        assert_eq!(band_rows(10, &(0..0), &(0..10)), None);
+        // A mark outside the panel's range is not clamped into view.
+        assert_eq!(band_rows(10, &(500..600), &(0..100)), None);
+        assert_eq!(band_rows(10, &(0..100), &(200..300)), None);
+    }
+
+    #[test]
+    fn the_overview_marks_where_the_zoom_column_is_looking() {
+        let mut app = TuiApp::for_test(1 << 20);
+        let buf = render(&mut app, 140, 14);
+        // The band lives on the overview block's right border.
+        let x = u16::try_from(app.layout.overview_cols + 1).expect("fits");
+        let marked: Vec<u16> = (1..12).filter(|&y| buf.get(x, y).symbol() == "┃").collect();
+        assert!(!marked.is_empty(), "no band drawn on the overview border");
+
+        // Moving the anchor to the end moves the band down.
+        app.apply(crate::tui::app::Action::Move(crate::core::geom::Nav::End));
+        let buf = render(&mut app, 140, 14);
+        let moved: Vec<u16> = (1..12).filter(|&y| buf.get(x, y).symbol() == "┃").collect();
+        assert!(!moved.is_empty(), "band vanished after seeking to the end");
+        assert!(
+            moved[0] > marked[0],
+            "band should move down: {marked:?} -> {moved:?}"
+        );
     }
 
     #[test]

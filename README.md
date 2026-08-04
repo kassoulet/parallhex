@@ -109,6 +109,11 @@ this table:
 hex column's byte row, the zoom column's width in bytes, or — in the overview —
 the slice of the file one half-row stands for, making it a coarse whole-file seek.
 
+Each column marks where the *next* one is looking with a `┃` on its right border:
+the overview shows the zoom column's region, the zoom column shows the hex
+column's. The overview never scrolls — it always shows the whole file — so this
+marker is how it tracks your position.
+
 Copying uses an OSC 52 escape, so it reaches the system clipboard through ssh and
 tmux without a clipboard library. Some terminals disable OSC 52, and the write
 cannot be confirmed, so a copy always reports success.
