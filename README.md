@@ -28,25 +28,82 @@ padding in the zoom column, and the exact bytes in hex.
 Files are `mmap`ed and every column paints only what is on screen, so a
 multi-gigabyte file opens instantly and costs no more to scroll than a small one.
 
+## Two frontends
+
+The same three columns over the same file, in a window or in a terminal:
+
+| Binary | Toolkit | Notes |
+|---|---|---|
+| `parallhex-gpui` | [gpui](https://crates.io/crates/gpui) | The full app: mouse, resizable columns, a zoom control. |
+| `parallhex-tui` | [ratatui](https://ratatui.rs) | Keyboard-driven, over ssh or on a headless host. |
+
+Both share all the byte-level semantics — colours, entropy, row geometry, the
+scroll anchor — so they cannot disagree about what a byte looks like or where it
+sits. They also share one preferences file.
+
 ## Build and run
 
 Requires a Rust toolchain supporting edition 2024.
 
 ```sh
-cargo run                       # launch with no file
-cargo run -- path/to/file.bin   # open a file on startup
-cargo run --release             # for large files, prefer release
+cargo run --bin parallhex-gpui                        # windowed, no file
+cargo run --bin parallhex-gpui -- path/to/file.bin    # open a file
+cargo run --bin parallhex-tui  -- path/to/file.bin    # in the terminal
+cargo run --release --bin parallhex-gpui              # prefer release for large files
 ```
 
-`--` is needed before a filename that begins with a dash. `-h` / `--help`
-prints usage. Extra positional arguments after the first are ignored.
+`--` is needed before a filename that begins with a dash. `-h` / `--help` prints
+usage; each binary names itself. Extra positional arguments after the first are
+ignored. The windowed frontend can start with no file and open one from a dialog;
+the terminal one requires a path, since it has no dialog to fall back on.
+
+The executables are named for their toolkits so they can sit alongside another
+`parallhex` build. The preferences directory stays `parallhex` for both.
+
+**Building the terminal frontend alone** needs none of gpui's link-time
+libraries, which is the point of it:
+
+```sh
+cargo build --no-default-features --features tui-frontend
+```
+
+CI asserts that gpui cannot reach that build's dependency tree.
+
+## Terminal frontend
 
 ```
-Usage: parallhex-gpui [OPTIONS] [FILE]
+┌ Overview · Entropy ┐┌ Zoom · Class ─────────┐┌ Hex · Class ────────────────────┐
+│▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀││00000000  7F 45 4C 46  .ELF.... │
+│▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀││00000010  03 00 3E 00  ..>..... │
+└────────────────────┘└───────────────────────┘└─────────────────────────────────┘
+ 0x00000000 · 0x7F '.' · H=1.886 · win 256 B
 ```
 
-The executable is `parallhex-gpui`, named for its toolkit so it can sit alongside
-another `parallhex` build. The preferences directory stays `parallhex`.
+The two graphical columns use half-block characters (`▀`), so each text row
+carries two byte rows: the foreground paints the upper byte, the background the
+lower one. This needs a terminal with 24-bit or 256-colour support.
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift+Tab` | Move focus between the three columns |
+| `←` `→` | Cursor ±1 byte |
+| `↑` `↓` | Cursor ± one row *of the focused column* |
+| `PgUp` `PgDn` | One screen of rows |
+| `Home` `End` | First / last byte |
+| `1` `2` `3` `4` | Focused column's colormap → None / Value / Class / Entropy |
+| `Shift`+arrows | Extend the selection |
+| `y` / `Y` | Copy the selection as hex / ASCII |
+| `g` | Jump to offset (`Enter` submits, `Esc` cancels) |
+| `-` / `+` (or `=`) | Halve / double the entropy window |
+| `q`, `Esc`, `Ctrl+C` | Save preferences and quit |
+
+`↑`/`↓` follow the focused column's idea of a row, which differs per column: the
+hex column's byte row, the zoom column's width in bytes, or — in the overview —
+the slice of the file one half-row stands for, making it a coarse whole-file seek.
+
+Copying uses an OSC 52 escape, so it reaches the system clipboard through ssh and
+tmux without a clipboard library. Some terminals disable OSC 52, and the write
+cannot be confirmed, so a copy always reports success.
 
 ## Colormaps
 
@@ -150,8 +207,16 @@ runs `cargo test --all-targets`, `cargo fmt --check` and
 `cargo clippy --all-targets`. Run all three before committing rather than
 discovering failures in the hook.
 
-GitHub Actions runs the same three gates on every push and pull request
-(`.github/workflows/ci.yml`). Building on Linux needs:
+GitHub Actions runs the same three gates on every push and pull request, then
+builds and tests the TUI-only and core-only configurations and asserts gpui stays
+out of the TUI's dependency tree (`.github/workflows/ci.yml`). The workflow can be
+run locally with [`act`](https://github.com/nektos/act):
+
+```sh
+act push -j gates -P ubuntu-24.04=catthehacker/ubuntu:act-24.04
+```
+
+Building the **gpui** frontend on Linux needs:
 
 ```sh
 sudo apt-get install libasound2-dev libfreetype-dev libopus-dev \
@@ -159,16 +224,17 @@ sudo apt-get install libasound2-dev libfreetype-dev libopus-dev \
 ```
 
 The Wayland and fontconfig bindings are `dlopen`ed, so they matter only at
-runtime. The workflow can be run locally with
-[`act`](https://github.com/nektos/act):
+runtime. The **terminal** frontend needs none of these.
 
-```sh
-act push -j gates -P ubuntu-24.04=catthehacker/ubuntu:act-24.04
-```
+`cargo test` runs the whole suite; `cargo test --no-default-features` runs the
+core's own tests with no toolkit compiled at all, which is what keeps `core`
+honest about being toolkit-neutral.
 
 `Cargo.toml` denies all compiler warnings and the whole of `clippy::pedantic`.
 A short, curated list of exceptions lives in the `#![allow(...)]` at the top of
-`src/main.rs` — see the comment there for why it cannot live in `Cargo.toml`.
+`src/lib.rs` — see the comment there for why it cannot live in `Cargo.toml`. The
+crate's public surface is kept deliberately tiny for the same reason: several
+pedantic lints fire only on publicly reachable items.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module layout and the
 invariants worth knowing before changing the rendering code.

@@ -70,7 +70,7 @@ jobs:
       # Cargo.toml sets `[lints.rust] warnings = "deny"` and
       # `[lints.clippy] pedantic = "deny"`, so this needs no extra flags.
       # Deliberately no RUSTFLAGS=-D warnings: it would apply to dependencies
-      # too, and could override the curated crate-level allows in src/main.rs.
+      # too, and could override the curated crate-level allows in src/lib.rs.
       - name: cargo clippy --all-targets
         run: cargo clippy --locked --all-targets
 
@@ -78,3 +78,24 @@ jobs:
       # window, so they run headless with no virtual display.
       - name: cargo test --all-targets
         run: cargo test --locked --all-targets
+
+      # The terminal frontend exists so parallhex can run on hosts that lack
+      # gpui's link-time libraries (freetype, xcb, xkbcommon). That only holds if
+      # gpui stays out of a TUI-only build, so assert it rather than trust it.
+      - name: the TUI must not depend on gpui
+        run: |
+          if cargo tree --locked --no-default-features --features tui-frontend \
+               | grep -q gpui; then
+            echo "gpui leaked into the TUI-only dependency tree" >&2
+            cargo tree --locked --no-default-features --features tui-frontend | grep gpui >&2
+            exit 1
+          fi
+
+      # Compile and test that configuration too: the leak check proves gpui is
+      # absent from the tree, this proves the code still builds without it.
+      - name: cargo test (TUI only)
+        run: cargo test --locked --no-default-features --features tui-frontend --all-targets
+
+      # And the core on its own, with no frontend at all.
+      - name: cargo test (core only)
+        run: cargo test --locked --no-default-features
