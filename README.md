@@ -1,4 +1,4 @@
-# ParallHex
+# Parall-Hex
 
 [![CI](https://github.com/kassoulet/parallhex/actions/workflows/ci.yml/badge.svg)](https://github.com/kassoulet/parallhex/actions/workflows/ci.yml)
 
@@ -27,9 +27,6 @@ padding in the zoom column, and the exact bytes in hex.
 
 Files are `mmap`ed and every column paints only what is on screen, so a
 multi-gigabyte file opens instantly and costs no more to scroll than a small one.
-
-> **Naming:** the repository directory is `entropymap`; the crate, binary and
-> config directory are all `parallhex`.
 
 ## Build and run
 
@@ -161,3 +158,17 @@ A short, curated list of exceptions lives in the `#![allow(...)]` at the top of
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the module layout and the
 invariants worth knowing before changing the rendering code.
+
+## Licence
+
+Licensed under either of
+
+- MIT ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+
+at your option — the usual dual licence for Rust projects.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you shall be dual licensed as above, without any
+additional terms or conditions.
