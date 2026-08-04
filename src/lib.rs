@@ -33,7 +33,7 @@
 )]
 
 pub(crate) mod app;
-pub(crate) mod core;
+pub mod core;
 pub(crate) mod jump;
 
 pub mod gui;

@@ -4,6 +4,7 @@
 //! the terminal one must stay buildable on hosts that lack gpui's link-time
 //! libraries (freetype, xcb, xkbcommon).
 
+pub mod cli;
 pub(crate) mod color;
 pub(crate) mod config;
 pub(crate) mod entropy;

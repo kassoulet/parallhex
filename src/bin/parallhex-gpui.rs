@@ -2,10 +2,11 @@
 //! the library.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use parallhex::gui::{Cli, parse_args, run};
+use parallhex::core::cli::{Cli, parse_args};
+use parallhex::gui::run;
 
 fn main() {
-    match parse_args(std::env::args().skip(1)) {
+    match parse_args(std::env::args().skip(1), "parallhex-gpui") {
         Cli::Exit(code) => std::process::exit(code),
         Cli::Launch(file) => run(file),
     }

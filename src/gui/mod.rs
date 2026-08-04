@@ -74,59 +74,6 @@ const DECORATIONS: Option<WindowDecorations> = if cfg!(target_os = "linux") {
 const MIN_WINDOW_W: f32 = 1000.0;
 const MIN_WINDOW_H: f32 = 600.0;
 
-/// Result of parsing the command line.
-pub enum Cli {
-    /// Launch the app, optionally opening a file.
-    Launch(Option<PathBuf>),
-    /// Print usage / an error and exit with this status code.
-    Exit(i32),
-}
-
-/// Parse command-line arguments. Positional arguments are file paths (the
-/// first is opened on startup); `-h`/`--help` prints usage; `--` ends option
-/// parsing (everything after is a file path); any other `-`-prefixed option
-/// is rejected instead of being treated as a file.
-pub fn parse_args(args: impl Iterator<Item = String>) -> Cli {
-    let mut file: Option<PathBuf> = None;
-    let mut positional_only = false;
-    for arg in args {
-        if positional_only {
-            if file.is_none() {
-                file = Some(PathBuf::from(arg));
-            }
-            continue;
-        }
-        match arg.as_str() {
-            "--" => positional_only = true,
-            "-h" | "--help" => {
-                print_usage();
-                return Cli::Exit(0);
-            }
-            _ if arg.starts_with('-') => {
-                eprintln!("parallhex-gpui: unknown option '{arg}'");
-                print_usage();
-                return Cli::Exit(2);
-            }
-            _ if file.is_none() => file = Some(PathBuf::from(arg)),
-            _ => {} // extra positional arguments are ignored
-        }
-    }
-    Cli::Launch(file)
-}
-
-fn print_usage() {
-    println!("Usage: parallhex-gpui [OPTIONS] [FILE]");
-    println!("       parallhex-gpui --help");
-    println!();
-    println!("Wide hex-viewer binary explorer.");
-    println!();
-    println!("Arguments:");
-    println!("  FILE    binary file to open on startup (optional)");
-    println!();
-    println!("Options:");
-    println!("  -h, --help    print this help and exit");
-}
-
 /// Every keyboard binding, in one place so the keystroke strings can be parsed
 /// in a unit test — `KeyBinding::new` panics on an unparseable keystroke, and
 /// that would otherwise only surface as a crash on startup.
@@ -235,28 +182,12 @@ fn restored_bounds(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, key_bindings, parse_args, restored_bounds};
-    use std::path::PathBuf;
-
+    use super::{key_bindings, restored_bounds};
     use crate::core::config;
     use gpui::{Bounds, Pixels, point, px, size};
 
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
-    }
-
-    fn launch(args: &[&str]) -> Option<PathBuf> {
-        match parse_args(args.iter().map(std::string::ToString::to_string)) {
-            Cli::Launch(file) => file,
-            Cli::Exit(_) => panic!("expected launch, got exit"),
-        }
-    }
-
-    fn exit_code(args: &[&str]) -> i32 {
-        match parse_args(args.iter().map(std::string::ToString::to_string)) {
-            Cli::Exit(code) => code,
-            Cli::Launch(_) => panic!("expected exit, got launch"),
-        }
     }
 
     /// `KeyBinding::new` panics on a keystroke it cannot parse, so building
@@ -273,54 +204,6 @@ mod tests {
             "secondary- should map to Ctrl or Cmd, got {mods:?}"
         );
         assert!(!mods.shift);
-    }
-
-    #[test]
-    fn no_args_launches_without_file() {
-        assert_eq!(launch(&[]), None);
-    }
-
-    #[test]
-    fn positional_arg_is_opened() {
-        assert_eq!(launch(&["data.bin"]), Some(PathBuf::from("data.bin")));
-    }
-
-    #[test]
-    fn first_positional_wins() {
-        assert_eq!(launch(&["a.bin", "b.bin"]), Some(PathBuf::from("a.bin")));
-    }
-
-    #[test]
-    fn help_exits_cleanly() {
-        assert_eq!(exit_code(&["--help"]), 0);
-        assert_eq!(exit_code(&["-h"]), 0);
-    }
-
-    #[test]
-    fn unknown_flag_is_rejected() {
-        assert_eq!(exit_code(&["--bogus"]), 2);
-        assert_eq!(exit_code(&["-x"]), 2);
-    }
-
-    #[test]
-    fn unknown_flag_precedes_file() {
-        assert_eq!(exit_code(&["--bogus", "data.bin"]), 2);
-    }
-
-    #[test]
-    fn help_beats_positional() {
-        assert_eq!(exit_code(&["data.bin", "--help"]), 0);
-    }
-
-    #[test]
-    fn double_dash_allows_dash_prefixed_file() {
-        assert_eq!(launch(&["--", "-foo.bin"]), Some(PathBuf::from("-foo.bin")));
-    }
-
-    #[test]
-    fn double_dash_makes_help_a_file() {
-        // After `--`, even `--help` is a file path, not a flag.
-        assert_eq!(launch(&["--", "--help"]), Some(PathBuf::from("--help")));
     }
 
     #[test]
