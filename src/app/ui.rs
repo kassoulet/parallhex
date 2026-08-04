@@ -19,6 +19,34 @@ use super::*;
 const STRIP_W: f32 = 320.0;
 const STRIP_H: f32 = 36.0;
 
+/// Wire one handler to both `on_mouse_up` and `on_mouse_up_out`.
+///
+/// Every drag in this UI has to end on release *anywhere*, not just inside the
+/// element that started it — otherwise letting go past the edge of a pane
+/// leaves the drag latched on. Both halves therefore always run the same
+/// handler, and attaching them separately at each call site only created pairs
+/// that could drift apart.
+trait MouseUpAnywhere: InteractiveElement + Sized {
+    fn on_mouse_up_anywhere(
+        self,
+        cx: &mut Context<ParallHexApp>,
+        button: MouseButton,
+        handler: impl Fn(&mut ParallHexApp, &MouseUpEvent, &mut Context<ParallHexApp>) + Clone + 'static,
+    ) -> Self {
+        let outside = handler.clone();
+        self.on_mouse_up(
+            button,
+            cx.listener(move |this, ev: &MouseUpEvent, _, cx| handler(this, ev, cx)),
+        )
+        .on_mouse_up_out(
+            button,
+            cx.listener(move |this, ev: &MouseUpEvent, _, cx| outside(this, ev, cx)),
+        )
+    }
+}
+
+impl<E: InteractiveElement> MouseUpAnywhere for E {}
+
 /// Button labels naming the `secondary` accelerator, which `main.rs` binds to
 /// Cmd on macOS and Ctrl elsewhere — the label has to follow the binding.
 const JUMP_BUTTON_LABEL: &str = if cfg!(target_os = "macos") {
@@ -28,6 +56,9 @@ const JUMP_BUTTON_LABEL: &str = if cfg!(target_os = "macos") {
 };
 
 impl ParallHexApp {
+    /// The hex column's scrollbar: the whole file as a track, the visible rows
+    /// as a thumb. The hex column is the scroll reference, so this drives the
+    /// shared anchor and the other panels follow.
     fn hex_scrollbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let anchor = self.scroll_offset;
@@ -53,20 +84,10 @@ impl ParallHexApp {
                     cx.notify();
                 }
             }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                    this.scrollbar_dragging = false;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                    this.scrollbar_dragging = false;
-                    cx.notify();
-                }),
-            )
+            .on_mouse_up_anywhere(cx, MouseButton::Left, |this, _, cx| {
+                this.scrollbar_dragging = false;
+                cx.notify();
+            })
             .child(pane_canvas(
                 &entity,
                 |this, bounds, _cx| this.scrollbar_bounds = bounds,
@@ -75,8 +96,6 @@ impl ParallHexApp {
                 },
             ))
     }
-
-    // ----- column divider drag -----
 
     /// The central area: the no-file placeholder, or the three columns with
     /// their drag dividers. It must be a dedicated child of the column root —
@@ -140,11 +159,8 @@ impl ParallHexApp {
                             .text_color(rgb(0x9ece6a))
                             .child(readout.unwrap_or_else(|| "no file loaded".to_owned())),
                     )
-                    .when(selection.is_some(), |d| {
-                        d.child(div().child(selection.clone().unwrap()))
-                    })
-                    .when(jump_preview.is_some(), |d| {
-                        let (text, is_err) = jump_preview.clone().unwrap();
+                    .when_some(selection, |d, s| d.child(div().child(s)))
+                    .when_some(jump_preview, |d, (text, is_err)| {
                         d.child(
                             div()
                                 .text_color(if is_err { rgb(0xe0af68) } else { rgb(0x9ece6a) })
@@ -162,19 +178,11 @@ impl ParallHexApp {
                             .text_color(rgb(0x565f89))
                             .child(format!("px {}", self.pixel_zoom.round() as u32)),
                     )
-                    .when(scroll.is_some(), |d| {
-                        d.child(
-                            div()
-                                .text_color(rgb(0x565f89))
-                                .child(scroll.clone().unwrap()),
-                        )
+                    .when_some(scroll, |d, s| {
+                        d.child(div().text_color(rgb(0x565f89)).child(s))
                     })
-                    .when(self.message.is_some(), |d| {
-                        d.child(
-                            div()
-                                .text_color(rgb(0xe0af68))
-                                .child(self.message.clone().unwrap()),
-                        )
+                    .when_some(self.message.clone(), |d, m| {
+                        d.child(div().text_color(rgb(0xe0af68)).child(m))
                     })
                     .child(
                         div()
@@ -296,7 +304,12 @@ impl ParallHexApp {
                                     },
                                 )
                             })
-                            .child(div().text_xl().text_color(rgb(0x7aa2f7)).child("ParallHex"))
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .text_color(rgb(0x7aa2f7))
+                                    .child("Parall-Hex"),
+                            )
                             .child(div().child(format!(
                                 "{file_name} · {file_size} bytes ({})",
                                 color::human_size(file_size)
@@ -386,28 +399,17 @@ impl ParallHexApp {
                     cx.notify();
                 }),
             )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, cx| {
-                    this.on_strip_mouse_up();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, cx| {
-                    this.on_strip_mouse_up();
-                    cx.notify();
-                }),
-            )
+            .on_mouse_up_anywhere(cx, MouseButton::Left, |this, _, cx| {
+                this.on_strip_mouse_up();
+                cx.notify();
+            })
             .child(pane_canvas(
                 &entity,
                 |this, bounds, _cx| this.strip_bounds = bounds,
-                move |bounds, window, cx| {
+                move |bounds, window, _cx| {
                     if let Some(img) = &strip_image {
                         panes::paint_strip(
                             window,
-                            cx,
                             bounds,
                             img,
                             file_size,
@@ -448,20 +450,10 @@ impl ParallHexApp {
                     cx.notify();
                 }
             }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                    this.on_divider_mouse_up();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                    this.on_divider_mouse_up();
-                    cx.notify();
-                }),
-            )
+            .on_mouse_up_anywhere(cx, MouseButton::Left, |this, _, cx| {
+                this.on_divider_mouse_up();
+                cx.notify();
+            })
     }
 
     /// Left column: a vertical whole-file overview.
@@ -508,20 +500,10 @@ impl ParallHexApp {
                             cx.notify();
                         }),
                     )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, cx| {
-                            this.on_overview_mouse_up();
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, cx| {
-                            this.on_overview_mouse_up();
-                            cx.notify();
-                        }),
-                    )
+                    .on_mouse_up_anywhere(cx, MouseButton::Left, |this, _, cx| {
+                        this.on_overview_mouse_up();
+                        cx.notify();
+                    })
                     .child({
                         let paint_entity = entity.clone();
                         pane_canvas(
@@ -593,7 +575,6 @@ impl ParallHexApp {
                                 match image {
                                     Some(img) => panes::paint_overview(
                                         window,
-                                        cx,
                                         bounds,
                                         &img,
                                         file_size,
@@ -652,20 +633,10 @@ impl ParallHexApp {
                         this.on_pixels_mouse_move(ev);
                         cx.notify();
                     }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, cx| {
-                            this.on_pixels_mouse_up();
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, cx| {
-                            this.on_pixels_mouse_up();
-                            cx.notify();
-                        }),
-                    )
+                    .on_mouse_up_anywhere(cx, MouseButton::Left, |this, _, cx| {
+                        this.on_pixels_mouse_up();
+                        cx.notify();
+                    })
                     .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
                         this.on_pixels_scroll(ev, cx);
                         cx.notify();
@@ -910,34 +881,14 @@ impl ParallHexApp {
                                     cx.notify();
                                 },
                             ))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                                    this.on_hex_mouse_up(ev);
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_up_out(
-                                MouseButton::Left,
-                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                                    this.on_hex_mouse_up(ev);
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Middle,
-                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                                    this.on_hex_mouse_up(ev);
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_up_out(
-                                MouseButton::Middle,
-                                cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
-                                    this.on_hex_mouse_up(ev);
-                                    cx.notify();
-                                }),
-                            )
+                            .on_mouse_up_anywhere(cx, MouseButton::Left, |this, ev, cx| {
+                                this.on_hex_mouse_up(ev);
+                                cx.notify();
+                            })
+                            .on_mouse_up_anywhere(cx, MouseButton::Middle, |this, ev, cx| {
+                                this.on_hex_mouse_up(ev);
+                                cx.notify();
+                            })
                             .on_scroll_wheel(cx.listener(
                                 move |this, ev: &ScrollWheelEvent, _, cx| {
                                     this.on_hex_scroll(ev, cx);
@@ -1056,12 +1007,8 @@ impl ParallHexApp {
                         file_size.saturating_sub(1)
                     )))
                     .child(jump_field.clone())
-                    .when(error.is_some(), |d| {
-                        d.child(
-                            div()
-                                .text_color(rgb(0xe0af68))
-                                .child(error.clone().unwrap()),
-                        )
+                    .when_some(error, |d, e| {
+                        d.child(div().text_color(rgb(0xe0af68)).child(e))
                     })
                     .child(
                         div()
@@ -1089,10 +1036,7 @@ impl ParallHexApp {
             SliderKind::PixelZoom => self.pixel_zoom,
             SliderKind::EntropyWindow => self.entropy_window as f32,
         };
-        let (min, max) = match kind {
-            SliderKind::PixelZoom => (panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
-            SliderKind::EntropyWindow => (16.0, 4096.0),
-        };
+        let (min, max) = kind.range();
 
         div()
             .w(px(90.))
@@ -1117,22 +1061,11 @@ impl ParallHexApp {
                 }
                 cx.notify();
             }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, _| {
-                    if this.dragging_slider == Some(kind) {
-                        this.dragging_slider = None;
-                    }
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseUpEvent, _: &mut Window, _| {
-                    if this.dragging_slider == Some(kind) {
-                        this.dragging_slider = None;
-                    }
-                }),
-            )
+            .on_mouse_up_anywhere(cx, MouseButton::Left, move |this, _, _cx| {
+                if this.dragging_slider == Some(kind) {
+                    this.dragging_slider = None;
+                }
+            })
             .child(canvas(
                 move |bounds, _window, cx| {
                     entity.update(cx, |this, _| {
@@ -1195,7 +1128,8 @@ impl ParallHexApp {
                 self.pixel_zoom = v.clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX);
             }
             SliderKind::EntropyWindow => {
-                let w = (v.round() as usize).clamp(16, 4096);
+                let w = (v.round() as usize)
+                    .clamp(panes::ENTROPY_WINDOW_MIN, panes::ENTROPY_WINDOW_MAX);
                 if w != self.entropy_window {
                     self.entropy_window = w;
                     self.recompute_entropies_async(cx, false);
@@ -1212,6 +1146,9 @@ impl ParallHexApp {
 // Shared chrome helpers
 // ---------------------------------------------------------------------------
 
+/// A reusable button wired up through `on_click` (so it works without the
+/// element holding keyboard focus). The callback receives the view, the
+/// window and a context, mirroring the `Context::listener` signature.
 fn button(
     cx: &mut Context<ParallHexApp>,
     label: &'static str,
@@ -1233,6 +1170,8 @@ fn button(
         .child(label)
 }
 
+/// A small color swatch previewing what a colormap looks like, shown in each
+/// column header's dropdown toggle.
 fn swatch(cm: Colormap) -> impl IntoElement {
     let color = match cm {
         Colormap::None => rgb(0x3b4261),
@@ -1268,6 +1207,7 @@ where
     .size_full()
 }
 
+/// Draw a column header: bold title, muted range label, trailing widgets.
 fn column_header(
     title: &'static str,
     range: Option<String>,
@@ -1290,12 +1230,7 @@ fn column_header(
                 .child(div().text_color(rgb(0x9d7cd8)).child(title))
                 .child(trailing),
         )
-        .when(range.is_some(), |d| {
-            d.child(
-                div()
-                    .text_color(rgb(0x565f89))
-                    .text_size(px(11.))
-                    .child(range.unwrap()),
-            )
+        .when_some(range, |d, r| {
+            d.child(div().text_color(rgb(0x565f89)).text_size(px(11.)).child(r))
         })
 }

@@ -32,6 +32,13 @@ pub(crate) const PIXEL_ZOOM_MAX: f32 = 24.0;
 /// Keyboard zoom step factor (`+` / `-`), applied multiplicatively per press.
 pub(crate) const ZOOM_STEP: f32 = 1.25;
 
+/// Clamp range for the entropy window, in bytes. Shared by the load-time clamp,
+/// the slider's pointer→value mapping and its thumb position: three copies of
+/// these bounds could disagree, and a thumb that renders somewhere a drag won't
+/// put it is the visible symptom.
+pub(crate) const ENTROPY_WINDOW_MIN: usize = 16;
+pub(crate) const ENTROPY_WINDOW_MAX: usize = 4096;
+
 /// Hex row geometry: the text size is fixed, so these are constants.
 pub(crate) const ROW_H: f32 = 18.0;
 pub(crate) const ROW_GAP: f32 = 3.0;
@@ -862,7 +869,6 @@ fn paint_row_band(
 /// thumbnail with a translucent band marking the visible byte range.
 pub(crate) fn paint_overview(
     window: &mut Window,
-    _cx: &mut App,
     bounds: Bounds<Pixels>,
     image: &Arc<RenderImage>,
     file_size: usize,
@@ -896,7 +902,6 @@ pub(crate) fn paint_overview(
 /// visible-range band.
 pub(crate) fn paint_strip(
     window: &mut Window,
-    _cx: &mut App,
     bounds: Bounds<Pixels>,
     image: &Arc<RenderImage>,
     file_size: usize,
@@ -995,45 +1000,24 @@ pub(crate) fn build_overview_rgba(
     pixels
 }
 
-/// Compute the raw RGBA pixels (256×1) of the horizontal whole-file preview
-/// strip. Extracted from `build_strip_image` for the same reason as
-/// `build_overview_rgba`.
-fn build_strip_rgba(
-    data: &[u8],
-    entropies: &[f32],
-    entropy_window: usize,
-    colormap: Colormap,
-) -> Vec<u8> {
-    const W: usize = 256;
-    if data.is_empty() {
-        return vec![0u8; W * 4];
-    }
-    let len = data.len();
-    let mut pixels = vec![0u8; W * 4];
-    for x in 0..W {
-        let start = x * len / W;
-        let end = ((x + 1) * len / W).max(start + 1);
-        let mid = (start + (end - start) / 2).min(len - 1);
-        let avg = sample_average(data, start, end);
-        if let Some(c) =
-            colormap.color_for(avg, entropy_for(colormap, entropies, entropy_window, mid))
-        {
-            set_pixel(&mut pixels, W, x, 0, c);
-        }
-    }
-    pixels
-}
+/// Columns in the horizontal whole-file preview strip.
+pub(crate) const STRIP_CELLS: usize = 256;
 
-/// Build the horizontal whole-file preview strip: a fixed 256×1 band in
-/// `colormap`, x mapping to file offset.
+/// Build the horizontal whole-file preview strip: a fixed `STRIP_CELLS`×1 band
+/// in `colormap`, x mapping to file offset.
+///
+/// A single row of the overview *is* the strip — `build_overview_rgba` lays its
+/// cells out row-major, so at `h = 1` every cell is one column and the two
+/// generators agree by construction rather than by keeping two copies of the
+/// downsampling math in step.
 pub(crate) fn build_strip_image(
     data: &[u8],
     entropies: &[f32],
     entropy_window: usize,
     colormap: Colormap,
 ) -> Arc<RenderImage> {
-    let pixels = build_strip_rgba(data, entropies, entropy_window, colormap);
-    render_image_from_rgba(256, 1, pixels)
+    let pixels = build_overview_rgba(data, entropies, entropy_window, STRIP_CELLS, 1, colormap);
+    render_image_from_rgba(STRIP_CELLS, 1, pixels)
 }
 
 /// Raw RGBA pixels of the zoom column's visible region: `rows` rows of `bpr`
@@ -1166,6 +1150,17 @@ mod tests {
         crate::entropy::block_entropies(data, 256)
     }
 
+    /// The strip's raw pixels: one row of the overview, exactly as
+    /// `build_strip_image` builds it.
+    fn strip_rgba(
+        data: &[u8],
+        entropies: &[f32],
+        entropy_window: usize,
+        colormap: Colormap,
+    ) -> Vec<u8> {
+        build_overview_rgba(data, entropies, entropy_window, STRIP_CELLS, 1, colormap)
+    }
+
     #[test]
     fn overview_buffer_is_w_by_h_and_opaque() {
         let data = [0x41u8; 4096];
@@ -1224,7 +1219,7 @@ mod tests {
     fn strip_buffer_is_256x1_and_opaque() {
         let data = [0u8; 512];
         let e = entropies(&data);
-        let buf = build_strip_rgba(&data, &e, 256, Colormap::Value);
+        let buf = strip_rgba(&data, &e, 256, Colormap::Value);
         assert_eq!(buf.len(), 256 * 4);
         for (i, &b) in buf.iter().enumerate() {
             if i % 4 == 3 {
@@ -1238,7 +1233,7 @@ mod tests {
         // 512 bytes over 256 columns -> 2 bytes each; left half 0xFF, right 0x00.
         let data: Vec<u8> = [vec![0xFF; 256], vec![0x00; 256]].concat();
         let e = entropies(&data);
-        let buf = build_strip_rgba(&data, &e, 256, Colormap::Value);
+        let buf = strip_rgba(&data, &e, 256, Colormap::Value);
         assert_eq!(px(&buf, 256, 0, 0), (255, 255, 255, 255));
         assert_eq!(px(&buf, 256, 127, 0), (255, 255, 255, 255));
         assert_eq!(px(&buf, 256, 128, 0), (0, 0, 0, 255));
@@ -1250,7 +1245,7 @@ mod tests {
         // Every strip column maps back to the one byte.
         let data = [0xABu8; 1];
         let e = entropies(&data);
-        let buf = build_strip_rgba(&data, &e, 256, Colormap::Value);
+        let buf = strip_rgba(&data, &e, 256, Colormap::Value);
         assert_eq!(buf.len(), 256 * 4);
         assert_eq!(px(&buf, 256, 0, 0), (171, 171, 171, 255));
         assert_eq!(px(&buf, 256, 200, 0), (171, 171, 171, 255));
@@ -1266,7 +1261,7 @@ mod tests {
                 .all(|&b| b == 0)
         );
         assert!(
-            build_strip_rgba(&[], &[], 256, Colormap::Value)
+            strip_rgba(&[], &[], 256, Colormap::Value)
                 .iter()
                 .all(|&b| b == 0)
         );
@@ -1333,7 +1328,7 @@ mod tests {
         );
 
         // Strip: valid 256×2 buffer, fully opaque, with genuine content.
-        let strip = build_strip_rgba(&data, &e, 256, Colormap::Value);
+        let strip = strip_rgba(&data, &e, 256, Colormap::Value);
         assert_eq!(strip.len(), 256 * 4);
         assert!(strip.iter().skip(3).step_by(4).all(|&a| a == 255));
         let distinct: std::collections::HashSet<[u8; 4]> = strip

@@ -87,6 +87,21 @@ pub(crate) enum SliderKind {
     EntropyWindow,
 }
 
+impl SliderKind {
+    /// The `(min, max)` this slider spans on its log scale. Both the thumb
+    /// position (`ui::slider`) and the pointer→value mapping (`slider_value_at`)
+    /// read it here, so they cannot disagree about where a value sits.
+    fn range(self) -> (f32, f32) {
+        match self {
+            SliderKind::PixelZoom => (panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
+            SliderKind::EntropyWindow => (
+                panes::ENTROPY_WINDOW_MIN as f32,
+                panes::ENTROPY_WINDOW_MAX as f32,
+            ),
+        }
+    }
+}
+
 /// Which column a per-panel control belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Panel {
@@ -305,7 +320,9 @@ impl ParallHexApp {
             file_path: None,
             mmap: None,
             file_size: 0,
-            entropy_window: prefs.entropy_window.clamp(16, 4096),
+            entropy_window: prefs
+                .entropy_window
+                .clamp(panes::ENTROPY_WINDOW_MIN, panes::ENTROPY_WINDOW_MAX),
             overview_colormap: prefs.overview_colormap,
             zoom_colormap: prefs.zoom_colormap,
             hex_colormap: prefs.hex_colormap,
@@ -1309,9 +1326,8 @@ impl ParallHexApp {
         self.clamp_anchor();
     }
 
-    /// The hex column's scrollbar: the whole file as a track, the visible rows
-    /// as a thumb. The hex column is the scroll reference, so this drives the
-    /// shared anchor and the other panels follow.
+    /// Begin a column-divider drag: remember which divider and the width it
+    /// started at, so `on_divider_mouse_move` can apply the pointer delta.
     fn on_divider_mouse_down(&mut self, kind: DividerKind, pos: Point<Pixels>) {
         self.resizing_divider = Some(kind);
         self.divider_start_x = pos.x.to_f64() as f32;
@@ -1352,8 +1368,6 @@ impl ParallHexApp {
     fn on_divider_mouse_up(&mut self) {
         self.resizing_divider = None;
     }
-
-    // ----- bottom status bar -----
 }
 
 impl Focusable for ParallHexApp {
@@ -1496,9 +1510,7 @@ fn divider_width(start_w: f32, dx: f32, min: f32, max: f32) -> f32 {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// A reusable button wired up through `on_click` (so it works without the
-/// element holding keyboard focus). The callback receives the view, the
-/// window and a context, mirroring the `Context::listener` signature.
+/// Width of the invisible resize strip along each window edge and corner.
 const RESIZE_EDGE_W: f32 = 6.0;
 
 /// Minimize / maximize / close, for when the app supplies its own titlebar.
@@ -1611,8 +1623,8 @@ fn resize_handle(cx: &mut Context<ParallHexApp>, edge: ResizeEdge) -> gpui::AnyE
     .into_any_element()
 }
 
-/// A small color swatch previewing what a colormap looks like, shown in the
-/// pixels-column dropdown toggle.
+/// Inset of a slider's track and the width of its thumb; the thumb travels
+/// between the pads, so both the paint and the hit-testing derive from these.
 const SLIDER_PAD: f32 = 2.0;
 const SLIDER_THUMB_W: f32 = 12.0;
 
@@ -1641,10 +1653,7 @@ fn slider_value_at(kind: SliderKind, pos: Point<Pixels>, bounds: Bounds<Pixels>)
     }
     let w = bounds.size.width.to_f64() as f32;
     let t = slider_t_at_x((pos.x - bounds.left()).to_f64() as f32, w);
-    let (min, max) = match kind {
-        SliderKind::PixelZoom => (panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
-        SliderKind::EntropyWindow => (16.0, 4096.0),
-    };
+    let (min, max) = kind.range();
     Some(min * (max / min).powf(t))
 }
 
@@ -1666,7 +1675,10 @@ fn wheel_zoom_factor(delta: &ScrollDelta) -> f32 {
     }
 }
 
-/// Draw a column header: bold title, muted range label, trailing widgets.
+/// The monospace family to render hex cells in: the first preferred face the
+/// system actually has, then any family whose name contains "mono", then the
+/// default UI font as a last resort (whose glyphs are proportional, so
+/// `RowGeo`'s measured `char_w` keeps the cells aligned regardless).
 fn pick_monospace_family(window: &Window) -> SharedString {
     let names = window.text_system().all_font_names();
     let lower: Vec<String> = names.iter().map(|s| s.to_lowercase()).collect();

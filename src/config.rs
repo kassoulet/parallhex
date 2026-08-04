@@ -110,9 +110,7 @@ pub fn parse(text: &str) -> Config {
                 }
             }
             "pixel_zoom" => {
-                if let Ok(f) = value.parse::<f32>()
-                    && f.is_finite()
-                {
+                if let Some(f) = parse_finite(value) {
                     cfg.pixel_zoom = f;
                 }
             }
@@ -132,16 +130,12 @@ pub fn parse(text: &str) -> Config {
                 }
             }
             "overview_width" => {
-                if let Ok(f) = value.parse::<f32>()
-                    && f.is_finite()
-                {
+                if let Some(f) = parse_finite(value) {
                     cfg.overview_width = f;
                 }
             }
             "zoom_width" => {
-                if let Ok(f) = value.parse::<f32>()
-                    && f.is_finite()
-                {
+                if let Some(f) = parse_finite(value) {
                     cfg.zoom_width = f;
                 }
             }
