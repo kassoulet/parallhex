@@ -173,7 +173,7 @@ pub fn serialize(cfg: &Config) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     // `write!` into a `String` cannot fail; discard the `Result` it returns.
-    let _ = writeln!(out, "# ParallHex preferences");
+    let _ = writeln!(out, "# Parall-Hex preferences");
     let _ = writeln!(out, "entropy_window = {}", cfg.entropy_window);
     let _ = writeln!(out, "pixel_zoom = {}", cfg.pixel_zoom);
     let _ = writeln!(out, "overview_colormap = {}", cfg.overview_colormap.key());

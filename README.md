@@ -5,7 +5,7 @@
 A native binary/hex explorer: one wide window showing the same region of a file
 through three synchronized columns.
 
-![ParallHex showing libc.so.6: an entropy overview of the whole file, a
+![Parall-Hex showing libc.so.6: an entropy overview of the whole file, a
 byte-class pixel map, and class-coloured hex with a selection](docs/screenshot.png)
 
 *`libc.so.6` at offset 0. The overview (left) maps entropy over the whole 2 MiB —

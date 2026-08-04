@@ -1,6 +1,6 @@
 # Architecture
 
-How ParallHex is put together, and the handful of invariants that are easy to
+How Parall-Hex is put together, and the handful of invariants that are easy to
 break by accident. For what the app *does*, see [../README.md](../README.md).
 
 ## Module layout

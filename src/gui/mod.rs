@@ -141,7 +141,7 @@ pub fn run(initial_file: Option<PathBuf>) {
                 window_min_size: Some(size(px(MIN_WINDOW_W), px(MIN_WINDOW_H))),
                 window_decorations: DECORATIONS,
                 titlebar: Some(TitlebarOptions {
-                    title: Some("ParallHex".into()),
+                    title: Some("Parall-Hex".into()),
                     ..Default::default()
                 }),
                 focus: true,
