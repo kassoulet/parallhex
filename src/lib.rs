@@ -31,9 +31,14 @@
     clippy::cast_sign_loss,
     clippy::float_cmp
 )]
+// With no frontend enabled, nothing consumes `core`, so every item in it is
+// legitimately dead and `warnings = "deny"` would fail the build. That
+// configuration exists only to prove core is toolkit-free (`cargo build
+// --no-default-features`, and the CI check that gpui stays out of the tree); any
+// real build selects a frontend and keeps the lint fully active.
+#![cfg_attr(not(feature = "gpui-frontend"), allow(dead_code))]
 
-pub(crate) mod app;
 pub mod core;
-pub(crate) mod jump;
 
+#[cfg(feature = "gpui-frontend")]
 pub mod gui;

@@ -15,13 +15,23 @@ path = "src/lib.rs"
 [[bin]]
 name = "parallhex-gpui"
 path = "src/bin/parallhex-gpui.rs"
+required-features = ["gpui-frontend"]
 
 [dependencies]
-gpui = "0.2.2"
-image = "0.25"
 memmap2 = "0.9"
 rayon = "1.10"
-rfd = "0.14"
+
+# The gpui frontend's dependencies are optional so that a frontend which does not
+# need them -- a terminal one -- can be built on a host without gpui's link-time
+# libraries (freetype, xcb, xkbcommon). `image` is only used to wrap a buffer as
+# a gpui texture, and `rfd` only for the file dialog, so both are gpui-only.
+gpui = { version = "0.2.2", optional = true }
+image = { version = "0.25", optional = true }
+rfd = { version = "0.14", optional = true }
+
+[features]
+default = ["gpui-frontend"]
+gpui-frontend = ["gpui", "image", "rfd"]
 
 # Warnings-as-errors for both the compiler and clippy's pedantic group.
 #

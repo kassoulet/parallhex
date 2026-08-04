@@ -21,6 +21,7 @@ use crate::core::color::{self, Colormap};
 use crate::core::config;
 use crate::core::entropy;
 use crate::core::geom;
+use crate::gui::jump::{JumpField, JumpFieldEvent};
 use crate::gui::paint;
 use crate::gui::{
     ClearSelection, CopySelectionAscii, CopySelectionHex, JumpCancel, JumpSubmit, JumpToOffset,
@@ -28,7 +29,6 @@ use crate::gui::{
     NavigateRight, NavigateUp, OpenFile, Quit, ResetColumns, ResetSettings, ResetView, ZoomIn,
     ZoomOut,
 };
-use crate::jump::{JumpField, JumpFieldEvent};
 
 // The view-construction methods (columns, bars, dialog, sliders) and their
 // shared chrome helpers live in `ui`; this module keeps the state, the
