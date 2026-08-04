@@ -523,6 +523,7 @@ impl ParallHexApp {
                                     h,
                                     colormap: this.overview_colormap,
                                     entropy_window: this.entropy_window,
+                                    entropy_epoch: this.entropy_epoch,
                                 };
                                 if this.overview_key != Some(key)
                                     && !this.overview_computing

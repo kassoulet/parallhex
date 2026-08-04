@@ -84,6 +84,12 @@ pub struct OverviewKey {
     h: usize,
     colormap: Colormap,
     entropy_window: usize,
+    /// Which entropy cache the thumbnail was built from. Without this a build
+    /// that started before the entropy pass landed commits a key equal to the
+    /// current one, so nothing ever rebuilds and the overview keeps the flat
+    /// colours of the empty cache. `entropy_window` is not enough: the window is
+    /// unchanged across a load, only the data arrives.
+    entropy_epoch: u64,
 }
 
 /// The inputs the zoom column's visible-region texture is a function of; the
@@ -97,6 +103,8 @@ pub struct ZoomImageKey {
     ih: usize,
     colormap: Colormap,
     entropy_window: usize,
+    /// See `OverviewKey::entropy_epoch`.
+    entropy_epoch: u64,
 }
 
 /// Clamp ranges for the two drag-resizable column widths.
@@ -144,8 +152,12 @@ pub struct ParallHexApp {
     pub zoom_computing: bool,
 
     // Entropy computation generation: a background recompute applies only if no
-    // newer one was started meanwhile.
+    // newer one was started meanwhile. Incremented when a pass *starts*.
     pub entropy_gen: u64,
+    // Incremented when a pass's result is *applied*, which is a different moment
+    // and the one the thumbnail keys care about: a build in flight when new
+    // entropies land must be recognised as stale.
+    pub entropy_epoch: u64,
     // Coalescing for the async entropy pass: while `entropy_computing` is set,
     // new requests just mark `entropy_pending` and the in-flight task re-runs
     // with the latest window when it lands. Without this, dragging the
@@ -293,6 +305,7 @@ impl ParallHexApp {
             zoom_image_key: None,
             zoom_computing: false,
             entropy_gen: 0,
+            entropy_epoch: 0,
             entropy_computing: false,
             entropy_pending: false,
             overview_image: None,
@@ -441,6 +454,7 @@ impl ParallHexApp {
             ih,
             colormap: self.zoom_colormap,
             entropy_window: self.entropy_window,
+            entropy_epoch: self.entropy_epoch,
         };
         if self.zoom_image_key != Some(key)
             && !self.zoom_computing
@@ -556,9 +570,12 @@ impl ParallHexApp {
                 if this.entropy_gen == generation {
                     this.entropies = Arc::new(ents);
                     this.entropy_computing = false;
-                    // The thumbnails and the zoom texture bake entropy in, so
-                    // invalidate all three; their keys change only via these
-                    // resets, not via the data itself.
+                    // The thumbnails and the zoom texture bake entropy in, so a
+                    // new cache makes every cached image stale. Bumping the epoch
+                    // is what actually invalidates them: clearing the keys alone
+                    // is not enough, because a build already in flight commits its
+                    // own key afterwards and would overwrite the clear.
+                    this.entropy_epoch += 1;
                     this.overview_key = None;
                     this.strip_dirty = true;
                     this.zoom_image_key = None;
@@ -1652,6 +1669,51 @@ mod tests {
     };
 
     /// Only the zoom column zooms now, so the step is exercised over its range.
+    /// A thumbnail built from the empty entropy cache must not satisfy a key
+    /// computed after the real pass landed. Before the epoch existed, a build
+    /// that started on load committed a key identical to the current one, so the
+    /// overview kept the flat colours of the empty cache until something else
+    /// (a resize, a colormap change) happened to alter a key field.
+    #[test]
+    fn thumbnail_keys_distinguish_entropy_caches() {
+        use crate::core::color::Colormap;
+        use crate::gui::app::{OverviewKey, ZoomImageKey};
+
+        let before = OverviewKey {
+            w: 200,
+            h: 400,
+            colormap: Colormap::Entropy,
+            entropy_window: 256,
+            entropy_epoch: 0,
+        };
+        let after = OverviewKey {
+            entropy_epoch: 1,
+            ..before
+        };
+        assert_ne!(
+            before, after,
+            "the overview key must track the entropy cache"
+        );
+
+        let z_before = ZoomImageKey {
+            bpr: 32,
+            first_row_start: 0,
+            iw: 320,
+            ih: 480,
+            colormap: Colormap::Entropy,
+            entropy_window: 256,
+            entropy_epoch: 0,
+        };
+        assert_ne!(
+            z_before,
+            ZoomImageKey {
+                entropy_epoch: 1,
+                ..z_before
+            },
+            "the zoom texture key must track the entropy cache"
+        );
+    }
+
     #[test]
     fn zoom_step_multiplies_and_clamps() {
         use crate::core::geom::{PIXEL_ZOOM_MAX, PIXEL_ZOOM_MIN};
