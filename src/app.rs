@@ -20,6 +20,8 @@ use memmap2::{Mmap, MmapOptions};
 use crate::core::color::{self, Colormap};
 use crate::core::config;
 use crate::core::entropy;
+use crate::core::geom;
+use crate::gui::paint;
 use crate::gui::{
     ClearSelection, CopySelectionAscii, CopySelectionHex, JumpCancel, JumpSubmit, JumpToOffset,
     NavigateDown, NavigateEnd, NavigateHome, NavigateLeft, NavigatePageDown, NavigatePageUp,
@@ -27,7 +29,6 @@ use crate::gui::{
     ZoomOut,
 };
 use crate::jump::{JumpField, JumpFieldEvent};
-use crate::panes;
 
 // The view-construction methods (columns, bars, dialog, sliders) and their
 // shared chrome helpers live in `ui`; this module keeps the state, the
@@ -93,10 +94,10 @@ impl SliderKind {
     /// read it here, so they cannot disagree about where a value sits.
     fn range(self) -> (f32, f32) {
         match self {
-            SliderKind::PixelZoom => (panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
+            SliderKind::PixelZoom => (geom::PIXEL_ZOOM_MIN, geom::PIXEL_ZOOM_MAX),
             SliderKind::EntropyWindow => (
-                panes::ENTROPY_WINDOW_MIN as f32,
-                panes::ENTROPY_WINDOW_MAX as f32,
+                geom::ENTROPY_WINDOW_MIN as f32,
+                geom::ENTROPY_WINDOW_MAX as f32,
             ),
         }
     }
@@ -322,7 +323,7 @@ impl ParallHexApp {
             file_size: 0,
             entropy_window: prefs
                 .entropy_window
-                .clamp(panes::ENTROPY_WINDOW_MIN, panes::ENTROPY_WINDOW_MAX),
+                .clamp(geom::ENTROPY_WINDOW_MIN, geom::ENTROPY_WINDOW_MAX),
             overview_colormap: prefs.overview_colormap,
             zoom_colormap: prefs.zoom_colormap,
             hex_colormap: prefs.hex_colormap,
@@ -344,7 +345,7 @@ impl ParallHexApp {
             strip_dirty: false,
             pixel_zoom: prefs
                 .pixel_zoom
-                .clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX),
+                .clamp(geom::PIXEL_ZOOM_MIN, geom::PIXEL_ZOOM_MAX),
             scroll_offset: 0,
             hex_bpr: 32,
             zoom_bpr: 64,
@@ -460,12 +461,12 @@ impl ParallHexApp {
         // Redistribute the bytes so a row spans the panel exactly: as many
         // target-sized blocks as fit, then widened to fill the width.
         let w = bounds.size.width.to_f64() as f32;
-        let bpr = panes::zoom_bytes_per_row(w, self.zoom_target());
+        let bpr = geom::zoom_bytes_per_row(w, self.zoom_target());
         let changed = bpr != self.zoom_bpr;
         self.zoom_bpr = bpr;
-        let block = panes::zoom_block_w(w, bpr);
-        let rows = panes::visible_rows(bounds.size.height.to_f64() as f32, block);
-        let first = panes::first_row_centred(self.scroll_offset, bpr, rows);
+        let block = geom::zoom_block_w(w, bpr);
+        let rows = geom::visible_rows(bounds.size.height.to_f64() as f32, block);
+        let first = geom::first_row_centred(self.scroll_offset, bpr, rows);
         self.zoom_view = first..(first + rows * bpr).min(self.file_size);
         // Rebuild the visible-region texture only when its inputs changed, on
         // the background executor so scrolling at low zoom never stalls the
@@ -495,13 +496,13 @@ impl ParallHexApp {
                     .background_executor()
                     .spawn(async move {
                         data.as_deref().and_then(|d| {
-                            let src = panes::ByteSource {
+                            let src = geom::ByteSource {
                                 data: d,
                                 entropies: &entropies,
                                 entropy_window: key.entropy_window,
                                 colormap: key.colormap,
                             };
-                            panes::build_zoom_image(&src, key.bpr, key.first_row_start, rows, block)
+                            paint::build_zoom_image(&src, key.bpr, key.first_row_start, rows, block)
                         })
                     })
                     .await;
@@ -525,14 +526,14 @@ impl ParallHexApp {
     /// The zoom column's *target* block size, as set by the slider.
     fn zoom_target(&self) -> f32 {
         self.pixel_zoom
-            .clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX)
+            .clamp(geom::PIXEL_ZOOM_MIN, geom::PIXEL_ZOOM_MAX)
     }
 
     /// Actual size of one byte's block. The bytes are redistributed across the
     /// panel so a row spans its full width, so this is the target widened to
     /// divide the width exactly. Blocks are square, so it is the row height too.
     fn zoom_row_h(&self) -> f32 {
-        panes::zoom_block_w(
+        geom::zoom_block_w(
             self.pixels_bounds.size.width.to_f64() as f32,
             self.zoom_bpr.max(1),
         )
@@ -543,7 +544,7 @@ impl ParallHexApp {
     fn clamp_anchor(&mut self) {
         self.scroll_offset = self
             .scroll_offset
-            .min(panes::max_anchor(self.file_size, self.hex_bpr.max(8)));
+            .min(geom::max_anchor(self.file_size, self.hex_bpr.max(8)));
     }
 
     /// Scroll by whole rows of `panel`, negative for up.
@@ -635,7 +636,7 @@ impl ParallHexApp {
         let entropy_window = self.entropy_window;
         let colormap = self.overview_colormap;
         self.strip_image = self.data().map(|d| {
-            panes::build_strip_image(&panes::ByteSource {
+            paint::build_strip_image(&geom::ByteSource {
                 data: d,
                 entropies: &entropies,
                 entropy_window,
@@ -830,7 +831,7 @@ impl ParallHexApp {
         if self.show_jump_dialog {
             return;
         }
-        self.zoom_under_pointer(window, panes::ZOOM_STEP);
+        self.zoom_under_pointer(window, paint::ZOOM_STEP);
         cx.notify();
     }
 
@@ -838,7 +839,7 @@ impl ParallHexApp {
         if self.show_jump_dialog {
             return;
         }
-        self.zoom_under_pointer(window, 1.0 / panes::ZOOM_STEP);
+        self.zoom_under_pointer(window, 1.0 / paint::ZOOM_STEP);
         cx.notify();
     }
 
@@ -848,11 +849,11 @@ impl ParallHexApp {
         let p = window.mouse_position();
         // Only the zoom column zooms; the hex text size is fixed.
         if self.pixels_bounds.contains(&p) {
-            self.pixel_zoom = panes::zoom_step(
+            self.pixel_zoom = paint::zoom_step(
                 self.pixel_zoom,
                 factor,
-                panes::PIXEL_ZOOM_MIN,
-                panes::PIXEL_ZOOM_MAX,
+                geom::PIXEL_ZOOM_MIN,
+                geom::PIXEL_ZOOM_MAX,
             );
         }
     }
@@ -897,7 +898,7 @@ impl ParallHexApp {
         }
         // The hex column is the scroll reference, so a page is its visible rows.
         let bpr = self.hex_bpr.max(8);
-        let page_bytes = panes::visible_rows(self.view_height, panes::BLOCK_H) * bpr;
+        let page_bytes = geom::visible_rows(self.view_height, paint::BLOCK_H) * bpr;
 
         // First navigation with no selection yet: honor Home/End, otherwise
         // place the cursor at offset 0.
@@ -1048,8 +1049,15 @@ impl ParallHexApp {
     fn hex_offset_at_pos(&self, pos: Point<Pixels>) -> Option<usize> {
         let local = self.hex_bounds.localize(&pos)?;
         let bpr = self.hex_bpr.max(8);
-        let geo = panes::RowGeo::new(self.hex_char_w, bpr);
-        panes::hex_offset_at(local, &geo, self.hex_view.start, self.file_size)
+        let geo = geom::RowGeo::new(self.hex_char_w, bpr);
+        geom::hex_offset_at(
+            local.x.to_f64() as f32,
+            local.y.to_f64() as f32,
+            &geo,
+            paint::BLOCK_H,
+            self.hex_view.start,
+            self.file_size,
+        )
     }
 
     fn on_hex_mouse_down(&mut self, event: &MouseDownEvent) {
@@ -1132,7 +1140,7 @@ impl ParallHexApp {
 
     fn on_hex_scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         // The hex text size is fixed, so there is nothing to zoom here.
-        self.scroll_by_wheel(Panel::Hex, &event.delta, panes::BLOCK_H);
+        self.scroll_by_wheel(Panel::Hex, &event.delta, paint::BLOCK_H);
         cx.notify();
     }
 
@@ -1141,8 +1149,9 @@ impl ParallHexApp {
     fn pixels_offset_at(&self, pos: Point<Pixels>) -> Option<usize> {
         let local = self.pixels_bounds.localize(&pos)?;
         let bpr = self.zoom_bpr.max(1);
-        panes::zoom_offset_at(
-            local,
+        geom::zoom_offset_at(
+            local.x.to_f64() as f32,
+            local.y.to_f64() as f32,
             bpr,
             self.zoom_view.start,
             self.zoom_row_h(),
@@ -1190,11 +1199,11 @@ impl ParallHexApp {
         if event.modifiers.control || event.modifiers.platform {
             let factor = wheel_zoom_factor(&event.delta);
             if factor != 1.0 {
-                self.pixel_zoom = panes::zoom_step(
+                self.pixel_zoom = paint::zoom_step(
                     self.pixel_zoom,
                     factor,
-                    panes::PIXEL_ZOOM_MIN,
-                    panes::PIXEL_ZOOM_MAX,
+                    geom::PIXEL_ZOOM_MIN,
+                    geom::PIXEL_ZOOM_MAX,
                 );
                 cx.notify();
             }
@@ -1323,8 +1332,8 @@ impl ParallHexApp {
         }
         let y = (pos.y - track.top()).to_f64() as f32;
         let visible = self.hex_view.len().max(1);
-        let last = panes::max_anchor(self.file_size, self.hex_bpr.max(8));
-        self.scroll_offset = panes::scrollbar_anchor_at(y, track_h, last, visible, self.file_size);
+        let last = geom::max_anchor(self.file_size, self.hex_bpr.max(8));
+        self.scroll_offset = geom::scrollbar_anchor_at(y, track_h, last, visible, self.file_size);
         self.clamp_anchor();
     }
 
@@ -1389,8 +1398,8 @@ impl Render for ParallHexApp {
         // mouse move.
         let scale = window.scale_factor();
         if self.hex_char_w_scale != scale {
-            let mono = panes::mono_font(&self.mono_family);
-            self.hex_char_w = panes::hex_char_width(window, &mono, px(panes::HEX_FONT_SIZE));
+            let mono = paint::mono_font(&self.mono_family);
+            self.hex_char_w = paint::hex_char_width(window, &mono, px(paint::HEX_FONT_SIZE));
             self.hex_char_w_scale = scale;
         }
         // With client-side decorations nothing else draws a titlebar, so the
@@ -1793,26 +1802,31 @@ mod tests {
     /// Only the zoom column zooms now, so the step is exercised over its range.
     #[test]
     fn zoom_step_multiplies_and_clamps() {
-        use crate::panes::{PIXEL_ZOOM_MAX, PIXEL_ZOOM_MIN};
+        use crate::core::geom::{PIXEL_ZOOM_MAX, PIXEL_ZOOM_MIN};
         assert_eq!(
-            crate::panes::zoom_step(4.0, crate::panes::ZOOM_STEP, PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX),
+            crate::gui::paint::zoom_step(
+                4.0,
+                crate::gui::paint::ZOOM_STEP,
+                PIXEL_ZOOM_MIN,
+                PIXEL_ZOOM_MAX
+            ),
             5.0
         );
         assert_eq!(
-            crate::panes::zoom_step(
+            crate::gui::paint::zoom_step(
                 24.0,
-                crate::panes::ZOOM_STEP,
+                crate::gui::paint::ZOOM_STEP,
                 PIXEL_ZOOM_MIN,
                 PIXEL_ZOOM_MAX
             ),
             24.0
         );
         assert_eq!(
-            crate::panes::zoom_step(1.0, 0.8, PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX),
+            crate::gui::paint::zoom_step(1.0, 0.8, PIXEL_ZOOM_MIN, PIXEL_ZOOM_MAX),
             1.0
         );
         assert_eq!(
-            crate::panes::zoom_step(20.0, crate::panes::ZOOM_STEP, 1.0, 24.0),
+            crate::gui::paint::zoom_step(20.0, crate::gui::paint::ZOOM_STEP, 1.0, 24.0),
             24.0
         );
     }

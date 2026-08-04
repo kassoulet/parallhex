@@ -35,6 +35,5 @@
 pub(crate) mod app;
 pub(crate) mod core;
 pub(crate) mod jump;
-pub(crate) mod panes;
 
 pub mod gui;

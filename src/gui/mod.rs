@@ -2,6 +2,8 @@
 //! view dispatches. The view itself lives in `app`, its tree builder in
 //! `app::ui`, and the painters in `paint`.
 
+pub(crate) mod paint;
+
 use crate::app;
 use crate::core::config;
 

@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::core::color::Colormap;
-use crate::panes::PIXEL_ZOOM_DEFAULT;
+use crate::core::geom::PIXEL_ZOOM_DEFAULT;
 
 /// UI preferences that survive across sessions.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -339,7 +339,8 @@ mod tests {
     fn default_zoom_is_within_its_clamp() {
         let cfg = Config::default();
         assert!(
-            (crate::panes::PIXEL_ZOOM_MIN..=crate::panes::PIXEL_ZOOM_MAX).contains(&cfg.pixel_zoom)
+            (crate::core::geom::PIXEL_ZOOM_MIN..=crate::core::geom::PIXEL_ZOOM_MAX)
+                .contains(&cfg.pixel_zoom)
         );
         assert!((16..=4096).contains(&cfg.entropy_window));
     }

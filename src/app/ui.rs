@@ -11,7 +11,8 @@ use gpui::{
 };
 
 use crate::core::color::Colormap;
-use crate::panes;
+use crate::core::{geom, thumb};
+use crate::gui::paint;
 
 use super::*;
 
@@ -64,9 +65,9 @@ impl ParallHexApp {
         let anchor = self.scroll_offset;
         let visible = self.hex_view.len();
         let len = self.file_size;
-        let last = panes::max_anchor(len, self.hex_bpr.max(8));
+        let last = geom::max_anchor(len, self.hex_bpr.max(8));
         div()
-            .w(px(panes::SCROLLBAR_W))
+            .w(px(paint::SCROLLBAR_W))
             .h_full()
             .flex_shrink_0()
             .cursor(CursorStyle::Arrow)
@@ -92,7 +93,7 @@ impl ParallHexApp {
                 &entity,
                 |this, bounds, _cx| this.scrollbar_bounds = bounds,
                 move |bounds, window, _cx| {
-                    panes::paint_scrollbar(window, bounds, anchor, last, visible, len);
+                    paint::paint_scrollbar(window, bounds, anchor, last, visible, len);
                 },
             ))
     }
@@ -214,7 +215,7 @@ impl ParallHexApp {
         let bpr = self.hex_bpr.max(8);
         let total_rows = self.file_size.div_ceil(bpr);
         let first = self.hex_view.start / bpr;
-        let vis = panes::visible_rows(self.view_height, panes::BLOCK_H);
+        let vis = geom::visible_rows(self.view_height, paint::BLOCK_H);
         let last = (first + vis).min(total_rows);
         let pct = (self.view_frac * 100.0).round() as u32;
         Some(format!(
@@ -332,7 +333,7 @@ impl ParallHexApp {
             return None;
         }
         let b = d[off];
-        let h = panes::entropy_at(&self.entropies, self.entropy_window, off);
+        let h = geom::entropy_at(&self.entropies, self.entropy_window, off);
         Some(format!(
             "0x{off:08X} · 0x{b:02X} '{}' · H={h:.3}",
             color::printable(b)
@@ -349,7 +350,7 @@ impl ParallHexApp {
             Some(o) if o < self.file_size => {
                 let d = self.data();
                 let b = d.map_or(0, |d| d[o]);
-                let h = panes::entropy_at(&self.entropies, self.entropy_window, o);
+                let h = geom::entropy_at(&self.entropies, self.entropy_window, o);
                 Some((
                     format!(
                         "Jump: 0x{o:08X}  Byte: 0x{b:02X} '{}'  H={h:.3}",
@@ -408,7 +409,7 @@ impl ParallHexApp {
                 |this, bounds, _cx| this.strip_bounds = bounds,
                 move |bounds, window, _cx| {
                     if let Some(img) = &strip_image {
-                        panes::paint_strip(
+                        paint::paint_strip(
                             window,
                             bounds,
                             img,
@@ -467,7 +468,7 @@ impl ParallHexApp {
         let overview_width = self.overview_width;
         let header = column_header(
             "Overview",
-            (file_size > 0).then(|| panes::range_label(0, file_size)),
+            (file_size > 0).then(|| geom::range_label(0, file_size)),
             self.colormap_picker(cx, Panel::Overview),
         );
 
@@ -537,8 +538,8 @@ impl ParallHexApp {
                                                 .background_executor()
                                                 .spawn(async move {
                                                     data.as_deref().map(|d| {
-                                                        panes::build_overview_rgba(
-                                                            &panes::ByteSource {
+                                                        thumb::build_overview_rgba(
+                                                            &geom::ByteSource {
                                                                 data: d,
                                                                 entropies: &entropies,
                                                                 entropy_window: key.entropy_window,
@@ -553,7 +554,7 @@ impl ParallHexApp {
                                             this.update(cx, |this, cx| {
                                                 if let Some(rgba) = rgba {
                                                     this.overview_image =
-                                                        Some(panes::render_image_from_rgba(
+                                                        Some(paint::render_image_from_rgba(
                                                             key.w, key.h, rgba,
                                                         ));
                                                     this.overview_cells = Some((key.w, key.h));
@@ -575,7 +576,7 @@ impl ParallHexApp {
                             move |bounds, window, cx| {
                                 let image = paint_entity.read(cx).overview_image.clone();
                                 match image {
-                                    Some(img) => panes::paint_overview(
+                                    Some(img) => paint::paint_overview(
                                         window,
                                         bounds,
                                         &img,
@@ -607,8 +608,8 @@ impl ParallHexApp {
         let sel = self.selection_range.clone();
 
         let range = (len > 0).then(|| {
-            let rows = panes::visible_rows(self.view_height, self.zoom_row_h());
-            panes::range_label(first_row_start, (first_row_start + rows * bpr).min(len))
+            let rows = geom::visible_rows(self.view_height, self.zoom_row_h());
+            geom::range_label(first_row_start, (first_row_start + rows * bpr).min(len))
         });
 
         div()
@@ -654,7 +655,7 @@ impl ParallHexApp {
                                 // closure just blits it and draws the overlays.
                                 if data.is_some() {
                                     let image = paint_entity.read(cx).zoom_image.clone();
-                                    panes::paint_zoom(
+                                    paint::paint_zoom(
                                         window,
                                         bounds,
                                         image.as_ref(),
@@ -688,7 +689,7 @@ impl ParallHexApp {
             )
             .child(self.slider(cx, SliderKind::PixelZoom))
             .child(button(cx, "Reset", move |this, _window, cx| {
-                this.pixel_zoom = panes::PIXEL_ZOOM_DEFAULT;
+                this.pixel_zoom = geom::PIXEL_ZOOM_DEFAULT;
                 cx.notify();
             }))
             .child(self.colormap_picker(cx, Panel::Zoom));
@@ -833,15 +834,15 @@ impl ParallHexApp {
         let first_row_start = self.hex_view.start;
         let hovered = self.hovered_offset;
         let sel = self.selection_range.clone();
-        let font = panes::mono_font(&self.mono_family);
+        let font = paint::mono_font(&self.mono_family);
         let char_w = self.hex_char_w;
         let hex_entropies = self.entropies.clone();
         let entropy_window = self.entropy_window;
         let hex_colormap = self.hex_colormap;
 
         let range = (len > 0).then(|| {
-            let rows = panes::visible_rows(self.view_height, panes::BLOCK_H);
-            panes::range_label(first_row_start, (first_row_start + rows * bpr).min(len))
+            let rows = geom::visible_rows(self.view_height, paint::BLOCK_H);
+            geom::range_label(first_row_start, (first_row_start + rows * bpr).min(len))
         });
 
         // The hex text size is fixed, so this header carries no zoom controls.
@@ -906,7 +907,7 @@ impl ParallHexApp {
                                     this.view_height = bounds.size.height.to_f64() as f32;
                                     // Content fits the panel: as many whole
                                     // 8-byte groups as the width allows.
-                                    let new_bpr = panes::hex_bytes_per_row(
+                                    let new_bpr = geom::hex_bytes_per_row(
                                         bounds.size.width.to_f64() as f32,
                                         this.hex_char_w,
                                     );
@@ -920,10 +921,9 @@ impl ParallHexApp {
                                         this.scroll_offset = off;
                                     }
                                     this.clamp_anchor();
-                                    let rows =
-                                        panes::visible_rows(this.view_height, panes::BLOCK_H);
+                                    let rows = geom::visible_rows(this.view_height, paint::BLOCK_H);
                                     let first =
-                                        panes::first_row_centred(this.scroll_offset, bpr, rows);
+                                        geom::first_row_centred(this.scroll_offset, bpr, rows);
                                     this.hex_view = first..(first + rows * bpr).min(this.file_size);
                                     if this.file_size > 0 {
                                         this.view_frac = (this.scroll_offset as f32
@@ -936,11 +936,11 @@ impl ParallHexApp {
                                 },
                                 move |bounds, window, cx| {
                                     if let Some(d) = &data {
-                                        panes::paint_hex(
+                                        paint::paint_hex(
                                             window,
                                             cx,
                                             bounds,
-                                            &panes::ByteSource {
+                                            &geom::ByteSource {
                                                 data: d,
                                                 entropies: &hex_entropies,
                                                 entropy_window,
@@ -1129,11 +1129,11 @@ impl ParallHexApp {
     fn set_slider_value(&mut self, kind: SliderKind, v: f32, cx: &mut Context<Self>) {
         match kind {
             SliderKind::PixelZoom => {
-                self.pixel_zoom = v.clamp(panes::PIXEL_ZOOM_MIN, panes::PIXEL_ZOOM_MAX);
+                self.pixel_zoom = v.clamp(geom::PIXEL_ZOOM_MIN, geom::PIXEL_ZOOM_MAX);
             }
             SliderKind::EntropyWindow => {
-                let w = (v.round() as usize)
-                    .clamp(panes::ENTROPY_WINDOW_MIN, panes::ENTROPY_WINDOW_MAX);
+                let w =
+                    (v.round() as usize).clamp(geom::ENTROPY_WINDOW_MIN, geom::ENTROPY_WINDOW_MAX);
                 if w != self.entropy_window {
                     self.entropy_window = w;
                     self.recompute_entropies_async(cx, false);
@@ -1180,15 +1180,15 @@ fn swatch(cm: Colormap) -> impl IntoElement {
     let color = match cm {
         Colormap::None => rgb(0x3b4261),
         Colormap::Value => rgb(0x9aa5ce),
-        Colormap::Class => panes::to_rgba(color::class_color(0x41)),
-        Colormap::Entropy => panes::to_rgba(color::entropy_color(4.0)),
+        Colormap::Class => paint::to_rgba(color::class_color(0x41)),
+        Colormap::Entropy => paint::to_rgba(color::entropy_color(4.0)),
     };
     div().w(px(10.)).h(px(10.)).rounded_md().bg(color)
 }
 
 /// A dark background quad for empty canvas areas.
 fn quad_dark(bounds: Bounds<Pixels>) -> gpui::PaintQuad {
-    panes::filled_quad(bounds, rgb(0x0c0d14))
+    paint::filled_quad(bounds, rgb(0x0c0d14))
 }
 
 /// A full-size canvas whose prepaint runs `prepaint` against the app state and

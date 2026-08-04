@@ -7,3 +7,5 @@
 pub(crate) mod color;
 pub(crate) mod config;
 pub(crate) mod entropy;
+pub(crate) mod geom;
+pub(crate) mod thumb;
