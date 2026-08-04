@@ -199,6 +199,16 @@ pub struct ParallHexApp {
     pub saved_cfg: config::Config,
     pub last_save: Instant,
 
+    // Wall-clock time spent building the previous frame's element tree,
+    // shown in the status bar as a rough per-frame speed readout.
+    pub last_render_ms: f32,
+
+    // Wall-clock time from the end of the previous `render` until gpui's next
+    // frame callback fires — i.e. the full frame cycle: the rest of the CPU
+    // paint, the GPU submit/present and the wait for the next refresh. Kept in
+    // sync via `Window::on_next_frame` (gpui 0.2 exposes no post-present hook).
+    pub last_frame_ms: f32,
+
     // Last captured window geometry, persisted so position/size can be
     // restored on the next launch. Captured live each frame (rounded to
     // whole pixels) so a move/resize lands in the config file.
@@ -288,6 +298,8 @@ impl ParallHexApp {
             window_maximized: prefs.window_maximized,
             saved_cfg: prefs,
             last_save: Instant::now(),
+            last_render_ms: 0.0,
+            last_frame_ms: 0.0,
             resizing_divider: None,
             divider_start_x: 0.0,
             divider_start_w: 0.0,
@@ -1299,7 +1311,17 @@ impl ParallHexApp {
                                 .text_color(rgb(0xe0af68))
                                 .child(self.message.clone().unwrap()),
                         )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .text_color(rgb(0x565f89))
+                            .child(format!("build {:.2} ms", self.last_render_ms)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0x565f89))
+                            .child(format!("frame {:.2} ms", self.last_frame_ms)),
+                    ),
             )
     }
 
@@ -2284,6 +2306,7 @@ impl Focusable for ParallHexApp {
 
 impl Render for ParallHexApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let frame_start = Instant::now();
         self.capture_window_geometry(window);
         // With client-side decorations nothing else draws a titlebar, so the
         // top bar has to provide move / maximize / close and the edges have to
@@ -2302,7 +2325,7 @@ impl Render for ParallHexApp {
         let show_jump = self.show_jump_dialog;
         let no_file = self.mmap.is_none();
 
-        div()
+        let el = div()
             .id("parallhex-root")
             .size_full()
             .flex()
@@ -2370,7 +2393,25 @@ impl Render for ParallHexApp {
             .when(show_jump, |d| d.child(self.jump_dialog(cx)))
             // Last children so they sit above everything and win hit-testing
             // in the few pixels along each window edge.
-            .when(client_side, |d| d.children(resize_handles(cx)))
+            .when(client_side, |d| d.children(resize_handles(cx)));
+
+        // Measure the tree build itself (element construction, not the GPU
+        // paint) so the status bar can report a rough per-frame cost.
+        let live_render_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        let live_frame_ms = move || frame_start.elapsed().as_secs_f32() * 1000.0;
+
+        // Timing the GPU paint itself isn't possible from outside gpui 0.2 (no
+        // post-present hook), so capture the full frame cycle instead: gpui
+        // runs this closure at the next frame's outset, i.e. after the current
+        // frame has been painted and presented. The readout therefore includes
+        // the rest of the CPU paint, the GPU submit and the vsync wait.
+        let entity = cx.entity();
+        window.on_next_frame(move |_, cx| {
+            entity.update(cx, |this, _| this.last_frame_ms = live_frame_ms());
+        });
+
+        self.last_render_ms = live_render_ms;
+        el
     }
 }
 
