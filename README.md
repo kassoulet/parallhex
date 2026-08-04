@@ -200,7 +200,9 @@ cargo clippy --all-targets          # required: pedantic, warnings denied
 
 Tests are inline `#[cfg(test)] mod tests` blocks in each module; there is no
 `tests/` directory. The pixel and geometry maths lives in pure functions in
-`panes.rs` precisely so it can be tested without opening a window.
+`core::geom` and `core::thumb` precisely so it can be tested without opening a
+window — and for the same reason the terminal frontend's keymap and state machine
+are pure too, so no test needs a terminal either.
 
 Commits are gated by [`prek`](https://prek.j178.dev) (see `prek.toml`), which
 runs `cargo test --all-targets`, `cargo fmt --check` and
