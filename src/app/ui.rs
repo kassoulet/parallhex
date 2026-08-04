@@ -1180,8 +1180,8 @@ fn swatch(cm: Colormap) -> impl IntoElement {
     let color = match cm {
         Colormap::None => rgb(0x3b4261),
         Colormap::Value => rgb(0x9aa5ce),
-        Colormap::Class => color::class_color(0x41),
-        Colormap::Entropy => color::entropy_color(4.0),
+        Colormap::Class => panes::to_rgba(color::class_color(0x41)),
+        Colormap::Entropy => panes::to_rgba(color::entropy_color(4.0)),
     };
     div().w(px(10.)).h(px(10.)).rounded_md().bg(color)
 }

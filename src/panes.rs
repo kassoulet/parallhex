@@ -23,7 +23,7 @@ use gpui::{
     transparent_black,
 };
 
-use crate::color::{self, Colormap};
+use crate::color::{self, Colormap, Rgb};
 
 pub(crate) const PIXEL_ZOOM_DEFAULT: f32 = 4.0;
 pub(crate) const PIXEL_ZOOM_MIN: f32 = 1.0;
@@ -257,6 +257,17 @@ pub(crate) fn mono_font(family: &str) -> Font {
     font(family.to_owned())
 }
 
+/// Convert a core `Rgb` to the gpui colour type. This is the single boundary
+/// where the toolkit-neutral palette becomes gpui's own representation.
+pub(crate) fn to_rgba(c: Rgb) -> Rgba {
+    Rgba {
+        r: f32::from(c.r) / 255.0,
+        g: f32::from(c.g) / 255.0,
+        b: f32::from(c.b) / 255.0,
+        a: 1.0,
+    }
+}
+
 /// Convert an RGBA color to the HSLA used by gpui text runs.
 fn to_hsla(c: Rgba) -> Hsla {
     Hsla::from(c)
@@ -296,7 +307,7 @@ impl ByteSource<'_> {
     /// Color for `byte`, sampling entropy at `offset`. The two are separate
     /// because the thumbnails color a *sampled average* of a cell's bytes while
     /// reading entropy at the cell's midpoint.
-    pub fn color_of(&self, byte: u8, offset: usize) -> Option<Rgba> {
+    pub fn color_of(&self, byte: u8, offset: usize) -> Option<Rgb> {
         self.colormap.color_for(
             byte,
             entropy_for(self.colormap, self.entropies, self.entropy_window, offset),
@@ -305,7 +316,7 @@ impl ByteSource<'_> {
 
     /// Color for the byte at `offset`. Panics if `offset` is out of bounds —
     /// callers already clamp to the visible range.
-    pub fn color_at(&self, offset: usize) -> Option<Rgba> {
+    pub fn color_at(&self, offset: usize) -> Option<Rgb> {
         self.color_of(self.data[offset], offset)
     }
 
@@ -483,9 +494,9 @@ pub(crate) fn build_row_text_into(
 
 /// Glyph color for a cell: contrast text against its background, or the
 /// default foreground when the colormap paints no background.
-fn cell_glyph_color(cell: Option<Rgba>) -> Hsla {
+fn cell_glyph_color(cell: Option<Rgb>) -> Hsla {
     match cell {
-        Some(bg) => to_hsla(color::fg_for_bg(bg)),
+        Some(bg) => to_hsla(to_rgba(color::fg_for_bg(bg))),
         None => to_hsla(rgb(DEFAULT_FG)),
     }
 }
@@ -502,7 +513,7 @@ fn build_row_runs(
     ascii_offsets: &[usize],
     font: &Font,
     total_len: usize,
-    colors: &[Option<Rgba>],
+    colors: &[Option<Rgb>],
     runs: &mut Vec<TextRun>,
 ) {
     runs.clear();
@@ -623,7 +634,7 @@ fn paint_cell_runs(
     window: &mut Window,
     origin: Point<Pixels>,
     y0: f32,
-    colors: &[Option<Rgba>],
+    colors: &[Option<Rgb>],
     selected: &[bool],
     x_of: impl Fn(usize) -> f32,
     cell_w: f32,
@@ -647,14 +658,14 @@ fn paint_cell_runs(
         if let Some(bg) = bg {
             if fill_w >= cell_w {
                 // Contiguous cells: the whole run is one quad.
-                window.paint_quad(filled_quad(span, bg));
+                window.paint_quad(filled_quad(span, to_rgba(bg)));
             } else {
                 for k in i..j {
                     let cell = Bounds::new(
                         point(origin.x + px(x_of(k)), origin.y + px(y0)),
                         size(px(fill_w), px(ROW_H)),
                     );
-                    window.paint_quad(filled_quad(cell, bg));
+                    window.paint_quad(filled_quad(cell, to_rgba(bg)));
                 }
             }
         }
@@ -703,7 +714,7 @@ pub(crate) fn paint_hex(
     let mut text = String::with_capacity(128);
     let mut hex_offsets = Vec::with_capacity(bpr);
     let mut ascii_offsets = Vec::with_capacity(bpr);
-    let mut colors: Vec<Option<Rgba>> = Vec::with_capacity(bpr);
+    let mut colors: Vec<Option<Rgb>> = Vec::with_capacity(bpr);
     let mut selected = vec![false; bpr];
     let mut runs: Vec<TextRun> = Vec::new();
     for r in 0..rows {
@@ -999,12 +1010,14 @@ fn sample_average(data: &[u8], start: usize, end: usize) -> u8 {
     (sum / SAMPLES as u32) as u8
 }
 
-fn set_pixel(buf: &mut [u8], width: usize, x: usize, y: usize, c: Rgba) {
+fn set_pixel(buf: &mut [u8], width: usize, x: usize, y: usize, c: Rgb) {
     let p = (y * width + x) * 4;
-    buf[p] = (c.r * 255.0) as u8;
-    buf[p + 1] = (c.g * 255.0) as u8;
-    buf[p + 2] = (c.b * 255.0) as u8;
-    buf[p + 3] = (c.a * 255.0) as u8;
+    buf[p] = c.r;
+    buf[p + 1] = c.g;
+    buf[p + 2] = c.b;
+    // Opaque: a cell the colormap declined to paint is skipped by the caller
+    // rather than written with alpha 0, so anything reaching here is visible.
+    buf[p + 3] = 255;
 }
 
 /// Wrap a raw RGBA buffer as a gpui `RenderImage` (via the `image` crate's
@@ -1127,12 +1140,9 @@ pub(crate) fn build_zoom_rgba(
             };
             let x0 = (i as f32 * block).round() as usize;
             let x1 = ((i + 1) as f32 * block).round() as usize;
-            let (r8, g8, b8, a8) = (
-                (c.r * 255.0) as u8,
-                (c.g * 255.0) as u8,
-                (c.b * 255.0) as u8,
-                (c.a * 255.0) as u8,
-            );
+            // `Rgb` is already 8-bit, so no scaling is needed; opaque because a
+            // colour the colormap declined to paint was skipped above.
+            let (r8, g8, b8, a8) = (c.r, c.g, c.b, 255);
             // Fill every pixel row of the block's column span.
             for row in buf.chunks_exact_mut(iw * 4).take(h) {
                 for px in row[x0 * 4..x1 * 4].chunks_exact_mut(4) {

@@ -1,25 +1,50 @@
 //! Byte-to-color mappings and small display helpers.
 
-use gpui::{Rgba, rgb};
+/// A plain 8-bit colour, deliberately toolkit-neutral so that every frontend can
+/// consume it: the gpui side converts to `gpui::Rgba` at its painting boundary,
+/// a terminal frontend to its own colour type. 8-bit rather than float because
+/// both destinations ultimately want bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// Split a packed `0xRRGGBB` literal, which is how this palette is written.
+    pub const fn from_hex(v: u32) -> Self {
+        Self {
+            r: (v >> 16) as u8,
+            g: (v >> 8) as u8,
+            b: v as u8,
+        }
+    }
+}
 
 /// Per-byte category color (binvis.io "byte class" palette).
-pub fn class_color(b: u8) -> Rgba {
+pub fn class_color(b: u8) -> Rgb {
     match b {
-        0x00 => rgb(0x000000),               // Null
-        0x01..=0x1F | 0x7F => rgb(0x17becf), // Control
-        0x20..=0x7E => rgb(0x1f77b4),        // Printable ASCII
-        0x80..=0xFE => rgb(0xff7f0e),        // High / non-ASCII
-        0xFF => rgb(0xffffff),               // Fill / padded
+        0x00 => Rgb::new(0, 0, 0),                     // Null
+        0x01..=0x1F | 0x7F => Rgb::from_hex(0x17becf), // Control
+        0x20..=0x7E => Rgb::from_hex(0x1f77b4),        // Printable ASCII
+        0x80..=0xFE => Rgb::from_hex(0xff7f0e),        // High / non-ASCII
+        0xFF => Rgb::new(255, 255, 255),               // Fill / padded
     }
 }
 
 /// Foreground text color with sufficient contrast against any cell background.
-pub fn fg_for_bg(bg: Rgba) -> Rgba {
-    let luma = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
-    if luma > 140.0 / 255.0 {
-        rgb(0x0f0f0f)
+/// The threshold is on the 0–255 scale, matching `Rgb`'s channels.
+pub fn fg_for_bg(bg: Rgb) -> Rgb {
+    let luma = 0.299 * f32::from(bg.r) + 0.587 * f32::from(bg.g) + 0.114 * f32::from(bg.b);
+    if luma > 140.0 {
+        Rgb::from_hex(0x0f0f0f)
     } else {
-        rgb(0xffffff)
+        Rgb::new(255, 255, 255)
     }
 }
 
@@ -43,7 +68,7 @@ const STOPS: [(f32, (u8, u8, u8)); 5] = [
 ];
 
 /// Map Shannon entropy `h in [0, 8]` onto a color gradient.
-pub fn entropy_color(h: f32) -> Rgba {
+pub fn entropy_color(h: f32) -> Rgb {
     let h = h.clamp(0.0, 8.0);
     let mut lo = STOPS[0];
     let mut hi = STOPS[0];
@@ -62,9 +87,11 @@ pub fn entropy_color(h: f32) -> Rgba {
         (h - lo.0) / (hi.0 - lo.0)
     };
     let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-    rgb(u32::from(lerp(lo.1.0, hi.1.0)) << 16
-        | u32::from(lerp(lo.1.1, hi.1.1)) << 8
-        | u32::from(lerp(lo.1.2, hi.1.2)))
+    Rgb::new(
+        lerp(lo.1.0, hi.1.0),
+        lerp(lo.1.1, hi.1.1),
+        lerp(lo.1.2, hi.1.2),
+    )
 }
 
 /// The colormap a panel uses to color each byte. Every panel picks its own.
@@ -124,15 +151,10 @@ impl Colormap {
 
     /// Color a single byte under this colormap, or `None` when this colormap
     /// paints nothing — callers skip drawing entirely rather than filling.
-    pub fn color_for(self, b: u8, entropy: f32) -> Option<Rgba> {
+    pub fn color_for(self, b: u8, entropy: f32) -> Option<Rgb> {
         match self {
             Colormap::None => Option::None,
-            Colormap::Value => Some(Rgba {
-                r: f32::from(b) / 255.0,
-                g: f32::from(b) / 255.0,
-                b: f32::from(b) / 255.0,
-                a: 1.0,
-            }),
+            Colormap::Value => Some(Rgb::new(b, b, b)),
             Colormap::Class => Some(class_color(b)),
             Colormap::Entropy => Some(entropy_color(entropy)),
         }
@@ -160,6 +182,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rgb_from_hex_splits_channels() {
+        let c = Rgb::from_hex(0x17becf);
+        assert_eq!((c.r, c.g, c.b), (0x17, 0xbe, 0xcf));
+    }
+
+    #[test]
+    fn class_colors_are_plain_rgb() {
+        assert_eq!(class_color(0x00), Rgb::new(0, 0, 0));
+        assert_eq!(class_color(0xFF), Rgb::new(255, 255, 255));
+        assert_eq!(class_color(0x41), Rgb::from_hex(0x1f77b4));
+    }
+
+    #[test]
     fn colormap_keys_round_trip() {
         for cm in Colormap::ALL {
             assert_eq!(Colormap::from_key(cm.key()), Some(cm), "{cm:?}");
@@ -181,15 +216,18 @@ mod tests {
     #[test]
     fn value_colormap_is_byte_brightness() {
         let c = Colormap::Value.color_for(0x80, 0.0).expect("value paints");
-        assert_eq!(c.r, c.g);
-        assert_eq!(c.g, c.b);
-        assert!((c.r - 128.0 / 255.0).abs() < 1e-6, "r={}", c.r);
+        assert_eq!(c, Rgb::new(0x80, 0x80, 0x80));
     }
 
     #[test]
     fn fg_contrast_flips_on_light_backgrounds() {
-        // Dark glyphs on a light cell, light glyphs on a dark one.
-        assert!(fg_for_bg(rgb(0xffffff)).r < 0.5);
-        assert!(fg_for_bg(rgb(0x000000)).r > 0.5);
+        // Dark glyphs on a light cell, light glyphs on a dark one. Guards the
+        // luma threshold's move from the 0..1 scale to 0..255.
+        assert!(fg_for_bg(Rgb::new(255, 255, 255)).r < 128);
+        assert!(fg_for_bg(Rgb::new(0, 0, 0)).r > 128);
+        // Mid-grey sits just below the threshold, so glyphs stay light.
+        assert!(fg_for_bg(Rgb::new(128, 128, 128)).r > 128);
+        // A bright colour crosses it, so glyphs go dark.
+        assert!(fg_for_bg(Rgb::from_hex(0xffffff)).r < 128);
     }
 }
