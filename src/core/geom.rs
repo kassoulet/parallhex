@@ -24,30 +24,27 @@ pub(crate) const ENTROPY_WINDOW_MIN: usize = 16;
 
 pub(crate) const ENTROPY_WINDOW_MAX: usize = 4096;
 
-/// Left padding for the address gutter.
-pub(crate) const ADDR_X: f32 = 8.0;
-
 /// Width a hex row of `n` bytes needs: the address gutter, `"HH "` per byte, a
 /// space between 8-byte groups, the two-space gap, then one ASCII glyph per
 /// byte. Must mirror `build_row_text` exactly: cell rects come from here and
 /// glyph positions from the row text's character offsets, so the two have to
 /// resolve to the same x for every byte or backgrounds drift off the digits they
 /// belong to (`hex_and_ascii_glyphs_sit_on_their_background_cells` asserts it).
-fn hex_row_width(n: usize, char_w: f32) -> f32 {
+fn hex_row_width(n: usize, char_w: f32, gutter: f32) -> f32 {
     let chars = 12 + 4 * n + n.saturating_sub(1) / 8;
-    ADDR_X + char_w * chars as f32
+    gutter + char_w * chars as f32
 }
 
 /// Bytes per row for a hex panel `panel_width` wide: the largest multiple of 8
 /// that fits, floored at 8 so the 8-byte grouping is never split.
-pub(crate) fn hex_bytes_per_row(panel_width: f32, char_w: f32) -> usize {
+pub(crate) fn hex_bytes_per_row(panel_width: f32, char_w: f32, gutter: f32) -> usize {
     if !char_w.is_finite() || char_w <= 0.0 || !panel_width.is_finite() {
         return 8;
     }
     let mut n = 8;
     // 4096 bytes per row is far past any real window; the bound only stops a
     // pathological `char_w` from spinning.
-    while n < 4096 && hex_row_width(n + 8, char_w) <= panel_width {
+    while n < 4096 && hex_row_width(n + 8, char_w, gutter) <= panel_width {
         n += 8;
     }
     n
@@ -245,9 +242,14 @@ pub(crate) struct RowGeo {
 }
 
 impl RowGeo {
-    /// Build the per-row geometry from the monospace glyph width.
-    pub fn new(char_w: f32, bpr: usize) -> Self {
-        let hex_start = ADDR_X + 8.0 * char_w + 2.0 * char_w;
+    /// Build the per-row geometry.
+    ///
+    /// `gutter` is the space before the address and `char_w` the width of one
+    /// monospace glyph, both in the caller's unit: pixels for a canvas, cells for
+    /// a terminal (which passes `gutter = 0.0, char_w = 1.0`). Nothing else here
+    /// is unit-aware, which is what lets one implementation serve both.
+    pub fn new(gutter: f32, char_w: f32, bpr: usize) -> Self {
+        let hex_start = gutter + 8.0 * char_w + 2.0 * char_w;
         let cell_w = 3.0 * char_w; // two hex digits + one space
         let group_gap = char_w; // extra space between 8-byte groups
         // `build_row_text` emits a space *between* groups, so a row of `bpr`
@@ -446,9 +448,39 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    /// What the gpui frontend passes as its gutter (`paint::ADDR_X`). Repeated
+    /// here so these tests stay independent of the frontend.
+    const ADDR_X_PX: f32 = 8.0;
+
+    #[test]
+    fn terminal_geometry_needs_no_special_case() {
+        // One cell per character and no pixel gutter: the shared arithmetic must
+        // land exactly on a terminal's "AAAAAAAA  HH HH ...  ascii" layout, so a
+        // character-grid frontend needs no geometry of its own.
+        let geo = RowGeo::new(0.0, 1.0, 16);
+        assert_eq!(geo.hex_start, 10.0); // 8 address chars + 2 spaces
+        assert_eq!(geo.cell_w, 3.0); // "HH "
+        assert_eq!(geo.hex_fill_w(), 2.0); // the two digits only
+        assert_eq!(geo.group_gap, 1.0);
+        // hex_w = 16*3 + ((16-1)/8)*1 = 49, so ascii starts two chars later.
+        assert_eq!(geo.ascii_start, 61.0);
+    }
+
+    #[test]
+    fn gutter_shifts_every_column_by_the_same_amount() {
+        let a = RowGeo::new(0.0, 1.0, 16);
+        let b = RowGeo::new(8.0, 1.0, 16);
+        assert_eq!(b.hex_start - a.hex_start, 8.0);
+        assert_eq!(b.cell_x(3) - a.cell_x(3), 8.0);
+        assert_eq!(b.ascii_x(3) - a.ascii_x(3), 8.0);
+        // Widths are unaffected: the gutter translates, it does not scale.
+        assert_eq!(a.cell_w, b.cell_w);
+        assert_eq!(a.hex_fill_w(), b.hex_fill_w());
+    }
+
     #[test]
     fn hex_colour_fills_the_digits_but_not_the_gap() {
-        let geo = RowGeo::new(8.0, 16);
+        let geo = RowGeo::new(0.0, 8.0, 16);
         // Two digits wide, against a three-character advance: the space between
         // bytes is left to the panel background.
         assert_eq!(geo.hex_fill_w(), 16.0);
@@ -475,44 +507,49 @@ mod tests {
     /// `char_w` = 10 keeps every cell boundary an exact number, so the
     /// expectations below are precise rather than approximate.
     fn row_geo() -> RowGeo {
-        RowGeo::new(10.0, 16)
+        RowGeo::new(ADDR_X_PX, 10.0, 16)
     }
 
     /// The x a monospace glyph lands at, given its character offset in the row
-    /// text: the row is painted at `ADDR_X`, so glyph `k` sits at
-    /// `ADDR_X + k * char_w`.
-    fn glyph_x(char_offset: usize, char_w: f32) -> f32 {
-        ADDR_X + char_offset as f32 * char_w
+    /// text: the row is painted at the gutter, so glyph `k` sits at
+    /// `gutter + k * char_w`. The gutter is a parameter because the identity has
+    /// to hold for *any* gutter — the frontends pass different ones.
+    fn glyph_x(char_offset: usize, char_w: f32, gutter: f32) -> f32 {
+        gutter + char_offset as f32 * char_w
     }
 
     #[test]
     fn hex_and_ascii_glyphs_sit_on_their_background_cells() {
         let char_w = 10.0;
-        for bpr in [8usize, 16, 32] {
-            let geo = RowGeo::new(char_w, bpr);
-            let data: Vec<u8> = (0..bpr).map(|i| i as u8).collect();
-            let mut text = String::new();
-            let mut hex_offsets = Vec::new();
-            let mut ascii_offsets = Vec::new();
-            build_row_text_into(
-                &data,
-                0,
-                bpr,
-                &mut text,
-                &mut hex_offsets,
-                &mut ascii_offsets,
-            );
-            for i in 0..bpr {
-                assert_eq!(
-                    glyph_x(hex_offsets[i], char_w),
-                    geo.cell_x(i),
-                    "hex byte {i} of {bpr} misaligned"
+        // Both gutters, since the identity must survive the parameterisation:
+        // 0.0 is what a terminal passes, ADDR_X_PX what the gpui frontend does.
+        for gutter in [0.0, ADDR_X_PX] {
+            for bpr in [8usize, 16, 32] {
+                let geo = RowGeo::new(gutter, char_w, bpr);
+                let data: Vec<u8> = (0..bpr).map(|i| i as u8).collect();
+                let mut text = String::new();
+                let mut hex_offsets = Vec::new();
+                let mut ascii_offsets = Vec::new();
+                build_row_text_into(
+                    &data,
+                    0,
+                    bpr,
+                    &mut text,
+                    &mut hex_offsets,
+                    &mut ascii_offsets,
                 );
-                assert_eq!(
-                    glyph_x(ascii_offsets[i], char_w),
-                    geo.ascii_x(i),
-                    "ascii byte {i} of {bpr} misaligned"
-                );
+                for i in 0..bpr {
+                    assert_eq!(
+                        glyph_x(hex_offsets[i], char_w, gutter),
+                        geo.cell_x(i),
+                        "hex byte {i} of {bpr} misaligned at gutter {gutter}"
+                    );
+                    assert_eq!(
+                        glyph_x(ascii_offsets[i], char_w, gutter),
+                        geo.ascii_x(i),
+                        "ascii byte {i} of {bpr} misaligned at gutter {gutter}"
+                    );
+                }
             }
         }
     }
@@ -624,20 +661,20 @@ mod tests {
         // n = 8  -> 8 + 10 * (12 + 32 + 0) = 448
         // n = 16 -> 8 + 10 * (12 + 64 + 1) = 778
         // n = 24 -> 8 + 10 * (12 + 96 + 2) = 1108
-        assert_eq!(hex_bytes_per_row(448.0, char_w), 8);
-        assert_eq!(hex_bytes_per_row(777.0, char_w), 8);
-        assert_eq!(hex_bytes_per_row(778.0, char_w), 16);
-        assert_eq!(hex_bytes_per_row(1107.0, char_w), 16);
-        assert_eq!(hex_bytes_per_row(1108.0, char_w), 24);
+        assert_eq!(hex_bytes_per_row(448.0, char_w, ADDR_X_PX), 8);
+        assert_eq!(hex_bytes_per_row(777.0, char_w, ADDR_X_PX), 8);
+        assert_eq!(hex_bytes_per_row(778.0, char_w, ADDR_X_PX), 16);
+        assert_eq!(hex_bytes_per_row(1107.0, char_w, ADDR_X_PX), 16);
+        assert_eq!(hex_bytes_per_row(1108.0, char_w, ADDR_X_PX), 24);
         // Always a multiple of 8, never below 8, however narrow the panel.
-        assert_eq!(hex_bytes_per_row(0.0, char_w), 8);
-        assert_eq!(hex_bytes_per_row(-50.0, char_w), 8);
+        assert_eq!(hex_bytes_per_row(0.0, char_w, ADDR_X_PX), 8);
+        assert_eq!(hex_bytes_per_row(-50.0, char_w, ADDR_X_PX), 8);
         for w in [500.0, 900.0, 1500.0, 4000.0] {
-            assert_eq!(hex_bytes_per_row(w, char_w) % 8, 0, "width {w}");
+            assert_eq!(hex_bytes_per_row(w, char_w, ADDR_X_PX) % 8, 0, "width {w}");
         }
         // Degenerate glyph width must not divide by zero or loop forever.
-        assert_eq!(hex_bytes_per_row(1000.0, 0.0), 8);
-        assert_eq!(hex_bytes_per_row(f32::NAN, char_w), 8);
+        assert_eq!(hex_bytes_per_row(1000.0, 0.0, ADDR_X_PX), 8);
+        assert_eq!(hex_bytes_per_row(f32::NAN, char_w, ADDR_X_PX), 8);
     }
 
     #[test]

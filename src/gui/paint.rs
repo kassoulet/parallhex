@@ -14,9 +14,7 @@ use gpui::{
 };
 
 use crate::core::color::{self, Rgb};
-use crate::core::geom::{
-    self, ByteSource, RowGeo, build_row_text_into, scrollbar_thumb, visible_rows,
-};
+use crate::core::geom::{ByteSource, RowGeo, build_row_text_into, scrollbar_thumb, visible_rows};
 use crate::core::thumb;
 
 /// Keyboard zoom step factor (`+` / `-`), applied multiplicatively per press.
@@ -26,6 +24,10 @@ pub(crate) const ZOOM_STEP: f32 = 1.25;
 pub(crate) const ROW_H: f32 = 18.0;
 
 pub(crate) const ROW_GAP: f32 = 3.0;
+
+/// Left padding for the address gutter, in pixels. Passed to `RowGeo` rather
+/// than baked into it, so a character-grid frontend can pass 0.
+pub(crate) const ADDR_X: f32 = 8.0;
 
 /// Monospace size for hex cells.
 pub(crate) const HEX_FONT_SIZE: f32 = 13.0;
@@ -318,7 +320,7 @@ pub(crate) fn paint_hex(
     }
     let row_h = ROW_H;
     let font_size = px(HEX_FONT_SIZE);
-    let geo = RowGeo::new(char_w, bpr);
+    let geo = RowGeo::new(ADDR_X, char_w, bpr);
 
     let rows = visible_rows(bounds.size.height.to_f64() as f32, BLOCK_H);
 
@@ -416,7 +418,7 @@ pub(crate) fn paint_hex(
         // `RowGeo` builds ADDR_X into `hex_start`, so the glyphs need the same
         // gutter or every background sits half a byte right of its digits.
         let _ = line.paint(
-            point(origin.x + px(geom::ADDR_X), origin.y + px(y0)),
+            point(origin.x + px(ADDR_X), origin.y + px(y0)),
             px(row_h),
             window,
             cx,

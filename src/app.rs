@@ -1049,7 +1049,7 @@ impl ParallHexApp {
     fn hex_offset_at_pos(&self, pos: Point<Pixels>) -> Option<usize> {
         let local = self.hex_bounds.localize(&pos)?;
         let bpr = self.hex_bpr.max(8);
-        let geo = geom::RowGeo::new(self.hex_char_w, bpr);
+        let geo = geom::RowGeo::new(paint::ADDR_X, self.hex_char_w, bpr);
         geom::hex_offset_at(
             local.x.to_f64() as f32,
             local.y.to_f64() as f32,

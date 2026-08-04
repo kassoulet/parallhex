@@ -910,6 +910,7 @@ impl ParallHexApp {
                                     let new_bpr = geom::hex_bytes_per_row(
                                         bounds.size.width.to_f64() as f32,
                                         this.hex_char_w,
+                                        paint::ADDR_X,
                                     );
                                     let bpr_changed = new_bpr != this.hex_bpr;
                                     this.hex_bpr = new_bpr;
