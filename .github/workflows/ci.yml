@@ -1,0 +1,64 @@
+name: CI
+
+# Run on every branch push so work in progress is checked before it reaches a
+# pull request, and on pull requests so forks are covered too.
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref makes an in-flight run redundant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: fmt / clippy / test
+    # Pinned rather than ubuntu-latest so a runner-image bump can't change the
+    # available system libraries underneath the build without a commit here.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # gpui links freetype, and its audio stack links ALSA and Opus. The
+      # wayland, X11 and fontconfig bindings are all dlopen'd at runtime, so
+      # they need no -dev packages to build or to run the tests. zstd and ring
+      # build vendored copies.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev \
+            libfreetype-dev \
+            libopus-dev \
+            pkg-config
+
+      # The runner image ships a stable toolchain; this only makes the two
+      # components explicit. Edition 2024 needs Rust 1.85 or newer.
+      - name: Set up Rust
+        run: |
+          rustup component add rustfmt clippy
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Cheapest gate first: no compilation, so formatting fails fast.
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      # Cargo.toml sets `[lints.rust] warnings = "deny"` and
+      # `[lints.clippy] pedantic = "deny"`, so this needs no extra flags.
+      # Deliberately no RUSTFLAGS=-D warnings: it would apply to dependencies
+      # too, and could override the curated crate-level allows in src/main.rs.
+      - name: cargo clippy --all-targets
+        run: cargo clippy --locked --all-targets
+
+      # The tests are pure functions over pixel/geometry maths and never open a
+      # window, so they run headless with no virtual display.
+      - name: cargo test --all-targets
+        run: cargo test --locked --all-targets

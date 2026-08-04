@@ -1,5 +1,7 @@
 # ParallHex
 
+[![CI](https://github.com/kassoulet/parallhex/actions/workflows/ci.yml/badge.svg)](https://github.com/kassoulet/parallhex/actions/workflows/ci.yml)
+
 A native binary/hex explorer: one wide window showing the same region of a file
 through three synchronized columns.
 
@@ -137,6 +139,11 @@ Commits are gated by [`prek`](https://prek.j178.dev) (see `prek.toml`), which
 runs `cargo test --all-targets`, `cargo fmt --check` and
 `cargo clippy --all-targets`. Run all three before committing rather than
 discovering failures in the hook.
+
+GitHub Actions runs the same three gates on every push and pull request
+(`.github/workflows/ci.yml`). Building on Linux needs `libasound2-dev`,
+`libfreetype-dev` and `libopus-dev`; the Wayland, X11 and fontconfig bindings
+are `dlopen`ed, so they matter only at runtime.
 
 `Cargo.toml` denies all compiler warnings and the whole of `clippy::pedantic`.
 A short, curated list of exceptions lives in the `#![allow(...)]` at the top of
