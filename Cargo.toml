@@ -17,6 +17,11 @@ name = "parallhex-gpui"
 path = "src/bin/parallhex-gpui.rs"
 required-features = ["gpui-frontend"]
 
+[[bin]]
+name = "parallhex-tui"
+path = "src/bin/parallhex-tui.rs"
+required-features = ["tui-frontend"]
+
 [dependencies]
 memmap2 = "0.9"
 rayon = "1.10"
@@ -29,9 +34,14 @@ gpui = { version = "0.2.2", optional = true }
 image = { version = "0.25", optional = true }
 rfd = { version = "0.14", optional = true }
 
+# ratatui re-exports crossterm (`ratatui::crossterm`), so the terminal frontend
+# needs no separate crossterm dependency and the two versions cannot drift.
+ratatui = { version = "0.27", optional = true }
+
 [features]
-default = ["gpui-frontend"]
+default = ["gpui-frontend", "tui-frontend"]
 gpui-frontend = ["gpui", "image", "rfd"]
+tui-frontend = ["ratatui"]
 
 # Warnings-as-errors for both the compiler and clippy's pedantic group.
 #
