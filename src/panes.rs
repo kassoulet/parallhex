@@ -355,6 +355,14 @@ impl RowGeo {
         self.hex_start + i as f32 * self.cell_w + (i / 8) as f32 * self.group_gap
     }
 
+    /// Width the byte colour fills in a hex cell: the two digits only, not the
+    /// space that separates them from the next byte. `cell_w` remains the
+    /// *advance* — hit-testing still claims the whole cell, so clicking in the
+    /// gap selects the byte to its left.
+    pub fn hex_fill_w(&self) -> f32 {
+        2.0 * self.char_w
+    }
+
     pub fn ascii_x(&self, i: usize) -> f32 {
         self.ascii_start + i as f32 * self.char_w
     }
@@ -597,11 +605,19 @@ pub(crate) fn hex_char_width(window: &mut Window, font: &Font, font_size: Pixels
     (line.x_for_index(64).to_f64() as f32 / 64.0).max(1.0)
 }
 
-/// Paint merged quads for a run of cell backgrounds. A run extends while the
-/// (color, selection) state is unchanged and stays within one group of
-/// `split_every` cells (the hex side splits at 8 so a merged quad never covers
-/// the group gap, which shows the panel background; `usize::MAX` merges the
-/// whole row). Cell x comes from `x_of`.
+/// Paint the cell backgrounds and selection tint for a run of cells. A run
+/// extends while the (color, selection) state is unchanged and stays within one
+/// group of `split_every` cells (the hex side splits at 8 so a merged quad never
+/// covers the group gap, which shows the panel background; `usize::MAX` merges
+/// the whole row). Cell x comes from `x_of`, and `cell_w` is the advance from one
+/// cell to the next.
+///
+/// `fill_w` is how much of each cell the byte colour covers. When it is narrower
+/// than the advance — the hex side, where only the two digits are coloured and
+/// the space between bytes stays panel background — the cells are not contiguous,
+/// so each needs its own quad. The **selection** still paints as one continuous
+/// band across the run either way, so a selected range reads as a block rather
+/// than a dashed line.
 #[allow(clippy::too_many_arguments)]
 fn paint_cell_runs(
     window: &mut Window,
@@ -611,6 +627,7 @@ fn paint_cell_runs(
     selected: &[bool],
     x_of: impl Fn(usize) -> f32,
     cell_w: f32,
+    fill_w: f32,
     split_every: usize,
 ) {
     let n = colors.len();
@@ -623,26 +640,40 @@ fn paint_cell_runs(
             j += 1;
         }
         let x0 = x_of(i);
-        let rect = Bounds::new(
+        let span = Bounds::new(
             point(origin.x + px(x0), origin.y + px(y0)),
             size(px(x_of(j - 1) + cell_w - x0), px(ROW_H)),
         );
         if let Some(bg) = bg {
-            window.paint_quad(filled_quad(rect, bg));
+            if fill_w >= cell_w {
+                // Contiguous cells: the whole run is one quad.
+                window.paint_quad(filled_quad(span, bg));
+            } else {
+                for k in i..j {
+                    let cell = Bounds::new(
+                        point(origin.x + px(x_of(k)), origin.y + px(y0)),
+                        size(px(fill_w), px(ROW_H)),
+                    );
+                    window.paint_quad(filled_quad(cell, bg));
+                }
+            }
         }
         if s {
-            window.paint_quad(filled_quad(rect, rgba(0xffffff3d)));
+            window.paint_quad(filled_quad(span, rgba(0xffffff3d)));
         }
         i = j;
     }
 }
 
 /// Paint the hex column into `bounds`: class-colored hex + ASCII cells with
-/// selection/hover overlays, one virtualized row at a time. Cell-background
-/// quads are merged into runs of identical (color, selection) state — binary
-/// data is repetitive, so the 2·bpr quads per row typically collapse to a
-/// handful. Runs split at every 8-byte group boundary so a merged quad never
-/// covers the group gap, which shows the panel background.
+/// selection/hover overlays, one virtualized row at a time.
+///
+/// On the hex side the byte colour covers the two digits only, so the space
+/// between bytes keeps the panel background and the cells read as discrete
+/// values rather than one continuous band. ASCII glyphs are adjacent, so there
+/// the colour does run together. Selection tints and run-merging still work
+/// across both — see `paint_cell_runs` — and runs split at every 8-byte group
+/// boundary so no merged quad covers the group gap.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn paint_hex(
     window: &mut Window,
@@ -702,6 +733,7 @@ pub(crate) fn paint_hex(
             &selected[..n],
             |i| geo.cell_x(i),
             geo.cell_w,
+            geo.hex_fill_w(),
             8,
         );
         paint_cell_runs(
@@ -711,6 +743,7 @@ pub(crate) fn paint_hex(
             &colors[..n],
             &selected[..n],
             |i| geo.ascii_x(i),
+            geo.char_w,
             geo.char_w,
             usize::MAX,
         );
@@ -1135,6 +1168,22 @@ mod tests {
     fn px(buf: &[u8], width: usize, x: usize, y: usize) -> (u8, u8, u8, u8) {
         let p = (y * width + x) * 4;
         (buf[p], buf[p + 1], buf[p + 2], buf[p + 3])
+    }
+
+    #[test]
+    fn hex_colour_fills_the_digits_but_not_the_gap() {
+        let geo = RowGeo::new(8.0, 16);
+        // Two digits wide, against a three-character advance: the space between
+        // bytes is left to the panel background.
+        assert_eq!(geo.hex_fill_w(), 16.0);
+        assert_eq!(geo.cell_w, 24.0);
+        assert!(geo.hex_fill_w() < geo.cell_w);
+        // The uncovered strip is exactly one glyph, and the next cell starts
+        // after it rather than overlapping the fill.
+        assert_eq!(geo.cell_w - geo.hex_fill_w(), geo.char_w);
+        assert_eq!(geo.cell_x(1) - geo.cell_x(0), geo.cell_w);
+        // ASCII cells stay contiguous, so their colour still merges.
+        assert_eq!(geo.ascii_x(1) - geo.ascii_x(0), geo.char_w);
     }
 
     /// Per-window Shannon entropies for `data`, as handed to the generators.

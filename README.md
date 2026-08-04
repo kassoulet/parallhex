@@ -50,7 +50,7 @@ Usage: parallhex [OPTIONS] [FILE]
 
 ## Colormaps
 
-Each column independently picks how it colours bytes, from the `Map: … ▾`
+Each column independently picks how it colours bytes, from the `Color: … ▾`
 dropdown in its header:
 
 | Mode | Meaning |
