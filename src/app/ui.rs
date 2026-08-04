@@ -847,7 +847,8 @@ impl ParallHexApp {
     }
 
     /// Right column: colormap-backed hex + ASCII cells. Its row length comes
-    /// from its own width and it is the scroll reference (SPECS §4.2).
+    /// from its own width, and it is the scroll reference: its visible height is
+    /// what clamps the shared anchor, sizes a page and centres a jump target.
     #[allow(clippy::too_many_lines)] // single-purpose element builder
     fn hex_column(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
@@ -855,7 +856,7 @@ impl ParallHexApp {
         let bpr = self.hex_bpr.max(8);
         let len = self.file_size;
         // The anchor is the byte in the middle of the viewport, so panels align
-        // on their centre line (SPECS §4.2); the prepaint recorded the row.
+        // on their centre line; the prepaint recorded the row.
         let first_row_start = self.hex_view.start;
         let hovered = self.hovered_offset;
         let sel = self.selection_range.clone();

@@ -149,8 +149,7 @@ fn print_usage() {
 ///
 /// `secondary-` is gpui's portable accelerator: Cmd on macOS, Ctrl everywhere
 /// else. `cmd-` would bind the platform modifier literally, i.e. Super on
-/// Linux/Windows, which is not what the UI labels and SPECS.md promise
-/// ("Ctrl/Cmd+…").
+/// Linux/Windows, which is not what the UI labels promise ("Ctrl/Cmd+…").
 fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("secondary-o", OpenFile, None),

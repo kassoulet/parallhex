@@ -53,7 +53,10 @@ pub(crate) fn zoom_step(zoom: f32, factor: f32, min: f32, max: f32) -> f32 {
 
 /// Width a hex row of `n` bytes needs: the address gutter, `"HH "` per byte, a
 /// space between 8-byte groups, the two-space gap, then one ASCII glyph per
-/// byte. Mirrors `build_row_text` exactly (see the §6 invariant in SPECS.md).
+/// byte. Must mirror `build_row_text` exactly: cell rects come from here and
+/// glyph positions from the row text's character offsets, so the two have to
+/// resolve to the same x for every byte or backgrounds drift off the digits they
+/// belong to (`hex_and_ascii_glyphs_sit_on_their_background_cells` asserts it).
 fn hex_row_width(n: usize, char_w: f32) -> f32 {
     let chars = 12 + 4 * n + n.saturating_sub(1) / 8;
     ADDR_X + char_w * chars as f32
@@ -105,14 +108,16 @@ pub(crate) fn row_start_for(anchor: usize, bpr: usize) -> usize {
 /// The row-aligned first visible offset for a panel showing `rows` rows of
 /// `bpr` bytes, **centred** on the shared anchor: the anchor is the byte in the
 /// middle of the viewport, so every panel puts that byte on the same line
-/// however much data it shows (SPECS §4.2). Near the start of the file this
+/// however much data it shows. Near the start of the file this
 /// saturates at 0 so the first rows stay reachable.
 pub(crate) fn first_row_centred(anchor: usize, bpr: usize, rows: usize) -> usize {
     row_start_for(anchor.saturating_sub(rows / 2 * bpr), bpr)
 }
 
 /// The furthest the shared anchor may scroll: the start of the row holding the
-/// last byte, in the hex column's row length (the scroll reference, SPECS §4.2).
+/// last byte, in the hex column's row length — the hex column is the scroll
+/// reference, so a panel with longer rows just runs out of file sooner and
+/// paints what exists rather than scrolling independently.
 pub(crate) fn max_anchor(file_size: usize, hex_bpr: usize) -> usize {
     if file_size == 0 || hex_bpr == 0 {
         return 0;
@@ -252,7 +257,8 @@ fn to_hsla(c: Rgba) -> Hsla {
 
 /// Entropy at `offset` for a byte lookup under `colormap`. Only the `Entropy`
 /// colormap consumes it, so the other three skip the interpolating lookup
-/// entirely (PERF.md item 3).
+/// entirely — without this gate the default `Class` hex colormap paid tens of
+/// thousands of discarded interpolations per frame.
 pub(crate) fn entropy_for(
     colormap: Colormap,
     entropies: &[f32],
@@ -391,7 +397,7 @@ pub(crate) fn zoom_offset_at(
 /// Build the display text of one hex row:
 /// `ADDR  HH HH …  AAAA` with an extra space every 8 hex bytes. Writes into
 /// caller-owned buffers that are cleared and refilled — `paint_hex` reuses one
-/// set across every row instead of allocating per row (PERF.md item 5).
+/// set across every row instead of allocating per row.
 pub(crate) fn build_row_text_into(
     data: &[u8],
     row_start: usize,
@@ -434,7 +440,8 @@ fn cell_glyph_color(cell: Option<Rgba>) -> Hsla {
 /// digits and ASCII glyphs per byte, neutral (invisible) spaces. Glyph colors
 /// come from the row's precomputed per-byte cell colors (`colors[i]`), so each
 /// byte's color is computed once and reused for both cells and both glyphs
-/// (PERF.md item 2). Runs are written into the caller-owned `runs` buffer.
+/// rather than four times per byte. Runs are written into the caller-owned
+/// `runs` buffer.
 #[allow(clippy::too_many_arguments)]
 fn build_row_runs(
     n: usize,
@@ -589,7 +596,8 @@ fn paint_cell_runs(
 /// selection/hover overlays, one virtualized row at a time. Cell-background
 /// quads are merged into runs of identical (color, selection) state — binary
 /// data is repetitive, so the 2·bpr quads per row typically collapse to a
-/// handful (PERF.md item 2).
+/// handful. Runs split at every 8-byte group boundary so a merged quad never
+/// covers the group gap, which shows the panel background.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn paint_hex(
     window: &mut Window,
@@ -617,8 +625,8 @@ pub(crate) fn paint_hex(
     let rows = visible_rows(bounds.size.height.to_f64() as f32, BLOCK_H);
 
     let origin = bounds.origin;
-    // Reusable per-row buffers (PERF.md item 5): cleared and refilled for each
-    // row instead of reallocated.
+    // Reusable per-row buffers: cleared and refilled for each row instead of
+    // reallocated.
     let mut text = String::with_capacity(128);
     let mut hex_offsets = Vec::with_capacity(bpr);
     let mut ascii_offsets = Vec::with_capacity(bpr);
@@ -634,7 +642,7 @@ pub(crate) fn paint_hex(
         let n = (len - row_start).min(bpr);
 
         // Each byte's cell color is computed once and reused for the hex cell,
-        // the ASCII cell and both glyphs (PERF.md item 2).
+        // the ASCII cell and both glyphs, not recomputed for each of the four.
         colors.clear();
         colors.extend((0..n).map(|i| {
             let off = row_start + i;
@@ -726,7 +734,9 @@ pub(crate) fn paint_hex(
 /// `RenderImage` texture (built by `build_zoom_image`, cached across frames),
 /// with selection, hover and the hex-column mark as overlay quads on top.
 /// Rows are flush so the panel reads as a pixel image; the texture is built at
-/// one pixel per screen pixel so it needs no smoothing (PERF.md item 1).
+/// one pixel per screen pixel so it needs no smoothing. One upload per changed
+/// visible region replaces the original quad-per-byte path, whose worst case was
+/// ~540k quads per frame at `pixel_zoom = 1`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_zoom(
     window: &mut Window,
@@ -945,10 +955,12 @@ pub(crate) fn render_image_from_rgba(
 
 /// Compute the raw RGBA pixels (`w` × `h`) of the 2D whole-file overview: one
 /// band per cell in `colormap`. The pixel math is unit-testable without a gpui
-/// window, and the app runs it on the background executor (PERF.md item 4).
+/// window, and the app runs it on the background executor so the UI thread never
+/// blocks on a whole-file pass.
 ///
 /// Under `Colormap::None` every cell is left transparent, so the panel
-/// background shows through (SPECS §3.C).
+/// background shows through — `None` mutes a panel rather than disabling it, and
+/// the viewport band, hover preview and click-to-navigate all stay live.
 pub(crate) fn build_overview_rgba(
     data: &[u8],
     entropies: &[f32],
@@ -1032,7 +1044,7 @@ pub(crate) fn build_strip_image(
 /// scales it ~1:1 into the panel and no smoothing is needed.
 ///
 /// Under `Colormap::None` every pixel stays transparent, so the panel
-/// background shows through (SPECS §3.C).
+/// background shows through; the panel stays interactive either way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_zoom_rgba(
     data: &[u8],
@@ -1053,7 +1065,7 @@ pub(crate) fn build_zoom_rgba(
     let mut pixels = vec![0u8; iw * ih * 4];
 
     // Row y-ranges from the quantized grid, then disjoint mutable slices so
-    // the fill can run in parallel over rows (PERF.md item 1).
+    // the fill can run in parallel over rows under rayon.
     let row_ys: Vec<(usize, usize)> = (0..rows)
         .map(|r| {
             let y0 = (r as f32 * block).round() as usize;

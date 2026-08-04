@@ -116,7 +116,8 @@ impl Colormap {
 
     /// Whether this colormap's output depends on the per-byte entropy value.
     /// Only `Entropy` does; callers can skip the (per-byte, interpolating)
-    /// `entropy_at` lookup entirely for the others (PERF.md item 3).
+    /// `entropy_at` lookup entirely for the others. Route per-byte lookups
+    /// through `panes::entropy_for` so they honor this gate.
     pub fn uses_entropy(self) -> bool {
         matches!(self, Colormap::Entropy)
     }

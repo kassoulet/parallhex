@@ -18,7 +18,8 @@ pub struct Config {
     pub entropy_window: usize,
     /// The zoom column's zoom, in pixels per byte.
     pub pixel_zoom: f32,
-    /// Each panel picks its own colormap (SPECS §3.C).
+    /// Each panel picks its own colormap; defaults are overview `Entropy`,
+    /// zoom `Value`, hex `Class`.
     pub overview_colormap: Colormap,
     pub zoom_colormap: Colormap,
     pub hex_colormap: Colormap,

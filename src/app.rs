@@ -113,7 +113,8 @@ pub struct OverviewKey {
 }
 
 /// The inputs the zoom column's visible-region texture is a function of; the
-/// cached image is rebuilt only when this changes (PERF.md item 1).
+/// cached image is rebuilt only when this changes, so scrolling and zooming
+/// re-upload one texture instead of repainting a quad per visible byte.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ZoomImageKey {
     bpr: usize,
@@ -140,7 +141,7 @@ pub struct ParallHexApp {
 
     pub entropy_window: usize,
 
-    // Each panel colors its bytes independently (SPECS §3.C).
+    // Each panel colors its bytes independently.
     pub overview_colormap: Colormap,
     pub zoom_colormap: Colormap,
     pub hex_colormap: Colormap,
@@ -153,24 +154,23 @@ pub struct ParallHexApp {
     pub entropies: Arc<Vec<f32>>,
 
     // Monospace glyph width for the hex column, measured in `render` only when
-    // the window scale changes (PERF.md item 5) and reused by the canvas
-    // prepaint, the paint closure and the hit-testing — previously reshaped 64
-    // glyphs on every frame *and* on every mouse move.
+    // the window scale changes, and reused by the canvas prepaint, the paint
+    // closure and the hit-testing — previously reshaped 64 glyphs on every frame
+    // *and* on every mouse move.
     pub hex_char_w: f32,
     pub hex_char_w_scale: f32,
 
-    // The zoom column renders its visible bytes as one texture (PERF.md item
-    // 1): `zoom_image` is rebuilt in the canvas prepaint only when its key
-    // changes, so scrolling/zooming re-uploads a texture instead of emitting a
-    // quad per byte.
+    // The zoom column renders its visible bytes as one texture: `zoom_image` is
+    // rebuilt in the canvas prepaint only when its key changes, so
+    // scrolling/zooming re-uploads a texture instead of emitting a quad per byte.
     pub zoom_image: Option<Arc<RenderImage>>,
     pub zoom_image_key: Option<ZoomImageKey>,
     // A zoom-texture build in flight (coalesces rebuilds; the landing commits
     // the key it built, and the next prepaint's key mismatch re-requests).
     pub zoom_computing: bool,
 
-    // Entropy computation generation: async recomputes (PERF.md item 4) apply
-    // only if no newer one was started meanwhile.
+    // Entropy computation generation: a background recompute applies only if no
+    // newer one was started meanwhile.
     pub entropy_gen: u64,
     // Coalescing for the async entropy pass: while `entropy_computing` is set,
     // new requests just mark `entropy_pending` and the in-flight task re-runs
@@ -194,8 +194,8 @@ pub struct ParallHexApp {
 
     // Three-column layout. The zoom column is the only one that zooms; the
     // shared scroll position is a *byte anchor* because each panel derives its
-    // own row length from its own width, so rows no longer line up (SPECS
-    // §4.2). `hex_bpr` / `zoom_bpr` are recomputed in each canvas's prepaint
+    // own row length from its own width, so rows no longer line up.
+    // `hex_bpr` / `zoom_bpr` are recomputed in each canvas's prepaint
     // from its measured width, and reused for hit-testing and navigation.
     pub pixel_zoom: f32,
     pub scroll_offset: usize,
@@ -210,7 +210,7 @@ pub struct ParallHexApp {
     // Each panel's currently visible byte range, recorded in its prepaint. A
     // panel draws the *next* panel's range as a band, so the overview shows
     // where the zoom column is looking and the zoom column shows where the hex
-    // column is (SPECS §4.1).
+    // column is.
     pub zoom_view: Range<usize>,
     pub hex_view: Range<usize>,
     // Anchor as a fraction of the file, for the status bar percentage.
@@ -437,7 +437,7 @@ impl ParallHexApp {
     /// Recompute the zoom column's layout from its measured canvas: how many
     /// bytes fit per row at the target block size, and which byte range that
     /// makes visible (the overview draws this as its band). Also rebuilds the
-    /// visible-region texture (PERF.md item 1) when its inputs changed.
+    /// visible-region texture when its inputs changed.
     fn measure_zoom(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         self.pixels_bounds = bounds;
         // Redistribute the bytes so a row spans the panel exactly: as many
@@ -524,7 +524,8 @@ impl ParallHexApp {
         )
     }
 
-    /// Clamp the shared anchor to the hex column's last row (SPECS §4.2).
+    /// Clamp the shared anchor to the hex column's last row — the hex column is
+    /// the scroll reference for all three panels.
     fn clamp_anchor(&mut self) {
         self.scroll_offset = self
             .scroll_offset
@@ -546,8 +547,8 @@ impl ParallHexApp {
         self.clamp_anchor();
     }
 
-    /// Recompute the whole-file entropy cache off the UI thread (PERF.md item
-    /// 4): `block_entropies` can take a second on multi-gigabyte files, which
+    /// Recompute the whole-file entropy cache off the UI thread:
+    /// `block_entropies` can take a second on multi-gigabyte files, which
     /// previously froze the window. The result is applied only if no newer
     /// recompute was started meanwhile (the `entropy_gen` guard), so changing
     /// the window mid-compute can't race an older result in. `show_message`
@@ -1367,7 +1368,7 @@ impl Render for ParallHexApp {
         self.capture_window_geometry(window);
         // The hex glyph width is a function of the font and the window scale,
         // so measure it only when the scale changes and share it with the hex
-        // column's prepaint, paint and hit-testing (PERF.md item 5).
+        // column's prepaint, paint and hit-testing.
         // Previously it was reshaped on every canvas paint *and* on every
         // mouse move.
         let scale = window.scale_factor();
