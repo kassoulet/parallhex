@@ -42,8 +42,11 @@ cargo run --release             # for large files, prefer release
 prints usage. Extra positional arguments after the first are ignored.
 
 ```
-Usage: parallhex [OPTIONS] [FILE]
+Usage: parallhex-gpui [OPTIONS] [FILE]
 ```
+
+The executable is `parallhex-gpui`, named for its toolkit so it can sit alongside
+another `parallhex` build. The preferences directory stays `parallhex`.
 
 ## Colormaps
 

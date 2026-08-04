@@ -119,7 +119,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Cli {
                 return Cli::Exit(0);
             }
             _ if arg.starts_with('-') => {
-                eprintln!("parallhex: unknown option '{arg}'");
+                eprintln!("parallhex-gpui: unknown option '{arg}'");
                 print_usage();
                 return Cli::Exit(2);
             }
@@ -131,8 +131,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Cli {
 }
 
 fn print_usage() {
-    println!("Usage: parallhex [OPTIONS] [FILE]");
-    println!("       parallhex --help");
+    println!("Usage: parallhex-gpui [OPTIONS] [FILE]");
+    println!("       parallhex-gpui --help");
     println!();
     println!("Wide hex-viewer binary explorer.");
     println!();

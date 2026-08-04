@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+# The executable is named for its toolkit so a gpui build can sit alongside
+# another parallhex binary without clashing. Only the *binary* is renamed: the
+# package, the `actions!` namespace and the config directory stay `parallhex`, so
+# an existing preferences file is still found.
+[[bin]]
+name = "parallhex-gpui"
+path = "src/main.rs"
+
 [dependencies]
 gpui = "0.2.2"
 image = "0.25"
