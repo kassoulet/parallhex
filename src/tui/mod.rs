@@ -11,7 +11,9 @@
 // off, the lint proves nothing here is genuinely unused.
 #![allow(dead_code)]
 
+pub(crate) mod app;
 pub(crate) mod blit;
+pub(crate) mod input;
 
 use std::io;
 use std::path::PathBuf;

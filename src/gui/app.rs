@@ -35,51 +35,9 @@ use crate::gui::{
 // handlers, the async work and the `Render` shell.
 pub(crate) mod ui;
 
-/// The navigation key pressed this frame (one-hot).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum NavigationAction {
-    Left,
-    Right,
-    Up,
-    Down,
-    PageUp,
-    PageDown,
-    Home,
-    End,
-}
-
 // ---------------------------------------------------------------------------
 // The main view
 // ---------------------------------------------------------------------------
-
-/// How a copied byte range is rendered to text.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum CopyKind {
-    /// Space-separated uppercase hex pairs, e.g. `DE AD BE EF`.
-    Hex,
-    /// Printable ASCII, non-printable bytes as `.`.
-    Ascii,
-}
-
-/// Render `range` of `data` for the clipboard, or `None` when the range is
-/// empty after clamping to the file. Shared by the copy actions and the hex
-/// column's right-click copy so the two can't drift apart.
-fn selection_text(data: &[u8], range: &Range<usize>, kind: CopyKind) -> Option<String> {
-    let start = range.start.min(data.len());
-    let end = range.end.min(data.len());
-    if start >= end {
-        return None;
-    }
-    let bytes = &data[start..end];
-    Some(match kind {
-        CopyKind::Hex => bytes
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-        CopyKind::Ascii => bytes.iter().map(|&b| color::printable(b)).collect(),
-    })
-}
 
 /// Which slider the pointer is currently dragging.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -859,32 +817,32 @@ impl ParallHexApp {
     }
 
     fn on_nav_left(&mut self, _: &NavigateLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::Left, cx);
+        self.navigate(geom::Nav::Left, cx);
     }
     fn on_nav_right(&mut self, _: &NavigateRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::Right, cx);
+        self.navigate(geom::Nav::Right, cx);
     }
     fn on_nav_up(&mut self, _: &NavigateUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::Up, cx);
+        self.navigate(geom::Nav::Up, cx);
     }
     fn on_nav_down(&mut self, _: &NavigateDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::Down, cx);
+        self.navigate(geom::Nav::Down, cx);
     }
     fn on_nav_page_up(&mut self, _: &NavigatePageUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::PageUp, cx);
+        self.navigate(geom::Nav::PageUp, cx);
     }
     fn on_nav_page_down(&mut self, _: &NavigatePageDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::PageDown, cx);
+        self.navigate(geom::Nav::PageDown, cx);
     }
     fn on_nav_home(&mut self, _: &NavigateHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::Home, cx);
+        self.navigate(geom::Nav::Home, cx);
     }
     fn on_nav_end(&mut self, _: &NavigateEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.navigate(NavigationAction::End, cx);
+        self.navigate(geom::Nav::End, cx);
     }
 
     /// Move the selection with the keyboard and schedule a scroll-to-center.
-    fn navigate(&mut self, action: NavigationAction, cx: &mut Context<Self>) {
+    fn navigate(&mut self, action: geom::Nav, cx: &mut Context<Self>) {
         // The jump dialog owns the keyboard while it's open.
         if self.show_jump_dialog {
             return;
@@ -905,51 +863,26 @@ impl ParallHexApp {
         let cur = if let Some(c) = self.selected_offset {
             c.min(len - 1)
         } else {
-            let start = if action == NavigationAction::End {
-                len - 1
-            } else {
-                0
-            };
+            let start = if action == geom::Nav::End { len - 1 } else { 0 };
             self.selected_offset = Some(start);
             self.hovered_offset = Some(start);
             self.scroll_to_offset = Some(start);
             cx.notify();
             return;
         };
-        let next = Self::nav_next(action, cur, bpr, page_bytes, len);
+        let next = geom::nav_next(action, cur, bpr, page_bytes, len);
         self.selected_offset = Some(next);
         self.hovered_offset = Some(next);
         self.scroll_to_offset = Some(next);
         cx.notify();
     }
 
-    /// Pure navigation math: compute the offset reached by `action` from
-    /// `cur`, clamped to `[0, len)`.
-    fn nav_next(
-        action: NavigationAction,
-        cur: usize,
-        bpr: usize,
-        page_bytes: usize,
-        len: usize,
-    ) -> usize {
-        match action {
-            NavigationAction::Left => cur.saturating_sub(1),
-            NavigationAction::Right => (cur + 1).min(len - 1),
-            NavigationAction::Up => cur.saturating_sub(bpr),
-            NavigationAction::Down => (cur + bpr).min(len - 1),
-            NavigationAction::PageUp => cur.saturating_sub(page_bytes),
-            NavigationAction::PageDown => (cur + page_bytes).min(len - 1),
-            NavigationAction::Home => 0,
-            NavigationAction::End => len - 1,
-        }
-    }
-
     fn on_copy_hex(&mut self, _: &CopySelectionHex, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_selection(CopyKind::Hex, cx);
+        self.copy_selection(geom::CopyKind::Hex, cx);
     }
 
     fn on_copy_ascii(&mut self, _: &CopySelectionAscii, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_selection(CopyKind::Ascii, cx);
+        self.copy_selection(geom::CopyKind::Ascii, cx);
     }
 
     fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
@@ -966,12 +899,12 @@ impl ParallHexApp {
         })
     }
 
-    fn copy_selection(&mut self, kind: CopyKind, cx: &mut Context<Self>) {
+    fn copy_selection(&mut self, kind: geom::CopyKind, cx: &mut Context<Self>) {
         let Some(d) = self.data() else { return };
         let Some(range) = self.copy_range() else {
             return;
         };
-        if let Some(s) = selection_text(d, &range, kind) {
+        if let Some(s) = geom::selection_text(d, &range, kind) {
             cx.write_to_clipboard(ClipboardItem::new_string(s));
         }
     }
@@ -996,7 +929,7 @@ impl ParallHexApp {
     /// Apply a submitted jump offset (shared by the Enter action and the
     /// dialog's Jump button).
     fn jump_submit(&mut self, text: &str, cx: &mut Context<Self>) {
-        match Self::parse_offset(text) {
+        match geom::parse_offset(text) {
             Some(o) if o < self.file_size => {
                 self.scroll_to_offset = Some(o);
                 self.selected_offset = Some(o);
@@ -1015,20 +948,6 @@ impl ParallHexApp {
             }
         }
         cx.notify();
-    }
-
-    /// Parse a user-supplied offset as hex: `0x` prefix optional, underscores
-    /// and whitespace allowed (e.g. `"0x1_000"`, `"1F"`).
-    fn parse_offset(input: &str) -> Option<usize> {
-        let s = input.trim().replace('_', "");
-        if s.is_empty() {
-            return None;
-        }
-        let hex = s
-            .strip_prefix("0x")
-            .or_else(|| s.strip_prefix("0X"))
-            .unwrap_or(&s);
-        usize::from_str_radix(hex, 16).ok()
     }
 
     fn open_jump_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1095,7 +1014,7 @@ impl ParallHexApp {
                     if let Some(d) = self.data()
                         && let Some(range) = self.copy_range()
                     {
-                        self.pending_copy = selection_text(d, &range, CopyKind::Hex);
+                        self.pending_copy = geom::selection_text(d, &range, geom::CopyKind::Hex);
                     }
                 }
             }
@@ -1728,76 +1647,9 @@ fn pick_monospace_family(window: &Window) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::{
-        CopyKind, NavigationAction, OVERVIEW_W_MAX, OVERVIEW_W_MIN, ParallHexApp, SLIDER_THUMB_W,
-        ZOOM_W_MAX, ZOOM_W_MIN, divider_width, selection_text, slider_t_at_x, slider_thumb_left,
+        OVERVIEW_W_MAX, OVERVIEW_W_MIN, SLIDER_THUMB_W, ZOOM_W_MAX, ZOOM_W_MIN, divider_width,
+        slider_t_at_x, slider_thumb_left,
     };
-
-    /// `navigate` clamps a stale selection before delegating, so the tests
-    /// exercise `nav_next` through the same clamp.
-    fn next(
-        action: NavigationAction,
-        cur: usize,
-        bpr: usize,
-        page_bytes: usize,
-        len: usize,
-    ) -> usize {
-        ParallHexApp::nav_next(action, cur.min(len - 1), bpr, page_bytes, len)
-    }
-
-    #[test]
-    fn arrows_clamp_at_boundaries() {
-        let len = 1000usize;
-        let bpr = 32usize;
-        assert_eq!(next(NavigationAction::Left, 0, bpr, 0, len), 0);
-        assert_eq!(next(NavigationAction::Up, 0, bpr, 0, len), 0);
-        assert_eq!(next(NavigationAction::Right, len - 1, bpr, 0, len), len - 1);
-        assert_eq!(next(NavigationAction::Down, len - 1, bpr, 0, len), len - 1);
-        assert_eq!(next(NavigationAction::Right, len - 2, bpr, 0, len), len - 1);
-        assert_eq!(next(NavigationAction::Down, len - 32, bpr, 0, len), len - 1);
-        assert_eq!(
-            next(NavigationAction::Down, len - 64, bpr, 0, len),
-            len - 64 + bpr
-        );
-    }
-
-    #[test]
-    fn page_keys_clamp_at_boundaries() {
-        let len = 1000usize;
-        let bpr = 32usize;
-        let page_bytes = 448usize;
-        assert_eq!(next(NavigationAction::PageUp, 10, bpr, page_bytes, len), 0);
-        assert_eq!(
-            next(NavigationAction::PageDown, len - 5, bpr, page_bytes, len),
-            len - 1
-        );
-        assert_eq!(
-            next(NavigationAction::PageDown, 100, bpr, page_bytes, len),
-            100 + page_bytes
-        );
-        assert_eq!(
-            next(NavigationAction::PageUp, 500, bpr, page_bytes, len),
-            500 - page_bytes
-        );
-    }
-
-    #[test]
-    fn home_end_jump_to_boundaries() {
-        let len = 1000usize;
-        assert_eq!(next(NavigationAction::Home, 500, 32, 448, len), 0);
-        assert_eq!(next(NavigationAction::End, 500, 32, 448, len), len - 1);
-        assert_eq!(next(NavigationAction::End, 0, 32, 448, len), len - 1);
-    }
-
-    #[test]
-    fn stale_selection_is_clamped_before_moving() {
-        let len = 1000usize;
-        assert_eq!(next(NavigationAction::Right, 5000, 32, 448, len), len - 1);
-        assert_eq!(
-            next(NavigationAction::PageDown, 5000, 32, 448, len),
-            len - 1
-        );
-        assert_eq!(next(NavigationAction::Up, 5000, 32, 448, len), len - 1 - 32);
-    }
 
     /// Only the zoom column zooms now, so the step is exercised over its range.
     #[test]
@@ -1829,31 +1681,6 @@ mod tests {
             crate::gui::paint::zoom_step(20.0, crate::gui::paint::ZOOM_STEP, 1.0, 24.0),
             24.0
         );
-    }
-
-    #[test]
-    fn parse_hex_with_prefix() {
-        assert_eq!(ParallHexApp::parse_offset("0x1F"), Some(31));
-        assert_eq!(ParallHexApp::parse_offset("0X1000"), Some(4096));
-    }
-
-    #[test]
-    fn parse_hex_without_prefix() {
-        assert_eq!(ParallHexApp::parse_offset("1F"), Some(31));
-        assert_eq!(ParallHexApp::parse_offset("DEADBEEF"), Some(0xDEAD_BEEF));
-    }
-
-    #[test]
-    fn parse_allows_underscores_and_whitespace() {
-        assert_eq!(ParallHexApp::parse_offset(" 0x1_000 "), Some(4096));
-    }
-
-    #[test]
-    fn parse_invalid_returns_none() {
-        assert_eq!(ParallHexApp::parse_offset(""), None);
-        assert_eq!(ParallHexApp::parse_offset("xyz"), None);
-        assert_eq!(ParallHexApp::parse_offset("0x"), None);
-        assert_eq!(ParallHexApp::parse_offset("-5"), None);
     }
 
     #[test]
@@ -1908,26 +1735,5 @@ mod tests {
         assert_eq!(slider_t_at_x(500.0, W), 1.0);
         // A degenerate width must not divide by zero.
         assert!(slider_t_at_x(5.0, 0.0).is_finite());
-    }
-
-    #[test]
-    fn selection_text_formats_hex_and_ascii() {
-        let data = b"Hi\x00\xff!";
-        assert_eq!(
-            selection_text(data, &(0..5), CopyKind::Hex).as_deref(),
-            Some("48 69 00 FF 21")
-        );
-        assert_eq!(
-            selection_text(data, &(0..5), CopyKind::Ascii).as_deref(),
-            Some("Hi..!")
-        );
-        // Ranges are clamped to the file, and an empty result is `None`.
-        assert_eq!(
-            selection_text(data, &(3..900), CopyKind::Hex).as_deref(),
-            Some("FF 21")
-        );
-        assert_eq!(selection_text(data, &(2..2), CopyKind::Hex), None);
-        assert_eq!(selection_text(data, &(900..901), CopyKind::Hex), None);
-        assert_eq!(selection_text(&[], &(0..4), CopyKind::Ascii), None);
     }
 }

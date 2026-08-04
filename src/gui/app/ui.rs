@@ -346,7 +346,7 @@ impl ParallHexApp {
             return None;
         }
         let content = self.jump_field.read(cx).content().to_owned();
-        match Self::parse_offset(&content) {
+        match geom::parse_offset(&content) {
             Some(o) if o < self.file_size => {
                 let d = self.data();
                 let b = d.map_or(0, |d| d[o]);

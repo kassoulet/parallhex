@@ -7,6 +7,7 @@
 //! testable without opening a window or a terminal.
 
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use super::color::{self, Colormap, Rgb};
 
@@ -145,6 +146,84 @@ pub(crate) fn scrollbar_anchor_at(
     let travel = (track_h - height).max(1.0);
     let t = ((y - height / 2.0) / travel).clamp(0.0, 1.0);
     (t * last_anchor as f32) as usize
+}
+
+/// A cursor movement, independent of how it was triggered. Both frontends map
+/// their own key bindings onto this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Nav {
+    Left,
+    Right,
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// Pure navigation math: compute the offset reached by `action` from
+/// `cur`, clamped to `[0, len)`.
+pub(crate) fn nav_next(
+    action: Nav,
+    cur: usize,
+    bpr: usize,
+    page_bytes: usize,
+    len: usize,
+) -> usize {
+    match action {
+        Nav::Left => cur.saturating_sub(1),
+        Nav::Right => (cur + 1).min(len - 1),
+        Nav::Up => cur.saturating_sub(bpr),
+        Nav::Down => (cur + bpr).min(len - 1),
+        Nav::PageUp => cur.saturating_sub(page_bytes),
+        Nav::PageDown => (cur + page_bytes).min(len - 1),
+        Nav::Home => 0,
+        Nav::End => len - 1,
+    }
+}
+
+/// How a copied byte range is rendered to text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CopyKind {
+    /// Space-separated uppercase hex pairs, e.g. `DE AD BE EF`.
+    Hex,
+    /// Printable ASCII, non-printable bytes as `.`.
+    Ascii,
+}
+
+/// Render `range` of `data` for the clipboard, or `None` when the range is
+/// empty after clamping to the file. Shared by the copy actions and the hex
+/// column's right-click copy so the two can't drift apart.
+pub(crate) fn selection_text(data: &[u8], range: &Range<usize>, kind: CopyKind) -> Option<String> {
+    let start = range.start.min(data.len());
+    let end = range.end.min(data.len());
+    if start >= end {
+        return None;
+    }
+    let bytes = &data[start..end];
+    Some(match kind {
+        CopyKind::Hex => bytes
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        CopyKind::Ascii => bytes.iter().map(|&b| color::printable(b)).collect(),
+    })
+}
+
+/// Parse a user-supplied offset as hex: `0x` prefix optional, underscores
+/// and whitespace allowed (e.g. `"0x1_000"`, `"1F"`).
+pub(crate) fn parse_offset(input: &str) -> Option<usize> {
+    let s = input.trim().replace('_', "");
+    if s.is_empty() {
+        return None;
+    }
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(&s);
+    usize::from_str_radix(hex, 16).ok()
 }
 
 /// Format a half-open byte range as a hex header label, e.g.
@@ -447,6 +526,103 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parse_allows_underscores_and_whitespace() {
+        assert_eq!(parse_offset(" 0x1_000 "), Some(4096));
+    }
+
+    #[test]
+    fn parse_invalid_returns_none() {
+        assert_eq!(parse_offset(""), None);
+        assert_eq!(parse_offset("xyz"), None);
+        assert_eq!(parse_offset("0x"), None);
+        assert_eq!(parse_offset("-5"), None);
+    }
+
+    #[test]
+    fn parse_hex_with_prefix() {
+        assert_eq!(parse_offset("0x1F"), Some(31));
+        assert_eq!(parse_offset("0X1000"), Some(4096));
+    }
+
+    #[test]
+    fn parse_hex_without_prefix() {
+        assert_eq!(parse_offset("1F"), Some(31));
+        assert_eq!(parse_offset("DEADBEEF"), Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn selection_text_formats_hex_and_ascii() {
+        let data = b"Hi\x00\xff!";
+        assert_eq!(
+            selection_text(data, &(0..5), CopyKind::Hex).as_deref(),
+            Some("48 69 00 FF 21")
+        );
+        assert_eq!(
+            selection_text(data, &(0..5), CopyKind::Ascii).as_deref(),
+            Some("Hi..!")
+        );
+        // Ranges are clamped to the file, and an empty result is `None`.
+        assert_eq!(
+            selection_text(data, &(3..900), CopyKind::Hex).as_deref(),
+            Some("FF 21")
+        );
+        assert_eq!(selection_text(data, &(2..2), CopyKind::Hex), None);
+        assert_eq!(selection_text(data, &(900..901), CopyKind::Hex), None);
+        assert_eq!(selection_text(&[], &(0..4), CopyKind::Ascii), None);
+    }
+
+    /// `navigate` in the gpui frontend clamps a stale cursor before delegating,
+    /// so the tests exercise `nav_next` through that same clamp.
+    fn next(action: Nav, cur: usize, bpr: usize, page_bytes: usize, len: usize) -> usize {
+        nav_next(action, cur.min(len - 1), bpr, page_bytes, len)
+    }
+
+    #[test]
+    fn arrows_clamp_at_boundaries() {
+        let len = 1000usize;
+        let bpr = 32usize;
+        assert_eq!(next(Nav::Left, 0, bpr, 0, len), 0);
+        assert_eq!(next(Nav::Up, 0, bpr, 0, len), 0);
+        assert_eq!(next(Nav::Right, len - 1, bpr, 0, len), len - 1);
+        assert_eq!(next(Nav::Down, len - 1, bpr, 0, len), len - 1);
+        assert_eq!(next(Nav::Right, len - 2, bpr, 0, len), len - 1);
+        assert_eq!(next(Nav::Down, len - 32, bpr, 0, len), len - 1);
+        assert_eq!(next(Nav::Down, len - 64, bpr, 0, len), len - 64 + bpr);
+    }
+
+    #[test]
+    fn page_keys_clamp_at_boundaries() {
+        let len = 1000usize;
+        let bpr = 32usize;
+        let page_bytes = 448usize;
+        assert_eq!(next(Nav::PageUp, 10, bpr, page_bytes, len), 0);
+        assert_eq!(next(Nav::PageDown, len - 5, bpr, page_bytes, len), len - 1);
+        assert_eq!(
+            next(Nav::PageDown, 100, bpr, page_bytes, len),
+            100 + page_bytes
+        );
+        assert_eq!(
+            next(Nav::PageUp, 500, bpr, page_bytes, len),
+            500 - page_bytes
+        );
+    }
+
+    #[test]
+    fn home_end_jump_to_boundaries() {
+        let len = 1000usize;
+        assert_eq!(next(Nav::Home, 500, 32, 448, len), 0);
+        assert_eq!(next(Nav::End, 500, 32, 448, len), len - 1);
+        assert_eq!(next(Nav::End, 0, 32, 448, len), len - 1);
+    }
+
+    #[test]
+    fn stale_selection_is_clamped_before_moving() {
+        let len = 1000usize;
+        assert_eq!(next(Nav::Right, 5000, 32, 448, len), len - 1);
+        assert_eq!(next(Nav::PageDown, 5000, 32, 448, len), len - 1);
+        assert_eq!(next(Nav::Up, 5000, 32, 448, len), len - 1 - 32);
+    }
 
     /// What the gpui frontend passes as its gutter (`paint::ADDR_X`). Repeated
     /// here so these tests stay independent of the frontend.
