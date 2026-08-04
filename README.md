@@ -148,9 +148,20 @@ runs `cargo test --all-targets`, `cargo fmt --check` and
 discovering failures in the hook.
 
 GitHub Actions runs the same three gates on every push and pull request
-(`.github/workflows/ci.yml`). Building on Linux needs `libasound2-dev`,
-`libfreetype-dev` and `libopus-dev`; the Wayland, X11 and fontconfig bindings
-are `dlopen`ed, so they matter only at runtime.
+(`.github/workflows/ci.yml`). Building on Linux needs:
+
+```sh
+sudo apt-get install libasound2-dev libfreetype-dev libopus-dev \
+                     libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+```
+
+The Wayland and fontconfig bindings are `dlopen`ed, so they matter only at
+runtime. The workflow can be run locally with
+[`act`](https://github.com/nektos/act):
+
+```sh
+act push -j gates -P ubuntu-24.04=catthehacker/ubuntu:act-24.04
+```
 
 `Cargo.toml` denies all compiler warnings and the whole of `clippy::pedantic`.
 A short, curated list of exceptions lives in the `#![allow(...)]` at the top of

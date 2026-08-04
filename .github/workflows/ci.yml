@@ -24,10 +24,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # gpui links freetype, and its audio stack links ALSA and Opus. The
-      # wayland, X11 and fontconfig bindings are all dlopen'd at runtime, so
-      # they need no -dev packages to build or to run the tests. zstd and ring
-      # build vendored copies.
+      # Two separate needs, both required:
+      #   * -sys build scripts probe pkg-config and fail outright without the
+      #     headers: alsa, opus, freetype.
+      #   * the final link line wants -lfreetype -lxcb -lxkbcommon
+      #     -lxkbcommon-x11. Those last three come from `#[link]` attributes in
+      #     crate source rather than from build-script output, so they are easy
+      #     to miss by inspecting build scripts alone.
+      # Wayland and fontconfig really are dlopen'd, so they stay runtime-only.
+      # zstd and ring build vendored copies.
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -35,12 +40,23 @@ jobs:
             libasound2-dev \
             libfreetype-dev \
             libopus-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
             pkg-config
 
-      # The runner image ships a stable toolchain; this only makes the two
-      # components explicit. Edition 2024 needs Rust 1.85 or newer.
+      # GitHub's runner image ships rustup, but `act` containers and bare
+      # self-hosted runners do not, so install it when it is missing instead of
+      # assuming it. Edition 2024 needs Rust 1.85 or newer.
       - name: Set up Rust
         run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            # $GITHUB_PATH covers later steps; PATH covers the rest of this one.
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup component add rustfmt clippy
           rustup show active-toolchain
           cargo --version
