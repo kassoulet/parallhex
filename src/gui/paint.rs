@@ -399,6 +399,7 @@ pub(crate) fn paint_hex(
             src.data,
             row_start,
             n,
+            bpr,
             &mut text,
             &mut hex_offsets,
             &mut ascii_offsets,

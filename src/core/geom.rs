@@ -450,6 +450,7 @@ pub(crate) fn build_row_text_into(
     data: &[u8],
     row_start: usize,
     n: usize,
+    bpr: usize,
     text: &mut String,
     hex_offsets: &mut Vec<usize>,
     ascii_offsets: &mut Vec<usize>,
@@ -466,6 +467,16 @@ pub(crate) fn build_row_text_into(
         let off = text.len();
         let _ = write!(text, "{b:02X} ");
         hex_offsets.push(off);
+    }
+    // Reserve the full row's hex area even when this row is short. The last row
+    // of a file usually is, and its cells are still positioned from `bpr`, so
+    // without this padding the ASCII block would start further left than
+    // `RowGeo::ascii_start` and every ASCII glyph on that row would sit off its
+    // background cell.
+    let full_hex = 3 * bpr + bpr.saturating_sub(1) / 8;
+    let written = 3 * n + n.saturating_sub(1) / 8;
+    for _ in written..full_hex {
+        text.push(' ');
     }
     text.push_str("  ");
     for i in 0..n {
@@ -710,6 +721,7 @@ mod tests {
                     &data,
                     0,
                     bpr,
+                    bpr,
                     &mut text,
                     &mut hex_offsets,
                     &mut ascii_offsets,
@@ -725,6 +737,49 @@ mod tests {
                         geo.ascii_x(i),
                         "ascii byte {i} of {bpr} misaligned at gutter {gutter}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The *last* row of a file is usually partial, and its cells are still
+    /// positioned from the full `bpr`. So the row text has to reserve the full
+    /// hex area regardless of how many bytes it holds, or the ASCII glyphs slide
+    /// left of the backgrounds they belong to. Only full rows were covered
+    /// before, which is exactly why that went unnoticed.
+    #[test]
+    fn a_partial_last_row_keeps_its_ascii_aligned() {
+        let char_w = 10.0;
+        for gutter in [0.0, ADDR_X_PX] {
+            for bpr in [8usize, 16, 32] {
+                let geo = RowGeo::new(gutter, char_w, bpr);
+                let data: Vec<u8> = (0..bpr).map(|i| i as u8).collect();
+                // 1 byte, a mid-group count, one short of full, and full.
+                for n in [1usize, 3, bpr - 1, bpr] {
+                    let mut text = String::new();
+                    let mut hex_offsets = Vec::new();
+                    let mut ascii_offsets = Vec::new();
+                    build_row_text_into(
+                        &data,
+                        0,
+                        n,
+                        bpr,
+                        &mut text,
+                        &mut hex_offsets,
+                        &mut ascii_offsets,
+                    );
+                    for i in 0..n {
+                        assert_eq!(
+                            glyph_x(hex_offsets[i], char_w, gutter),
+                            geo.cell_x(i),
+                            "hex byte {i} of {n}/{bpr} misaligned at gutter {gutter}"
+                        );
+                        assert_eq!(
+                            glyph_x(ascii_offsets[i], char_w, gutter),
+                            geo.ascii_x(i),
+                            "ascii byte {i} of {n}/{bpr} misaligned at gutter {gutter}"
+                        );
+                    }
                 }
             }
         }
