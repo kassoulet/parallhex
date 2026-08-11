@@ -81,11 +81,9 @@ fn visible_range(app: &TuiApp, focus: Focus, inner: Rect) -> Range<usize> {
     match focus {
         Focus::Overview => 0..len,
         Focus::Zoom => {
-            let cols = (inner.width as usize).max(1);
-            // Two byte rows per text row, because of the half-block packing.
-            let rows = inner.height as usize * 2;
-            let first = geom::first_row_centred(app.anchor, cols, rows);
-            first..(first + rows * cols).min(len)
+            let (bpr, _block, rows, first) =
+                app.zoom_geometry(inner.width as usize, inner.height as usize * 2);
+            first..(first + rows * bpr).min(len)
         }
         Focus::Hex => {
             let bpr = app.bpr_for(Focus::Hex).max(8);
@@ -175,10 +173,14 @@ fn draw_hints(frame: &mut Frame, app: &TuiApp, area: Rect) {
         };
         put(&format!(" {} {} ", i + 1, cm.label()), style);
     }
-    put(
-        "  Tab panel · g jump · y copy · -/+ window · q quit",
-        Style::new().fg(MUTED),
-    );
+    // On the zoom column the -/+ keys change its pixel size instead of the
+    // entropy window, so the hint row says which one is live.
+    let tail = if app.focus == Focus::Zoom {
+        "  Tab panel · g jump · y copy · -/+ zoom · q quit"
+    } else {
+        "  Tab panel · g jump · y copy · -/+ window · q quit"
+    };
+    put(tail, Style::new().fg(MUTED));
 }
 
 /// Draw a column's border and header, returning the area left for content.
@@ -188,7 +190,18 @@ fn column(frame: &mut Frame, app: &TuiApp, focus: Focus, area: Rect) -> Rect {
     } else {
         UNFOCUSED
     };
-    let title = format!(" {} · {} ", focus.title(), app.colormap(focus).label());
+    // The zoom column advertises its pixel size the way the gpui frontend's
+    // header shows `px N`, since the keys that change it are its own.
+    let title = if focus == Focus::Zoom {
+        format!(
+            " {} · {} · {} px ",
+            focus.title(),
+            app.colormap(focus).label(),
+            app.pixel_zoom.round() as u32
+        )
+    } else {
+        format!(" {} · {} ", focus.title(), app.colormap(focus).label())
+    };
     let block = Block::bordered()
         .border_style(Style::new().fg(border))
         .title(title);
@@ -215,13 +228,12 @@ fn draw_zoom(frame: &mut Frame, app: &TuiApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let cols = area.width as usize;
-    let rows_px = area.height as usize * 2;
-    let first = geom::first_row_centred(app.anchor, cols, rows_px);
-    // `block = 1.0` makes the generator emit exactly one pixel per byte, which is
-    // one byte per half-cell -- no separate generator needed.
+    // `block` is the pixel size the zoom control picked, so each byte becomes a
+    // `block × block` square (wider rows are redistributed to fill the panel).
+    let (bpr, block, rows, first) =
+        app.zoom_geometry(area.width as usize, area.height as usize * 2);
     let (rgba, iw, _ih) =
-        thumb::build_zoom_rgba(&app.byte_source(Focus::Zoom), cols, first, rows_px, 1.0);
+        thumb::build_zoom_rgba(&app.byte_source(Focus::Zoom), bpr, first, rows, block);
     if iw > 0 {
         blit_half_blocks(frame.buffer_mut(), area, &rgba, iw);
     }
@@ -464,6 +476,31 @@ mod tests {
         assert!(hints.contains("Overview colormap:"), "{hints:?}");
         let x = hints.find("4 Entropy").expect("4 Entropy present");
         assert_eq!(buf.get(u16::try_from(x).unwrap(), 11).bg, FOCUSED);
+    }
+
+    #[test]
+    fn the_zoom_column_header_reads_out_its_pixel_size() {
+        let mut app = TuiApp::for_test(4096);
+        app.focus = Focus::Zoom;
+        app.pixel_zoom = 6.0;
+        let buf = render(&mut app, 140, 12);
+        let top = row_text(&buf, 0, 140);
+        assert!(top.contains("Zoom · Value · 6 px"), "{top:?}");
+    }
+
+    #[test]
+    fn the_hint_row_names_the_live_zoom_binding() {
+        // With the zoom column focused, -/+ adjust its pixel size, and the hint
+        // row says so instead of promising an entropy-window change.
+        let mut app = TuiApp::for_test(4096);
+        app.focus = Focus::Zoom;
+        let buf = render(&mut app, 140, 12);
+        let hints = row_text(&buf, 11, 140);
+        assert!(hints.contains("-/+ zoom"), "{hints:?}");
+        app.focus = Focus::Hex;
+        let buf = render(&mut app, 140, 12);
+        let hints = row_text(&buf, 11, 140);
+        assert!(hints.contains("-/+ window"), "{hints:?}");
     }
 
     #[test]

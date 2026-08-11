@@ -806,7 +806,7 @@ impl ParallHexApp {
         if self.show_jump_dialog {
             return;
         }
-        self.zoom_under_pointer(window, paint::ZOOM_STEP);
+        self.zoom_under_pointer(window, geom::ZOOM_STEP);
         cx.notify();
     }
 
@@ -814,7 +814,7 @@ impl ParallHexApp {
         if self.show_jump_dialog {
             return;
         }
-        self.zoom_under_pointer(window, 1.0 / paint::ZOOM_STEP);
+        self.zoom_under_pointer(window, 1.0 / geom::ZOOM_STEP);
         cx.notify();
     }
 
@@ -1720,7 +1720,7 @@ mod tests {
         assert_eq!(
             crate::gui::paint::zoom_step(
                 4.0,
-                crate::gui::paint::ZOOM_STEP,
+                crate::core::geom::ZOOM_STEP,
                 PIXEL_ZOOM_MIN,
                 PIXEL_ZOOM_MAX
             ),
@@ -1729,7 +1729,7 @@ mod tests {
         assert_eq!(
             crate::gui::paint::zoom_step(
                 24.0,
-                crate::gui::paint::ZOOM_STEP,
+                crate::core::geom::ZOOM_STEP,
                 PIXEL_ZOOM_MIN,
                 PIXEL_ZOOM_MAX
             ),
@@ -1740,7 +1740,7 @@ mod tests {
             1.0
         );
         assert_eq!(
-            crate::gui::paint::zoom_step(20.0, crate::gui::paint::ZOOM_STEP, 1.0, 24.0),
+            crate::gui::paint::zoom_step(20.0, crate::core::geom::ZOOM_STEP, 1.0, 24.0),
             24.0
         );
     }

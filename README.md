@@ -71,6 +71,19 @@ CI asserts that gpui cannot reach that build's dependency tree.
 
 ## Terminal frontend
 
+![The terminal frontend showing libc.so.6: an entropy overview, a byte-class
+zoom column, and class-coloured hex with a selection and the key-hint row at
+the bottom](docs/screenshot-tui.png)
+
+*`libc.so.6` at offset 0 in a 150×32 terminal. The half-block columns are the
+same thumbnails the windowed frontend paints: the overview maps entropy over the
+whole 2 MiB, the zoom column shows one 4 px block per byte in the value palette
+(its header reads out the size), and the hex column is class-coloured, with the
+first four bytes selected. The hint row along the bottom names the `1`–`4`
+colormap keys and highlights the focused panel's choice.*
+
+The schematic below labels the layout:
+
 ```
 ┌ Overview · Entropy ┐┌ Zoom · Class ─────────┐┌ Hex · Class ────────────────────┐
 │▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀││00000000  7F 45 4C 46  .ELF.... │
@@ -81,7 +94,10 @@ CI asserts that gpui cannot reach that build's dependency tree.
 
 The two graphical columns use half-block characters (`▀`), so each text row
 carries two byte rows: the foreground paints the upper byte, the background the
-lower one. This needs a terminal with 24-bit or 256-colour support.
+lower one. This needs a terminal with 24-bit or 256-colour support. In the
+terminal a half-block column is the display's "pixel", so the zoom column's
+pixel size (see below) is measured in those columns: `4 px` paints one byte four
+columns wide.
 
 | Key | Action |
 |---|---|
@@ -94,12 +110,15 @@ lower one. This needs a terminal with 24-bit or 256-colour support.
 | `Shift`+arrows | Extend the selection |
 | `y` / `Y` | Copy the selection as hex / ASCII |
 | `g` | Jump to offset (`Enter` submits, `Esc` cancels) |
-| `-` / `+` (or `=`) | Halve / double the entropy window |
+| `+` / `=` / `-` | With the **zoom column** focused: pixel-zoom in / out (1–24 px per byte). Elsewhere: double / halve the entropy window |
 | `q`, `Esc`, `Ctrl+C` | Save preferences and quit |
 
 A hint row along the bottom lists the colormap keys for whichever column has
 focus and highlights the one in use, so `1`–`4` are discoverable without reading
-this table:
+this table. It also names what `-`/`+` does right now: with the zoom column
+focused they adjust its pixel size and the hint row switches to `-/+ zoom`; the
+zoom column's header shows the current size (`· 4 px`), and it is persisted to
+the preferences file like the windowed frontend's.
 
 ```
  Hex colormap: 1 None  2 Value  3 Class  4 Entropy   Tab panel · g jump · y copy · -/+ window · q quit

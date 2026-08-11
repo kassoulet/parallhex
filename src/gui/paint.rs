@@ -17,9 +17,6 @@ use crate::core::color::{self, Rgb};
 use crate::core::geom::{ByteSource, RowGeo, build_row_text_into, scrollbar_thumb, visible_rows};
 use crate::core::thumb;
 
-/// Keyboard zoom step factor (`+` / `-`), applied multiplicatively per press.
-pub(crate) const ZOOM_STEP: f32 = 1.25;
-
 /// Hex row geometry: the text size is fixed, so these are constants.
 pub(crate) const ROW_H: f32 = 18.0;
 

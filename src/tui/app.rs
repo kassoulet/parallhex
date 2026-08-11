@@ -63,6 +63,8 @@ pub(crate) enum Action {
     JumpCancel,
     EntropyDouble,
     EntropyHalve,
+    ZoomIn,
+    ZoomOut,
     Quit,
 }
 
@@ -108,6 +110,10 @@ pub(crate) struct TuiApp {
     pub focus: Focus,
     pub colormaps: [Colormap; 3],
     pub entropy_window: usize,
+    /// The zoom column's target block size in pixels per byte, as in the gpui
+    /// frontend. Keys `=`/`+`/`-` step it while the zoom column is focused, and
+    /// the renderer widens each row's blocks to fill the panel exactly.
+    pub pixel_zoom: f32,
     pub entropies: Arc<Vec<f32>>,
     pub message: Option<String>,
     pub layout: PanelLayout,
@@ -169,6 +175,9 @@ impl TuiApp {
             entropy_window: cfg
                 .entropy_window
                 .clamp(geom::ENTROPY_WINDOW_MIN, geom::ENTROPY_WINDOW_MAX),
+            pixel_zoom: cfg
+                .pixel_zoom
+                .clamp(geom::PIXEL_ZOOM_MIN, geom::PIXEL_ZOOM_MAX),
             entropies: Arc::new(Vec::new()),
             message: None,
             layout: PanelLayout::default(),
@@ -189,18 +198,42 @@ impl TuiApp {
     /// Each panel means something different by "a row", and `↑`/`↓` follow the
     /// focused one:
     /// - hex: whole 8-byte groups that fit its width, one cell per character;
-    /// - zoom: its width in cells, since a byte is one half-cell;
+    /// - zoom: as many `pixel_zoom`-sized blocks as fit its width, so a row is
+    ///   the column width over the zoom;
     /// - overview: the slice of the file one half-row stands for, which makes
     ///   `↑`/`↓` there a deliberately coarse whole-file seek.
     pub(crate) fn bpr_for(&self, focus: Focus) -> usize {
         match focus {
             Focus::Hex => geom::hex_bytes_per_row(self.layout.hex_cols as f32, 1.0, 0.0),
-            Focus::Zoom => self.layout.zoom_cols.max(1),
+            // The pixel-row count does not affect the bytes-per-row, but using
+            // the measured height keeps this the same geometry the renderer
+            // shows rather than a parallel computation.
+            Focus::Zoom => {
+                self.zoom_geometry(self.layout.zoom_cols, self.layout.text_rows * 2)
+                    .0
+            }
             Focus::Overview => self
                 .file_size
                 .div_ceil((self.layout.text_rows * 2).max(1))
                 .max(1),
         }
+    }
+
+    /// The zoom column's geometry for a panel `w` cells wide over `rows_px`
+    /// pixel rows: bytes per row at the target pixel size, the actual block
+    /// size (widened so a row fills the panel exactly, as in the gpui
+    /// frontend), the byte rows that fit, and the row-aligned first byte.
+    /// `rows` counts *byte* rows — each is `block` pixel rows tall, and the
+    /// half-block blit shows two pixel rows per text row. At `pixel_zoom =
+    /// 1.0` this degenerates to the historical layout of one byte per
+    /// half-cell. The renderer and the input layer both take the zoom row
+    /// length from here, so the two cannot disagree.
+    pub(crate) fn zoom_geometry(&self, w: usize, rows_px: usize) -> (usize, f32, usize, usize) {
+        let bpr = geom::zoom_bytes_per_row(w as f32, self.pixel_zoom);
+        let block = geom::zoom_block_w(w as f32, bpr);
+        let rows = geom::visible_rows(rows_px as f32, block);
+        let first = geom::first_row_centred(self.anchor, bpr, rows);
+        (bpr, block, rows, first)
     }
 
     /// The hex column's row length, which owns the shared anchor's clamp.
@@ -259,6 +292,8 @@ impl TuiApp {
             Action::JumpCancel => self.jump = None,
             Action::EntropyDouble => self.scale_entropy_window(2),
             Action::EntropyHalve => self.scale_entropy_window(-2),
+            Action::ZoomIn => self.scale_pixel_zoom(1),
+            Action::ZoomOut => self.scale_pixel_zoom(-1),
             Action::Quit => self.quit = true,
         }
     }
@@ -334,16 +369,34 @@ impl TuiApp {
         }
     }
 
+    /// Step the zoom column's pixel size in (`dir` > 0) or out, clamped to the
+    /// range the config shares with the gpui frontend. The step is
+    /// multiplicative, like the gpui frontend's `=`/`-` keys, so zooming feels
+    /// proportional at every size.
+    fn scale_pixel_zoom(&mut self, dir: i32) {
+        let factor = if dir > 0 {
+            geom::ZOOM_STEP
+        } else {
+            1.0 / geom::ZOOM_STEP
+        };
+        let next = (self.pixel_zoom * factor).clamp(geom::PIXEL_ZOOM_MIN, geom::PIXEL_ZOOM_MAX);
+        if next != self.pixel_zoom {
+            self.pixel_zoom = next;
+            self.message = Some(format!("zoom {next:.0} px"));
+        }
+    }
+
     /// The config to write: everything as loaded, with only what this frontend
     /// owns overwritten. Because `load` reads every field and `save` writes every
-    /// field, the gpui-only settings — window geometry, pixel zoom, column widths
-    /// — round-trip untouched instead of being reset to defaults.
+    /// field, the gpui-only settings — window geometry and column widths —
+    /// round-trip untouched instead of being reset to defaults.
     pub(crate) fn config_to_save(&self) -> config::Config {
         config::Config {
             overview_colormap: self.colormaps[Focus::Overview as usize],
             zoom_colormap: self.colormaps[Focus::Zoom as usize],
             hex_colormap: self.colormaps[Focus::Hex as usize],
             entropy_window: self.entropy_window,
+            pixel_zoom: self.pixel_zoom,
             ..self.loaded_cfg
         }
     }
@@ -412,6 +465,7 @@ impl TuiApp {
             focus: Focus::Hex,
             colormaps: [Colormap::Entropy, Colormap::Value, Colormap::Class],
             entropy_window: 256,
+            pixel_zoom: geom::PIXEL_ZOOM_DEFAULT,
             entropies: Arc::new(Vec::new()),
             message: None,
             layout: PanelLayout {
@@ -439,9 +493,15 @@ mod tests {
 
     #[test]
     fn each_panel_defines_its_own_row_length() {
-        let app = TuiApp::for_test(4096);
-        // Zoom: one byte per half-cell, so a row is the column width.
-        assert_eq!(app.bpr_for(Focus::Zoom), 32);
+        let mut app = TuiApp::for_test(4096);
+        // Zoom: at the default 4 px per byte, a row is the column width over
+        // the zoom -- 32 cells / 4 px = 8 bytes.
+        assert_eq!(app.bpr_for(Focus::Zoom), 8);
+        // A coarser zoom shows fewer bytes per row.
+        app.pixel_zoom = 2.0;
+        assert_eq!(app.bpr_for(Focus::Zoom), 16);
+        app.pixel_zoom = 8.0;
+        assert_eq!(app.bpr_for(Focus::Zoom), 4);
         // Hex: whole 8-byte groups that fit, one cell per character, no gutter.
         assert_eq!(
             app.bpr_for(Focus::Hex),
@@ -450,6 +510,27 @@ mod tests {
         // Overview: one half-row stands for this slice of the file, which makes
         // up/down there a coarse whole-file seek rather than a byte step.
         assert_eq!(app.bpr_for(Focus::Overview), 4096_usize.div_ceil(24 * 2));
+    }
+
+    #[test]
+    fn the_pixel_zoom_steps_multiplies_and_clamps() {
+        let mut app = TuiApp::for_test(4096);
+        app.pixel_zoom = 4.0;
+        app.apply(Action::ZoomIn);
+        assert_eq!(app.pixel_zoom, 5.0, "4 * 1.25 = 5");
+        app.apply(Action::ZoomOut);
+        assert_eq!(app.pixel_zoom, 4.0, "5 / 1.25 = 4");
+        // The clamp is shared with the gpui frontend's 1..=24 range.
+        app.pixel_zoom = geom::PIXEL_ZOOM_MAX;
+        app.apply(Action::ZoomIn);
+        assert_eq!(app.pixel_zoom, geom::PIXEL_ZOOM_MAX, "clamped high");
+        app.pixel_zoom = geom::PIXEL_ZOOM_MIN;
+        app.apply(Action::ZoomOut);
+        assert_eq!(app.pixel_zoom, geom::PIXEL_ZOOM_MIN, "clamped low");
+        // A no-op at the clamp must not claim to have changed anything.
+        app.message = None;
+        app.apply(Action::ZoomOut);
+        assert_eq!(app.message, None, "no message for an unchanged zoom");
     }
 
     #[test]
@@ -597,12 +678,14 @@ mod tests {
 
     #[test]
     fn saving_preserves_the_gpui_only_settings() {
-        // The TUI must round-trip window geometry and pixel zoom, or it would
-        // silently reset the gpui app's window position on every exit.
+        // The TUI must round-trip window geometry and the column widths, or it
+        // would silently reset the gpui app's window layout on every exit.
+        // pixel_zoom is shared: the terminal frontend now writes the value it
+        // holds, not whatever the file had.
         let mut app = TuiApp::for_test(16);
         app.loaded_cfg.window_bounds = Some((10.0, 20.0, 1600.0, 900.0));
-        app.loaded_cfg.pixel_zoom = 7.0;
         app.loaded_cfg.overview_width = 321.0;
+        app.pixel_zoom = 7.0;
         app.colormaps[Focus::Hex as usize] = Colormap::Entropy;
         app.entropy_window = 1024;
 

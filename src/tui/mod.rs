@@ -89,7 +89,7 @@ fn event_loop(term: &mut Term, app: &mut TuiApp) -> io::Result<()> {
             // Windows and some terminals report Press *and* Release, which would
             // otherwise double every keystroke.
             && key.kind == KeyEventKind::Press
-            && let Some(action) = input::key_to_action(key, app.jump.is_some())
+            && let Some(action) = input::key_to_action(key, app.jump.is_some(), app.focus)
         {
             app.apply(action);
         }

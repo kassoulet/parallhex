@@ -17,6 +17,11 @@ pub(crate) const PIXEL_ZOOM_MIN: f32 = 1.0;
 
 pub(crate) const PIXEL_ZOOM_MAX: f32 = 24.0;
 
+/// Multiplicative step per `=`/`-` press, shared by both frontends' zoom keys.
+/// The gpui frontend binds `=`/`-` to the column under the pointer; the
+/// terminal frontend binds them to the focused column.
+pub(crate) const ZOOM_STEP: f32 = 1.25;
+
 /// Clamp range for the entropy window, in bytes. Shared by the load-time clamp,
 /// the slider's pointer→value mapping and its thumb position: three copies of
 /// these bounds could disagree, and a thumb that renders somewhere a drag won't
